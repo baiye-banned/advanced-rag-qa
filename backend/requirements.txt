@@ -1,4 +1,4 @@
-fastapi==0.142.2
+fastapi==0.143.2
 uvicorn==0.54.0
 python-jose[cryptography]>=3.5.0
 passlib[bcrypt]==1.7.4
@@ -11,8 +11,8 @@ numpy<3
 httpx==0.28.1
 python-docx==1.2.0
 pypdf>=6.19.0
-langchain-openai==1.6.7
+langchain-openai==1.7.2
 openai>=3.23.0
 pymilvus[milvus_lite]==3.0.2
-milvus-lite==3.2.1
+milvus-lite==3.2.2
 python-dotenv>=1.2.4
