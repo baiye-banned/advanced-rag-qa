@@ -274,6 +274,9 @@ EMBEDDING_INGEST_BATCH_MAX_CHARS = _env_int("EMBEDDING_INGEST_BATCH_MAX_CHARS", 
 # configured tiktoken encoding; the safety ratio scales the hard limit down so the
 # provider tokenizer has headroom. Character-mode callers of chunk_text (explicit
 # chunk_size/chunk_overlap) are unaffected by these knobs.
+# These are the fallback values used by normalize_chunk_token_budget when an env value is
+# invalid. The _env_int defaults below are literals so that tests/test_env_example_parity.py,
+# which compares the AST default against .env.example, can evaluate them; keep both in sync.
 DEFAULT_CHUNK_TOKEN_LIMIT = 500
 DEFAULT_CHUNK_TOKEN_TARGET = 400
 DEFAULT_CHUNK_TOKEN_OVERLAP = 50
@@ -327,9 +330,9 @@ def normalize_chunk_token_budget(
     CHUNK_TOKEN_TARGET,
     CHUNK_TOKEN_OVERLAP,
 ) = normalize_chunk_token_budget(
-    _env_int("CHUNK_TOKEN_LIMIT", DEFAULT_CHUNK_TOKEN_LIMIT),
-    _env_int("CHUNK_TOKEN_TARGET", DEFAULT_CHUNK_TOKEN_TARGET),
-    _env_int("CHUNK_TOKEN_OVERLAP", DEFAULT_CHUNK_TOKEN_OVERLAP),
+    _env_int("CHUNK_TOKEN_LIMIT", 500),
+    _env_int("CHUNK_TOKEN_TARGET", 400),
+    _env_int("CHUNK_TOKEN_OVERLAP", 50),
 )
 CHUNK_TOKENIZER = os.getenv("CHUNK_TOKENIZER", "cl100k_base").strip() or "cl100k_base"
 CHUNK_TOKEN_SAFETY_RATIO = normalize_token_safety_ratio(
