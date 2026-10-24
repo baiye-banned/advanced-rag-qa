@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta
 
 from sqlalchemy import and_, func, literal, or_
@@ -9,6 +10,8 @@ from crud.pagination import LIST_DEFAULT_LIMIT, clamp_limit, datetime_cursor_val
 from model.models import ChatAttachmentUpload, ChatTraceSession, Conversation, Message
 from service.json_utils import load_json_value
 
+
+logger = logging.getLogger(__name__)
 
 # 消息历史默认页大小与单页上限：不传分页参数时也必须有上限，否则会话越长单次响应越大。
 CHAT_MESSAGE_DEFAULT_LIMIT = 50
@@ -742,9 +745,11 @@ def delete_message(db: Session, message_id: int, user_id: int,
     附件**不在这里删对象**（不调用 OSS / `_reclaim_chat_attachments` / `delete_attachment_uploads`）：
     请求路径只把键收敛到 #238 的墓碑状态（`claimed_at` + `reclaimed_at` 同时写下、清掉
     `consumed_at`），真正的 OSS DELETE 由既有的 `reclaim_orphan_chat_attachments` 在租约
-    到期后领取执行；失败时 `clear_attachment_claim` 会把行放回队列。不能只给「还没有行」
-    的键插 pending 行——真实链路上传时一定已登记、发送时盖了 `consumed_at`，那样写会让
-    所有实际用过的附件都漏出回收视野（对象桶是 public-read，泄漏即长期可读）。
+    到期后领取执行；失败时 `clear_attachment_claim` 会把行放回队列。没有 `ChatAttachmentUpload`
+    行的键**一律跳过**、只记 warning：`object_key` 来自客户端消息的 attachments（只做形状
+    校验），无行即归属未知，若替它插墓碑就等于按删除者的身份伪造归属（#233）。真实链路上传
+    时一定已登记、发送时盖了 `consumed_at`，所以「无行」属于历史老键；这类对象泄漏宁可留着，
+    也不在这里新造归属，由后续对账处理（PR 后续计划登记）。
 
     `keep_attachments=True`（issue #253）：编辑/重新生成会在删除后**立即**重发**目标
     消息自身**的附件，此时若照常登记墓碑，发送路径会把这些键判死而丢掉附件。该分支因此
@@ -851,19 +856,19 @@ def delete_message(db: Session, message_id: int, user_id: int,
                 row.consumed_at = None
                 row.claimed_at = now
                 row.reclaimed_at = now
-            # 历史老键（本服务登记过但库里没有行）：直接插入一条完整墓碑。
-            db.add_all([
-                ChatAttachmentUpload(
-                    object_key=object_key,
-                    user_id=user_id,
-                    created_at=now,
-                    consumed_at=None,
-                    claimed_at=now,
-                    reclaimed_at=now,
+            # 无登记行的键一律跳过（#233 归属判据）：object_key 只经过形状校验就来自
+            # 客户端消息，库里没有行意味着归属未知。替它插墓碑会把「删除者」写成上传者，
+            # 等于允许凭一条自己的消息就认领并让服务凭据删掉任意合法形状的键。宁可漏回收
+            # 历史老对象，也不伪造归属；只记 warning（不输出消息正文），由后续对账处理。
+            for object_key in orphan_keys:
+                if object_key in registered_keys:
+                    continue
+                logger.warning(
+                    "orphan chat attachment has no upload registration; "
+                    "leaving it untouched "
+                    "[scope=delete_message_missing_upload_row] object_key=%s",
+                    object_key,
                 )
-                for object_key in orphan_keys
-                if object_key not in registered_keys
-            ])
 
         db.commit()
     except Exception:
