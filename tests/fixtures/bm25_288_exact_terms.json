@@ -1,0 +1,302 @@
+[
+  {
+    "id": "b288-01",
+    "question": "员工手册第 42 条规定了什么？",
+    "expected_answer": "第 42 条规定了员工年度体检的安排。",
+    "evidence": [
+      "《员工手册》第 42 条"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "第 42 条"
+    ],
+    "answerable": true,
+    "document": "《员工手册》第三章规定：第 42 条 公司每年为在职满一年的员工安排一次年度体检，体检费用由公司承担，员工可在指定机构预约。",
+    "near_miss": "《员工手册》第 41 条 员工出差期间的住宿标准按职级执行，超标部分由个人承担。"
+  },
+  {
+    "id": "b288-02",
+    "question": "报销制度第 7 条对发票有什么要求？",
+    "expected_answer": "第 7 条要求报销必须提供原始发票。",
+    "evidence": [
+      "《费用报销管理办法》第 7 条"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "第 7 条"
+    ],
+    "answerable": true,
+    "document": "《费用报销管理办法》第 7 条 报销时必须提供原始发票；电子发票需同时上传发票原件及查验结果。",
+    "near_miss": "《费用报销管理办法》第 6 条 差旅补贴按出差天数计发，不再另行报销餐费。"
+  },
+  {
+    "id": "b288-03",
+    "question": "信息安全制度第 103 条禁止什么行为？",
+    "expected_answer": "第 103 条禁止将账号口令写在便签上。",
+    "evidence": [
+      "《信息安全管理办法》第 103 条"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "第 103 条"
+    ],
+    "answerable": true,
+    "document": "《信息安全管理办法》第 103 条 禁止将账号口令写在便签、纸质台账或聊天工具中，违者按安全事件处理。",
+    "near_miss": "《信息安全管理办法》第 102 条 员工离职时须交回门禁卡与办公设备。"
+  },
+  {
+    "id": "b288-04",
+    "question": "第 9.3 条约定的验收标准是什么？",
+    "expected_answer": "第 9.3 条约定验收以第三方检测报告为准。",
+    "evidence": [
+      "《采购合同管理细则》第 9.3 条"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "第 9.3 条"
+    ],
+    "answerable": true,
+    "document": "《采购合同管理细则》第 9.3 条 约定设备验收以第三方检测机构出具的报告为准，报告不合格的限期整改。",
+    "near_miss": "《采购合同管理细则》第 9.2 条 约定合同价款按季度结算，逾期付款按日计息。"
+  },
+  {
+    "id": "b288-05",
+    "question": "工单系统报错 TS-999 表示什么问题？",
+    "expected_answer": "TS-999 表示租户配额已用尽。",
+    "evidence": [
+      "《信息化系统使用规范》错误码表"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "TS-999"
+    ],
+    "answerable": true,
+    "document": "《信息化系统使用规范》错误码表：TS-999 表示租户配额已用尽，需联系平台管理员扩容后重试。",
+    "near_miss": "《信息化系统使用规范》错误码表：TS-998 表示租户配额接近上限，请提前申请扩容。"
+  },
+  {
+    "id": "b288-06",
+    "question": "错误码 E-4021 应该如何处置？",
+    "expected_answer": "E-4021 表示当前账号权限不足，需要申请授权。",
+    "evidence": [
+      "《信息化系统使用规范》错误码表"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "E-4021"
+    ],
+    "answerable": true,
+    "document": "《信息化系统使用规范》错误码表：E-4021 表示当前账号权限不足，需在权限平台提交授权申请。",
+    "near_miss": "《信息化系统使用规范》错误码表：E-4020 表示账号已锁定，请联系服务台解锁。"
+  },
+  {
+    "id": "b288-07",
+    "question": "制度编号 HR-LEAVE-2024 对应哪项制度？",
+    "expected_answer": "HR-LEAVE-2024 对应《员工休假管理办法》。",
+    "evidence": [
+      "《员工休假管理办法》第 1 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "HR-LEAVE-2024"
+    ],
+    "answerable": true,
+    "document": "《员工休假管理办法》第 1 章：制度编号 HR-LEAVE-2024 对应年假、病假与事假的申请规则。",
+    "near_miss": "《员工休假管理办法》附录：制度编号 HR-LEAVE-2023 已于上一年度废止，不再执行。"
+  },
+  {
+    "id": "b288-08",
+    "question": "采购申请单模板 PUR-FORM-07 的用途是什么？",
+    "expected_answer": "PUR-FORM-07 用于单笔采购申请。",
+    "evidence": [
+      "《采购管理办法》附表 1"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "PUR-FORM-07"
+    ],
+    "answerable": true,
+    "document": "《采购管理办法》附表 1：采购申请单模板 PUR-FORM-07 用于单笔采购申请，需附三家比价材料。",
+    "near_miss": "《采购管理办法》附表 1：采购申请单模板 PUR-FORM-06 仅用于框架协议下的零星采购。"
+  },
+  {
+    "id": "b288-09",
+    "question": "发票编号 INV-2026-08 对应哪笔付款？",
+    "expected_answer": "INV-2026-08 对应八月云服务采购付款。",
+    "evidence": [
+      "《费用报销管理办法》第 4 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "INV-2026-08"
+    ],
+    "answerable": true,
+    "document": "《费用报销管理办法》第 4 章：发票编号 INV-2026-08 对应八月云服务采购付款，已通过审核。",
+    "near_miss": "《费用报销管理办法》第 4 章：发票编号 INV-2026-07 对应七月云服务采购付款。"
+  },
+  {
+    "id": "b288-10",
+    "question": "采购金额 5000 元需要哪一级审批？",
+    "expected_answer": "5000 元由部门负责人审批。",
+    "evidence": [
+      "《采购管理办法》第 3 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "5000 元"
+    ],
+    "answerable": true,
+    "document": "《采购管理办法》第 3 章：采购金额 5000 元 由部门负责人审批，无需提交采购委员会。",
+    "near_miss": "《采购管理办法》第 3 章：采购金额 4000 元 由采购专员直接下单，事后备案。"
+  },
+  {
+    "id": "b288-11",
+    "question": "单笔支出 30000 元需要提交什么材料？",
+    "expected_answer": "30000 元需提交三家供应商比价单。",
+    "evidence": [
+      "《采购管理办法》第 3 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "30000 元"
+    ],
+    "answerable": true,
+    "document": "《采购管理办法》第 3 章：单笔支出 30000 元 需提交三家供应商比价单及预算批复。",
+    "near_miss": "《采购管理办法》第 3 章：单笔支出 20000 元 需提交两家供应商报价单。"
+  },
+  {
+    "id": "b288-12",
+    "question": "超过 128000 元 的设备采购走什么流程？",
+    "expected_answer": "128000 元 以上需总经理审批。",
+    "evidence": [
+      "《固定资产管理办法》第 4 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "128000 元"
+    ],
+    "answerable": true,
+    "document": "《固定资产管理办法》第 4 章：超过 128000 元 的设备采购需由总经理审批后执行。",
+    "near_miss": "《固定资产管理办法》第 4 章：超过 100000 元 的设备采购需由分管副总审批。"
+  },
+  {
+    "id": "b288-13",
+    "question": "试用期提前 90 天 需要满足什么条件？",
+    "expected_answer": "提前 90 天 提出书面申请。",
+    "evidence": [
+      "《员工休假管理办法》第 2 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "90 天"
+    ],
+    "answerable": true,
+    "document": "《员工休假管理办法》第 2 章：试用期员工提前 90 天 提出书面申请，可申请延长试用期。",
+    "near_miss": "《员工休假管理办法》第 2 章：试用期员工提前 30 天 提出书面申请，可申请转正答辩。"
+  },
+  {
+    "id": "b288-14",
+    "question": "报销审核应在 15 个工作日 内完成吗？",
+    "expected_answer": "审核应在 15 个工作日 内完成。",
+    "evidence": [
+      "《费用报销管理办法》第 4 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "15 个工作日"
+    ],
+    "answerable": true,
+    "document": "《费用报销管理办法》第 4 章：报销审核应在 15 个工作日 内完成，逾期由财务负责人督办。",
+    "near_miss": "《费用报销管理办法》第 4 章：初审应在 10 个工作日 内完成，复核另行计时。"
+  },
+  {
+    "id": "b288-15",
+    "question": "安全事件需要在 24 小时 内上报吗？",
+    "expected_answer": "重大安全事件须在 24 小时 内上报。",
+    "evidence": [
+      "《信息安全管理办法》第 5 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "24 小时"
+    ],
+    "answerable": true,
+    "document": "《信息安全管理办法》第 5 章：重大安全事件须在 24 小时 内上报信息安全委员会。",
+    "near_miss": "《信息安全管理办法》第 5 章：一般安全事件须在 48 小时 内完成整改并留档。"
+  },
+  {
+    "id": "b288-16",
+    "question": "节假日加班工资按 3 倍 计算吗？",
+    "expected_answer": "法定节假日加班按 3 倍 工资计算。",
+    "evidence": [
+      "《考勤与加班管理办法》第 6 条"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "3 倍"
+    ],
+    "answerable": true,
+    "document": "《考勤与加班管理办法》第 6 条：法定节假日加班按 3 倍 工资计算，不得以调休替代。",
+    "near_miss": "《考勤与加班管理办法》第 6 条：休息日加班按 2 倍 工资计算，也可安排调休。"
+  },
+  {
+    "id": "b288-17",
+    "question": "文号 沪人社〔2025〕18 号 对应哪份通知？",
+    "expected_answer": "文号 沪人社〔2025〕18 号 对应年度社保基数调整通知。",
+    "evidence": [
+      "《社保管理办法》附件"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "文号 沪人社〔2025〕18 号"
+    ],
+    "answerable": true,
+    "document": "《社保管理办法》附件：文号 沪人社〔2025〕18 号 对应年度社保缴费基数调整通知。",
+    "near_miss": "《社保管理办法》附件：文号 沪人社〔2025〕17 号 对应上一年度社保基数调整通知。"
+  },
+  {
+    "id": "b288-18",
+    "question": "机房 A-302 的巡检频率是多少？",
+    "expected_answer": "机房 A-302 每日巡检一次。",
+    "evidence": [
+      "《机房管理办法》第 2 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "机房 A-302"
+    ],
+    "answerable": true,
+    "document": "《机房管理办法》第 2 章：机房 A-302 每日巡检一次，温湿度记录保存一年。",
+    "near_miss": "《机房管理办法》第 2 章：机房 A-301 每周巡检一次，仅记录异常项。"
+  },
+  {
+    "id": "b288-19",
+    "question": "工号 EMP-0472 的权限何时回收？",
+    "expected_answer": "工号 EMP-0472 在离职当日回收权限。",
+    "evidence": [
+      "《账号权限管理办法》第 3 章"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "工号 EMP-0472"
+    ],
+    "answerable": true,
+    "document": "《账号权限管理办法》第 3 章：工号 EMP-0472 在离职当日回收全部系统权限。",
+    "near_miss": "《账号权限管理办法》第 3 章：工号 EMP-0471 在转岗后次月调整权限。"
+  },
+  {
+    "id": "b288-20",
+    "question": "校验码 X7K-229 对应哪台设备？",
+    "expected_answer": "校验码 X7K-229 对应财务部打印服务器。",
+    "evidence": [
+      "《固定资产管理办法》附表 2"
+    ],
+    "category": "exact_term",
+    "exact_terms": [
+      "校验码 X7K-229"
+    ],
+    "answerable": true,
+    "document": "《固定资产管理办法》附表 2：校验码 X7K-229 对应财务部打印服务器，资产编号与实物一致。",
+    "near_miss": "《固定资产管理办法》附表 2：校验码 X7K-228 对应人事部打印机。"
+  }
+]

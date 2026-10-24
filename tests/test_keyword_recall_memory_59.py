@@ -11,6 +11,11 @@
 冻结副本刻意不复用 ``backend/rag/retrieval.py`` 里的打分/切分函数：如果两边共用同一份实现，
 「两边一起改错」就测不出来了。只有与本次修复无关的 ``_expand_keywords``（查询关键词展开）
 沿用模块实现。
+
+issue #288 增加 BM25 排序后，本文件的断言仍然是「修复前的逐条等价」基线：旧断言不能改成
+「BM25 也差不多」或放宽分值——那会同时失去对 #59 内存/等价回归的保护。正确做法是在本文件
+显式关闭 ``BM25_ENABLED``，让旧实现等价性继续按旧排序验证；BM25 开启后的排序由
+``tests/test_bm25_288.py`` 单独覆盖。
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import math
 import random
 import tracemalloc
 
+import pytest
 from sqlalchemy import create_engine, event
 from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.ext.compiler import compiles
@@ -28,6 +34,13 @@ from sqlalchemy.pool import StaticPool
 from database.session import Base
 from model.models import KnowledgeFile
 from rag import retrieval
+
+
+@pytest.fixture(autouse=True)
+def _legacy_ranking_baseline(monkeypatch):
+    """Keep this file's equivalence baseline on the pre-#288 keyword ordering."""
+    monkeypatch.setattr(retrieval, "BM25_ENABLED", False)
+    retrieval.clear_bm25_cache()
 
 
 @compiles(LONGTEXT, "sqlite")

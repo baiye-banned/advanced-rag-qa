@@ -1,18 +1,37 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import heapq
 import logging
 import math
+import queue
 import re
-from typing import Any, Iterator
+import threading
+import unicodedata
+from collections import OrderedDict
+from typing import Any, Iterator, NamedTuple
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
-from config import RETRIEVAL_ROUTE_TOP_K
+from config import (
+    BM25_B,
+    BM25_ENABLED,
+    BM25_K1,
+    BM25_MAX_DOCS,
+    BM25_MAX_SCORED_CANDIDATES,
+    BM25_MAX_TERMS,
+    RETRIEVAL_ROUTE_TOP_K,
+)
 from database.session import SessionLocal
 from model.models import KnowledgeFile
+from rag.bm25 import (
+    BM25CorpusTooLarge,
+    BM25Index,
+    BM25VocabularyTooLarge,
+    query_terms as bm25_query_terms,
+)
 from rag.llm import call_chat_json, call_router_json
 from rag.milvus_client import (
     EMBEDDING_UNAVAILABLE_MESSAGE,
@@ -72,6 +91,68 @@ _DIGIT_RE = re.compile(r"\d")
 _EXACT_WINDOW_SCAN_RE = re.compile("[İΣ]")
 
 logger = logging.getLogger(__name__)
+
+
+class _Bm25CacheEntry(NamedTuple):
+    """One knowledge base's BM25 corpus statistics.
+
+    The cheap change signature is ``(file_id, size)``. Knowledge files are
+    write-once through the API (``crud.knowledge_file`` has no content-update path),
+    so add/delete/replace always changes the id set or a size. An out-of-band edit
+    that rewrites a row without changing either value is not detected; it can only
+    come from outside this application, and the cost of detecting it would be
+    re-reading and hashing every LONGTEXT column on every lookup.
+    """
+
+    signature: tuple[tuple[int, int], ...]
+    index: BM25Index | None
+    reason: str
+    observed_docs: int
+    observed_terms: int
+
+
+class _BM25ScoringFailed(RuntimeError):
+    """Internal signal: BM25 scoring failed, rerun the scan with legacy ordering."""
+
+
+# Cache key: (stable database identity, knowledge_base_id, k1, b, max_docs, max_terms).
+# Parameter values are part of the key: tweaking BM25_K1/B or either cap must rebuild,
+# not silently keep serving an index built under the previous settings.
+#
+# The database identity is the rendered connection URL (host, port and database; the
+# password is hidden), not ``id(bind)``: the latter is an address that CPython reuses
+# after garbage collection, so a new engine could inherit a dead one's cached corpus.
+# In-memory databases have no stable URL, so they fall back to the object identity --
+# there is no cross-process meaning to share.
+_BM25_CACHE: OrderedDict[tuple, _Bm25CacheEntry] = OrderedDict()
+# Eight knowledge bases are kept. With more than eight active bases the LRU evicts the
+# coldest one and its next query rebuilds the full corpus (a one-off full scan, not a
+# correctness problem). Raising the limit trades that rebuild for memory: each entry
+# holds a DF Counter of up to BM25_MAX_TERMS terms (~25MB at the default cap).
+_BM25_CACHE_LIMIT = 8
+_BM25_CACHE_LOCK = threading.Lock()
+# Per-cache-key single-flight locks. N concurrent first questions for the same
+# (database, knowledge base) build the corpus once; the others wait, then hit the
+# cache. The dict is tiny (one lock per key ever built) and is deliberately not
+# evicted: removing a lock while a waiter is blocked on it would let a third caller
+# create a second lock and start a duplicate scan.
+_BM25_BUILD_LOCKS: dict[tuple, threading.Lock] = {}
+_BM25_BUILD_LOCKS_GUARD = threading.Lock()
+# The keyword recall runs in a worker thread; the diagnostics dict is scoped to that
+# call so concurrent retrievals never overwrite each other's trace.
+_BM25_DIAGNOSTICS: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "bm25_diagnostics", default=None
+)
+
+# Background prewarm (issue #288 revision). The full-corpus scan is expensive enough
+# that doing it inside the first chat request would add its whole latency to that
+# answer. Uploads schedule the affected knowledge base here after their rows commit;
+# startup schedules every base. One daemon worker keeps bursts of uploads from
+# spawning one scan thread each, and the single-flight lock above still prevents a
+# concurrent first question from duplicating the work.
+_BM25_PREWARM_QUEUE: queue.Queue[int | None] = queue.Queue(maxsize=64)
+_BM25_PREWARM_GUARD = threading.Lock()
+_BM25_PREWARM_WORKER: threading.Thread | None = None
 
 
 async def decide_need_rag(
@@ -148,7 +229,9 @@ async def retrieve_knowledge(
         "routes": [],
         "rrf": [],
         "rerank": {"status": "skipped", "items": []},
+        "bm25": _new_bm25_diagnostics(),
     }
+    bm25_diagnostics = trace["bm25"]
 
     route_results: list[tuple[str, list[dict]]] = []
     route_specs = _build_route_specs(question, query_plan)
@@ -187,7 +270,12 @@ async def retrieve_knowledge(
                 "keyword",
                 " ".join(keyword_terms),
                 asyncio.to_thread(
-                    _keyword_recall_step, db, knowledge_base_id, keyword_terms, RETRIEVAL_ROUTE_TOP_K
+                    _keyword_recall_step,
+                    db,
+                    knowledge_base_id,
+                    keyword_terms,
+                    RETRIEVAL_ROUTE_TOP_K,
+                    bm25_diagnostics,
                 ),
             )
         )
@@ -247,6 +335,7 @@ async def retrieve_knowledge(
             "routes": trace["routes"],
             "rrf": trace["rrf"],
             "rerank": rerank_trace,
+            "bm25": trace["bm25"],
         },
         result={"final_chunks_count": len(final_chunks)},
         note="retrieve_knowledge 完成，最终 chunk 会进入回答生成链。",
@@ -311,6 +400,7 @@ def _keyword_recall_step(
     knowledge_base_id: int,
     keywords: list[str],
     top_k: int,
+    diagnostics: dict | None = None,
 ) -> list[dict]:
     """关键词召回这一步的会话归属（issue #187）。
 
@@ -320,14 +410,22 @@ def _keyword_recall_step(
     「开 session → 用 → 关」整段不跨线程。
 
     传了 `db` 的调用方（启动重建、用例里的真实库）沿用它原来的会话，行为不变。
+
+    ``diagnostics`` 是本次关键词召回的 BM25 trace 槽位（issue #288）。用 ContextVar 传递
+    而不是改 `keyword_recall` 的返回值：公开返回形状是既有契约，测试也会直接替换该函数。
     """
-    if db is not None:
-        return keyword_recall(db, knowledge_base_id, keywords, top_k)
-    own_session = SessionLocal()
+    token = _BM25_DIAGNOSTICS.set(diagnostics) if diagnostics is not None else None
     try:
-        return keyword_recall(own_session, knowledge_base_id, keywords, top_k)
+        if db is not None:
+            return keyword_recall(db, knowledge_base_id, keywords, top_k)
+        own_session = SessionLocal()
+        try:
+            return keyword_recall(own_session, knowledge_base_id, keywords, top_k)
+        finally:
+            own_session.close()
     finally:
-        own_session.close()
+        if token is not None:
+            _BM25_DIAGNOSTICS.reset(token)
 
 
 def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top_k: int) -> list[dict]:
@@ -351,27 +449,569 @@ def keyword_recall(db: Session, knowledge_base_id: int, keywords: list[str], top
     「整篇归一化后取区间」不再等于「对窗口切片单独归一化」，该文件回退到与旧实现逐行同构的
     逐窗口路径（``_collect_file_keyword_candidates_exact``）。回退按文件粒度触发，中文语料
     不会命中，取数层的批上界也不受影响。
+
+    issue #288：``BM25_ENABLED`` 打开时，窗口排序键换成 BM25（``bm25_score``），但
+    ``keyword_score`` 字段与旧打分函数原样保留；关闭或 BM25 构建/打分失败时完全退回旧排序。
+    ``bm25_rank`` 是最终关键词候选的 1-based 名次。
     """
+    diagnostics = _BM25_DIAGNOSTICS.get()
     if top_k <= 0:
+        _set_bm25_diagnostics(diagnostics, status="skipped", reason="top_k_non_positive")
         return []
     clean_keywords = _expand_keywords(keywords)
     if not clean_keywords:
+        _set_bm25_diagnostics(diagnostics, status="skipped", reason="no_keywords")
         return []
     case_fold = _needs_case_fold(clean_keywords)
     prepared_keywords = _prepare_keywords(clean_keywords, case_fold)
     if not prepared_keywords:
+        _set_bm25_diagnostics(diagnostics, status="skipped", reason="no_prepared_keywords")
         return []
-    best: list[tuple[float, int, dict]] = []
+
+    index: BM25Index | None = None
+    terms: tuple[str, ...] = ()
+    cache_hit = False
+    if not BM25_ENABLED:
+        _set_bm25_diagnostics(diagnostics, status="disabled")
+    else:
+        terms = bm25_query_terms(" ".join(clean_keywords))
+        if not terms:
+            # Nothing BM25 can match (e.g. a script the tokenizer does not cover).
+            # Keep the legacy ordering instead of ranking every window at zero.
+            _set_bm25_diagnostics(diagnostics, status="fallback", reason="no_query_tokens")
+        elif not _keyword_candidates_exist(db, knowledge_base_id, clean_keywords, case_fold):
+            # The LIKE pre-filter is a necessary condition, so zero rows means zero
+            # matches. Do not pay for a full-corpus BM25 build just to return [].
+            _set_bm25_diagnostics(diagnostics, status="skipped", reason="no_candidates")
+            return []
+        else:
+            try:
+                index, cache_hit, reason, observed_docs, observed_terms = _bm25_index_for(
+                    db, knowledge_base_id
+                )
+            except Exception as exc:
+                # 异常原文只进日志；trace 只记录固定原因码（沿用 #263 的护栏）。
+                logger.warning(
+                    "BM25 index build failed, falling back to legacy keyword scoring: %s",
+                    exc,
+                    exc_info=True,
+                )
+                _set_bm25_diagnostics(
+                    diagnostics, status="fallback", degraded=True, reason="index_build_failed"
+                )
+            else:
+                if index is None:
+                    degraded = reason in {"corpus_too_large", "vocabulary_too_large"}
+                    _set_bm25_diagnostics(
+                        diagnostics,
+                        status="degraded" if degraded else "fallback",
+                        degraded=degraded,
+                        reason=reason,
+                        corpus_docs=observed_docs,
+                        corpus_terms=observed_terms,
+                    )
+
+    budget = max(top_k, BM25_MAX_SCORED_CANDIDATES) if index is not None else top_k
+    try:
+        chunks, candidates, scored, budget_exceeded = _keyword_recall_ranked(
+            db,
+            knowledge_base_id,
+            clean_keywords,
+            prepared_keywords,
+            case_fold,
+            top_k,
+            index,
+            terms,
+            budget,
+        )
+    except _BM25ScoringFailed:
+        logger.warning("BM25 scoring failed, falling back to legacy keyword scoring", exc_info=True)
+        index = None
+        budget = top_k
+        _set_bm25_diagnostics(
+            diagnostics, status="fallback", degraded=True, reason="scoring_failed"
+        )
+        # Re-scan with the legacy rank: the first pass may already have dropped
+        # candidates from its BM25-ordered heap, so reusing it would not be a true
+        # fallback.
+        chunks, candidates, scored, budget_exceeded = _keyword_recall_ranked(
+            db,
+            knowledge_base_id,
+            clean_keywords,
+            prepared_keywords,
+            case_fold,
+            top_k,
+            None,
+            (),
+            budget,
+        )
+
+    if index is not None:
+        _set_bm25_diagnostics(
+            diagnostics,
+            status="ok",
+            degraded=False,
+            reason="",
+            corpus_docs=index.doc_count,
+            corpus_terms=index.term_count,
+            cache_hit=cache_hit,
+        )
+    _set_bm25_diagnostics(
+        diagnostics,
+        candidates=candidates,
+        scored_candidates=scored,
+        candidate_budget=budget,
+        scoring_budget_exceeded=budget_exceeded,
+    )
+    return chunks
+
+
+def _keyword_recall_ranked(
+    db: Session,
+    knowledge_base_id: int,
+    clean_keywords: list[str],
+    prepared_keywords: list[tuple[str, str, float]],
+    case_fold: bool,
+    top_k: int,
+    index: BM25Index | None,
+    terms: tuple[str, ...],
+    budget: int,
+) -> tuple[list[dict], int, int, bool]:
+    """Scan candidates and return ``(top_k chunks, candidates, scored, truncated)``.
+
+    When BM25 is active the scan does **not** tokenise every matching window. Windows
+    are first pre-ranked by a cheap proxy (``_bm25_cheap_upper``) and only the best
+    ``budget`` of them get a full BM25 score, so the keyword-route cost is bounded by
+    the budget instead of the number of ``LIKE`` matches. ``truncated`` says whether
+    the scan saw more matches than the budget. On truncation the windows outside the
+    retained heap are discarded and the returned top-k is an approximate ordering;
+    the trace's ``scoring_budget_exceeded`` makes that visible instead of silent.
+    """
+    best: list[tuple[tuple[float, float], int, dict]] = []
     order = 0
+    bm25 = None
+    if index is not None:
+        # IDF is corpus-level, so look it up once per query term instead of once per
+        # candidate window: ``idf()`` is a dict lookup plus a log, and the scan may
+        # visit thousands of windows.
+        bm25 = (index, tuple((term, index.idf(term)) for term in terms))
     for file_id, file_name, content in _iter_keyword_candidate_files(
         db, knowledge_base_id, clean_keywords, case_fold
     ):
         order = _collect_file_keyword_candidates(
-            file_id, file_name, content, clean_keywords, prepared_keywords, case_fold, top_k, best, order
+            file_id,
+            file_name,
+            content,
+            clean_keywords,
+            prepared_keywords,
+            case_fold,
+            budget,
+            best,
+            order,
+            bm25,
         )
-    # 与旧实现 candidates.sort(key=keyword_score, reverse=True)[:top_k] 等价：Python 排序稳定，
-    # 同分候选保持「文件主键序、窗口起点序」；这里用 -order 复刻同一顺序。
-    return [item[2] for item in sorted(best, key=lambda item: (-item[0], -item[1]))]
+    if index is None:
+        # 与旧实现 candidates.sort(key=keyword_score, reverse=True)[:top_k] 等价：Python 排序稳定，
+        # 同分候选保持「文件主键序、窗口起点序」；这里用负的 rank key 复刻同一顺序。
+        final = [item[2] for item in sorted(best, key=_candidate_sort_key)]
+        return final, order, 0, False
+
+    # Full BM25 score, exactly once per retained window (at most ``budget``).
+    scored: list[tuple[float, float, int, dict]] = []
+    for _cheap, neg_order, candidate in best:
+        score = _score_bm25((index, terms), candidate["content"])
+        # ``_score_bm25`` raises instead of returning None for the non-None context.
+        assert score is not None
+        candidate["bm25_score"] = score
+        scored.append((score, candidate["keyword_score"], neg_order, candidate))
+    # ``neg_order`` is ``-order``; negating again restores the earlier-first order.
+    scored.sort(key=lambda item: (-item[0], -item[1], -item[2]))
+    final = [item[3] for item in scored[:top_k]]
+    for rank, candidate in enumerate(final, start=1):
+        candidate["bm25_rank"] = rank
+    return final, order, len(scored), order > budget
+
+
+def _candidate_sort_key(item: tuple[tuple[float, float], int, dict]) -> tuple[float, float, int]:
+    rank_key, neg_order, _candidate = item
+    return (-rank_key[0], -rank_key[1], -neg_order)
+
+
+def _new_bm25_diagnostics() -> dict:
+    """Trace shape for the BM25 stage (issue #288).
+
+    The trace carries parameters, corpus/candidate sizes and a fixed reason code.
+    It never carries an exception message from the index/scoring path.
+    """
+    return {
+        "enabled": bool(BM25_ENABLED),
+        "k1": float(BM25_K1),
+        "b": float(BM25_B),
+        "max_docs": int(BM25_MAX_DOCS),
+        "max_terms": int(BM25_MAX_TERMS),
+        "candidate_budget": int(BM25_MAX_SCORED_CANDIDATES),
+        "status": "skipped",
+        "candidates": 0,
+        "scored_candidates": 0,
+        # True means the pre-ranking heap was truncated: only ``candidate_budget``
+        # windows got a full BM25 score and the returned top-k is approximate.
+        "scoring_budget_exceeded": False,
+        "corpus_docs": 0,
+        "corpus_terms": 0,
+        "cache_hit": False,
+        "degraded": False,
+        "reason": "",
+    }
+
+
+def _set_bm25_diagnostics(diagnostics: dict | None, **fields) -> None:
+    if diagnostics is None:
+        return
+    diagnostics.update(fields)
+
+
+def clear_bm25_cache() -> None:
+    """Drop all cached BM25 corpus statistics (tests and explicit invalidation)."""
+    with _BM25_CACHE_LOCK:
+        _BM25_CACHE.clear()
+
+
+def schedule_bm25_prewarm(knowledge_base_id: int | None = None) -> None:
+    """Queue a background corpus build so the first question does not pay for it.
+
+    Uploads call this after their row commits; startup calls it with no id to warm
+    every knowledge base. ``None`` means "all". A full queue drops the item: the cache
+    still builds on demand, so a dropped prewarm only means the next query pays the
+    scan itself.
+    """
+    if not BM25_ENABLED:
+        return
+    _ensure_bm25_prewarm_worker()
+    try:
+        _BM25_PREWARM_QUEUE.put_nowait(knowledge_base_id)
+    except queue.Full:
+        logger.debug("BM25 prewarm queue is full; leaving the build to the next query")
+
+
+def _ensure_bm25_prewarm_worker() -> None:
+    global _BM25_PREWARM_WORKER
+    with _BM25_PREWARM_GUARD:
+        if _BM25_PREWARM_WORKER is not None and _BM25_PREWARM_WORKER.is_alive():
+            return
+        worker = threading.Thread(
+            target=_bm25_prewarm_worker, name="bm25-prewarm", daemon=True
+        )
+        _BM25_PREWARM_WORKER = worker
+        worker.start()
+
+
+def _bm25_prewarm_worker() -> None:
+    while True:
+        knowledge_base_id = _BM25_PREWARM_QUEUE.get()
+        try:
+            _prewarm_bm25(knowledge_base_id)
+        except Exception as exc:
+            # 后台预热失败只影响「首问是否已热」，检索路径会自己重建并记录降级；
+            # 异常原文只进日志。
+            logger.warning(
+                "BM25 prewarm failed: knowledge_base_id=%s error=%s",
+                knowledge_base_id,
+                exc,
+                exc_info=True,
+            )
+        finally:
+            _BM25_PREWARM_QUEUE.task_done()
+
+
+def _prewarm_bm25(knowledge_base_id: int | None) -> None:
+    """Build one knowledge base's corpus, or every base when the id is ``None``.
+
+    Warming more than ``_BM25_CACHE_LIMIT`` bases leaves only the last ones in the
+    LRU; the earlier ones are rebuilt on their next query (documented in .env.example).
+    """
+    if not BM25_ENABLED:
+        return
+    db = SessionLocal()
+    try:
+        if knowledge_base_id is not None:
+            _bm25_index_for(db, knowledge_base_id)
+            return
+        rows = (
+            db.query(KnowledgeFile.knowledge_base_id)
+            .filter(KnowledgeFile.knowledge_base_id.isnot(None))
+            .distinct()
+            .all()
+        )
+        for (kb_id,) in rows:
+            if not BM25_ENABLED:
+                return
+            _bm25_index_for(db, int(kb_id))
+    finally:
+        db.close()
+
+
+def _bm25_cache_scope(db: Session) -> str:
+    """Stable identity shared by sessions of the same database.
+
+    The rendered URL (host, port, database, password hidden) is stable across
+    sessions and process lifetimes.
+    ``id(bind)`` is not: it is an address, and CPython reuses addresses after garbage
+    collection, so a brand-new engine could inherit a dead one's corpus. In-memory
+    databases have no stable URL, so they fall back to object identity -- there is no
+    cross-connection meaning to share anyway.
+    """
+    try:
+        bind = db.get_bind()
+    except Exception:
+        bind = None
+    if bind is None:
+        return f"session:{id(db)}"
+    url = getattr(bind, "url", None)
+    if url is None:
+        return f"bind:{id(bind)}"
+    database = url.database
+    if database and database != ":memory:":
+        # Render the whole URL (password hidden): host, port and database all
+        # distinguish deployments, and a shared database name on two hosts must not
+        # share a corpus.
+        return url.render_as_string(hide_password=True)
+    return f"{url.drivername}:memory:{id(bind)}"
+
+
+def _bm25_cache_key(scope: str, knowledge_base_id: int) -> tuple:
+    """Cache key including every parameter that changes the resulting scores."""
+    return (
+        scope,
+        int(knowledge_base_id),
+        float(BM25_K1),
+        float(BM25_B),
+        int(BM25_MAX_DOCS),
+        int(BM25_MAX_TERMS),
+    )
+
+
+def _bm25_build_lock(cache_key: tuple) -> threading.Lock:
+    """Per-key single-flight lock (see ``_BM25_BUILD_LOCKS``)."""
+    with _BM25_BUILD_LOCKS_GUARD:
+        lock = _BM25_BUILD_LOCKS.get(cache_key)
+        if lock is None:
+            lock = threading.Lock()
+            _BM25_BUILD_LOCKS[cache_key] = lock
+        return lock
+
+
+def _cached_bm25_entry(cache_key: tuple, signature: tuple) -> tuple | None:
+    """Return the cached result if the signature still matches, else ``None``."""
+    with _BM25_CACHE_LOCK:
+        cached = _BM25_CACHE.get(cache_key)
+        if cached is None or cached.signature != signature:
+            return None
+        _BM25_CACHE.move_to_end(cache_key)
+        return (
+            cached.index,
+            True,
+            cached.reason,
+            cached.observed_docs,
+            cached.observed_terms,
+        )
+
+
+def _bm25_signature(db: Session, knowledge_base_id: int) -> tuple[tuple[int, int], ...]:
+    """Cheap change signal for a knowledge base: ``(file_id, size)`` per file.
+
+    Knowledge files are create/delete-only in this application (``crud.knowledge_file``
+    has no content-update path), so this pair changes on every add/delete/replace.
+    The full content digests are computed once when the index is built and stored in
+    the cache entry; re-reading every LONGTEXT column just to hash it would defeat
+    the point of caching the corpus scan.
+    """
+    rows = (
+        db.query(KnowledgeFile.id, KnowledgeFile.size)
+        .filter(KnowledgeFile.knowledge_base_id == knowledge_base_id)
+        .order_by(KnowledgeFile.id)
+        .all()
+    )
+    return tuple((int(row[0]), int(row[1] or 0)) for row in rows)
+
+
+def _iter_knowledge_base_contents(
+    db: Session, knowledge_base_id: int
+) -> Iterator[tuple[int, str]]:
+    """Stream every file's content with the same paged/adaptive batching as recall."""
+    last_id = 0
+    batch_rows = KEYWORD_RECALL_BATCH_SIZE
+    while True:
+        rows = (
+            db.query(KnowledgeFile.id, KnowledgeFile.content)
+            .filter(
+                KnowledgeFile.knowledge_base_id == knowledge_base_id,
+                KnowledgeFile.id > last_id,
+            )
+            .order_by(KnowledgeFile.id)
+            .limit(batch_rows)
+            .all()
+        )
+        if not rows:
+            return
+        batch_chars = 0
+        for file_id, content in rows:
+            content = content or ""
+            batch_chars += len(content)
+            yield int(file_id), content
+        last_id = int(rows[-1][0])
+        average_chars = max(batch_chars // len(rows), 1)
+        batch_rows = max(
+            1, min(KEYWORD_RECALL_BATCH_ROWS_MAX, KEYWORD_RECALL_BATCH_CHARS // average_chars)
+        )
+
+
+def _bm25_window_texts(content: str) -> Iterator[str]:
+    """Same ``KEYWORD_CHUNK_SIZE``/overlap windows the keyword route retrieves."""
+    for start in _keyword_chunk_starts(len(content)):
+        text = content[start : start + KEYWORD_CHUNK_SIZE].strip()
+        if text:
+            yield text
+
+
+def _bm25_index_for(
+    db: Session, knowledge_base_id: int
+) -> tuple[BM25Index | None, bool, str, int, int]:
+    """Return ``(index, cache_hit, reason, observed_docs, observed_terms)``.
+
+    DF is accumulated over **all** retrievable windows; there is deliberately no
+    fallback to the current query's ``LIKE`` candidates. A cap breach (windows or
+    distinct terms) returns ``index=None`` with a fixed reason so the caller records
+    an explicit degradation and keeps the legacy ordering.
+
+    Concurrent first lookups for the same key are serialised: the first builds, the
+    rest wait and then read the cache. Without that lock, N simultaneous first
+    questions would each scan the whole knowledge base.
+    """
+    signature = _bm25_signature(db, knowledge_base_id)
+    cache_key = _bm25_cache_key(_bm25_cache_scope(db), knowledge_base_id)
+    cached = _cached_bm25_entry(cache_key, signature)
+    if cached is not None:
+        return cached
+
+    with _bm25_build_lock(cache_key):
+        # Re-read after waiting: another thread may have built it, and an upload may
+        # have committed while we waited, which changes the signature.
+        signature = _bm25_signature(db, knowledge_base_id)
+        cached = _cached_bm25_entry(cache_key, signature)
+        if cached is not None:
+            return cached
+
+        index, reason, observed_docs, observed_terms = _build_bm25_index(
+            db, knowledge_base_id
+        )
+        entry = _Bm25CacheEntry(
+            signature=signature,
+            index=index,
+            reason=reason,
+            observed_docs=observed_docs,
+            observed_terms=observed_terms,
+        )
+        with _BM25_CACHE_LOCK:
+            _BM25_CACHE[cache_key] = entry
+            _BM25_CACHE.move_to_end(cache_key)
+            while len(_BM25_CACHE) > _BM25_CACHE_LIMIT:
+                _BM25_CACHE.popitem(last=False)
+        if reason:
+            # A cap breach is a permanent degradation for this knowledge base until
+            # its files change. Make it operator-visible instead of trace-only.
+            logger.warning(
+                "BM25 corpus degraded for knowledge_base_id=%s reason=%s "
+                "observed_docs=%s observed_terms=%s; the keyword route keeps legacy ordering",
+                knowledge_base_id,
+                reason,
+                observed_docs,
+                observed_terms,
+            )
+        return index, False, reason, observed_docs, observed_terms
+
+
+def _build_bm25_index(
+    db: Session, knowledge_base_id: int
+) -> tuple[BM25Index | None, str, int, int]:
+    """Scan one knowledge base into corpus statistics, or report why it was capped."""
+    observed_docs = 0
+
+    def documents() -> Iterator[str]:
+        nonlocal observed_docs
+        for _file_id, content in _iter_knowledge_base_contents(db, knowledge_base_id):
+            for text in _bm25_window_texts(content):
+                observed_docs += 1
+                yield text
+
+    try:
+        index = BM25Index(
+            documents(),
+            k1=BM25_K1,
+            b=BM25_B,
+            max_docs=BM25_MAX_DOCS,
+            max_terms=BM25_MAX_TERMS,
+        )
+        return index, "", index.doc_count, index.term_count
+    except BM25CorpusTooLarge as exc:
+        return None, "corpus_too_large", exc.doc_count, 0
+    except BM25VocabularyTooLarge as exc:
+        return None, "vocabulary_too_large", observed_docs, exc.term_count
+
+
+def _keyword_candidates_exist(
+    db: Session, knowledge_base_id: int, clean_keywords: list[str], case_fold: bool
+) -> bool:
+    """Cheap existence probe before paying for a full-corpus BM25 build.
+
+    The SQL pre-filter only over-selects (it is a necessary condition), so zero rows
+    means zero real candidates and the index would be built for nothing. When the
+    pre-filter cannot be pushed down this only checks that the knowledge base has any
+    file at all, which is still cheaper than the corpus scan.
+    """
+    query = db.query(KnowledgeFile.id).filter(
+        KnowledgeFile.knowledge_base_id == knowledge_base_id
+    )
+    prefilter = _sql_prefilter_patterns(clean_keywords, case_fold)
+    if prefilter is not None:
+        column = func.lower(KnowledgeFile.content) if case_fold else KnowledgeFile.content
+        query = query.filter(
+            or_(*[column.like(pattern, escape=LIKE_ESCAPE) for pattern in prefilter])
+        )
+    return bool(query.limit(1).all())
+
+
+def _bm25_cheap_upper(idf_terms: tuple[tuple[str, float], ...], window_norm: str) -> float:
+    """Cheap pre-ranking proxy for a window's BM25 score, without tokenising it.
+
+    For every query term whose NFKC spelling occurs in the window, add its IDF. This
+    skips tokenisation, term frequency and length normalisation, so it is a proxy for
+    the real score, **not** a tight mathematical bound and not a ranking guarantee.
+
+    It is only used to choose which ``BM25_MAX_SCORED_CANDIDATES`` windows get a full
+    ``score_text``. When the budget is exceeded, windows outside the retained heap are
+    dropped after this pre-ranking, so the returned top-k is an approximation rather
+    than an exact BM25 ordering. ``scoring_budget_exceeded`` in the trace records that
+    truncation; it must not be read as "no candidates were lost".
+    """
+    total = 0.0
+    for term, weight in idf_terms:
+        if weight > 0 and term in window_norm:
+            total += weight
+    return total
+
+
+def _score_bm25(bm25: tuple[BM25Index, tuple[str, ...]] | None, content: str) -> float | None:
+    """Score one candidate window; ``None`` means the legacy path is active."""
+    if bm25 is None:
+        return None
+    index, terms = bm25
+    try:
+        score = float(index.score_text(content, terms))
+    except Exception as exc:
+        raise _BM25ScoringFailed() from exc
+    if not math.isfinite(score):
+        raise _BM25ScoringFailed()
+    return score
 
 
 def _iter_keyword_candidate_files(
@@ -539,14 +1179,21 @@ def _collect_file_keyword_candidates(
     clean_keywords: list[str],
     prepared_keywords: list[tuple[str, str, float]],
     case_fold: bool,
-    top_k: int,
-    best: list[tuple[float, int, dict]],
+    budget: int,
+    best: list[tuple[tuple[float, float], int, dict]],
     order: int,
+    bm25: tuple[BM25Index, tuple[tuple[str, float], ...]] | None = None,
 ) -> int:
-    """把单个文件里命中的窗口并入 top_k 候选（有界堆），返回更新后的候选序号。"""
+    """把单个文件里命中的窗口并入有界堆，返回更新后的候选序号。
+
+    ``budget`` 在 BM25 开启时是「最多对多少个窗口做完整打分」的预算（`top_k` 与
+    ``BM25_MAX_SCORED_CANDIDATES`` 的较大值），关闭时就是 ``top_k``。窗口先按廉价代理
+    预排序入堆，完整 BM25 只在扫描结束后对堆内窗口做一次（见 ``_keyword_recall_ranked``）。
+    触顶时堆外窗口会被截断，最终 top-k 是近似排序。
+    """
     if _needs_exact_window_scan(content):
         return _collect_file_keyword_candidates_exact(
-            file_id, file_name, content, clean_keywords, top_k, best, order
+            file_id, file_name, content, clean_keywords, budget, best, order, bm25
         )
     normalized_content = _normalize_for_match(content, case_fold)
     occurrences = []
@@ -583,37 +1230,47 @@ def _collect_file_keyword_candidates(
             continue
         order += 1
         chunk_id = str(raw_start)
-        _keep_best_candidate(
-            best,
-            top_k,
-            order,
-            score,
-            {
-                "id": f"{file_id}_{chunk_id}",
-                "chunk_id": chunk_id,
-                "content": chunk_content,
-                "file_name": file_name,
-                "file_id": file_id,
-                "route": "keyword",
-                "keyword_score": score,
-                # 命中证据随候选一起带出，供 select_final_chunks 校验（issue #56）。
-                "keyword_hits": len(matched_keywords),
-                "matched_keywords": matched_keywords,
-            },
-        )
+        candidate = {
+            "id": f"{file_id}_{chunk_id}",
+            "chunk_id": chunk_id,
+            "content": chunk_content,
+            "file_name": file_name,
+            "file_id": file_id,
+            "route": "keyword",
+            "keyword_score": score,
+            # 命中证据随候选一起带出，供 select_final_chunks 校验（issue #56）。
+            "keyword_hits": len(matched_keywords),
+            "matched_keywords": matched_keywords,
+        }
+        if bm25 is None:
+            rank_key = (score, 0.0)
+        else:
+            # ``normalized_content`` 已去空白并折小写；NFKC 让全角写法与 ``tokenize``
+            # 的查询词项对齐。只对命中窗口做，未命中窗口不付这份成本。
+            window_norm = unicodedata.normalize(
+                "NFKC", normalized_content[window_start:window_end]
+            )
+            rank_key = (_bm25_cheap_upper(bm25[1], window_norm), score)
+        _keep_best_candidate(best, budget, order, rank_key, candidate)
     return order
 
 
 def _keep_best_candidate(
-    best: list[tuple[float, int, dict]], top_k: int, order: int, score: float, candidate: dict
+    best: list[tuple[tuple[float, float], int, dict]],
+    budget: int,
+    order: int,
+    rank_key: tuple[float, float],
+    candidate: dict,
 ) -> None:
-    """有界 top_k 堆：只保留分值最高的 top_k 条，同分保留更早出现的候选。
+    """有界堆：只保留排序键最高的 ``budget`` 条，同分保留更早出现的候选。
 
-    堆顶是「最差」条目（分值最低；同分时 -order 最小即出现最晚），因此新候选只要比堆顶
-    更好就替换它。这样内存只与 ``top_k`` 相关，不再为每个窗口都留一个候选字典。
+    ``rank_key`` 在 BM25 开启时是 ``(廉价代理分, keyword_score)``（完整 BM25 分数要等扫描
+    结束后再算，见 ``_keyword_recall_ranked``），关闭时是 ``(keyword_score, 0.0)``。
+    堆顶是「最差」条目（排序键最低；同分时 -order 最小即出现最晚），因此新候选只要比堆顶
+    更好就替换它。这样内存只与预算相关，不再为每个窗口都留一个候选字典。
     """
-    entry = (score, -order, candidate)
-    if len(best) < top_k:
+    entry = (rank_key, -order, candidate)
+    if len(best) < budget:
         heapq.heappush(best, entry)
     elif entry[:2] > best[0][:2]:
         heapq.heapreplace(best, entry)
@@ -624,9 +1281,10 @@ def _collect_file_keyword_candidates_exact(
     file_name: str,
     content: str,
     clean_keywords: list[str],
-    top_k: int,
-    best: list[tuple[float, int, dict]],
+    budget: int,
+    best: list[tuple[tuple[float, float], int, dict]],
     order: int,
+    bm25: tuple[BM25Index, tuple[tuple[str, float], ...]] | None = None,
 ) -> int:
     """含 ``İ``/``Σ`` 的文件：逐窗口重新归一化的精确路径（见 _needs_exact_window_scan）。
 
@@ -652,24 +1310,26 @@ def _collect_file_keyword_candidates_exact(
         if score <= 0:
             continue
         order += 1
-        _keep_best_candidate(
-            best,
-            top_k,
-            order,
-            score,
-            {
-                "id": f"{file_id}_{raw_start}",
-                "chunk_id": str(raw_start),
-                "content": chunk_content,
-                "file_name": file_name,
-                "file_id": file_id,
-                "route": "keyword",
-                "keyword_score": score,
-                # 命中证据随候选一起带出，供 select_final_chunks 校验（issue #56）。
-                "keyword_hits": len(matched_keywords),
-                "matched_keywords": matched_keywords,
-            },
-        )
+        candidate = {
+            "id": f"{file_id}_{raw_start}",
+            "chunk_id": str(raw_start),
+            "content": chunk_content,
+            "file_name": file_name,
+            "file_id": file_id,
+            "route": "keyword",
+            "keyword_score": score,
+            # 命中证据随候选一起带出，供 select_final_chunks 校验（issue #56）。
+            "keyword_hits": len(matched_keywords),
+            "matched_keywords": matched_keywords,
+        }
+        if bm25 is None:
+            rank_key = (score, 0.0)
+        else:
+            window_norm = unicodedata.normalize(
+                "NFKC", _normalize_for_match(chunk_content)
+            )
+            rank_key = (_bm25_cheap_upper(bm25[1], window_norm), score)
+        _keep_best_candidate(best, budget, order, rank_key, candidate)
     return order
 
 

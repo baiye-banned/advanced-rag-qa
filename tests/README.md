@@ -239,6 +239,7 @@ Current files:
 
 - `test_attachment_lifecycle.py`
 - `test_auth_service.py`
+- `test_bm25_288.py`
 - `test_boundary_modules.py`
 - `test_chat_export_252.py`
 - `test_chat_service_retrieval.py`
@@ -543,7 +544,14 @@ required categories each contribute two cases plus twenty exact-term entries res
 missing fields and duplicate IDs are reported without suppressing the report, external question sets
 stay path-private and warn instead of failing on absent categories, two dry runs are identical apart
 from the timestamp, Recall@5/20 is computed only from explicitly supplied retrieval results, and the
-recorded character-chunk baseline is checked against `chunk_text`'s AST defaults.
+recorded character-chunk baseline is checked against `chunk_text`'s AST defaults. `test_bm25_288.py`
+covers issue #288's BM25 keyword ranking: tokenisation, NFKC folding, length normalisation, document
+frequency from every knowledge-base window rather than the LIKE candidate set, the candidate budget
+that caps full scoring at `BM25_MAX_SCORED_CANDIDATES` (asserted by counting `score_text` calls,
+never by wall clock), the vocabulary cap, stable cache keys with single-flight rebuilds, prewarm,
+the no-candidate/no-index path, and a 20-question exact-term fixture with realistic paragraphs and
+near misses - the legacy ranking finds none of the targets in its top five while BM25 ranks all
+twenty first.
 
 `conftest.py` puts `backend/` on `sys.path` so the tests can import application modules, and holds the test doubles shared by more than one test file: the `FakeQuery`/`FakeDb`/`FakeUser`/`FakeKnowledgeBase`/`FakeTraceRecorder` classes, the pytest fixtures built on them (`fake_user`, `fake_db`, `fake_knowledge_base`, `trace_recorder_cls`), and the SSE helpers (`collect_stream`, `parse_sse_frames`, `frames_of_type`, `streamed_content`). Test doubles used by a single file stay in that file.
 

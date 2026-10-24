@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from config import KNOWLEDGE_INDEX_MAX_WORKERS, KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
 from rag.milvus_client import EmbeddingBackendError, add_chunks, delete_file_chunks
+from rag.retrieval import schedule_bm25_prewarm
 from crud import knowledge_base as crud_knowledge_base
 from crud import knowledge_file as crud_knowledge_file
 from crud.pagination import LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT
@@ -291,6 +292,9 @@ def rebuild_existing_knowledge_index():
             except Exception as exc:
                 # 单个文件失败不阻塞启动：旧索引保持原样，可修复向量化服务后再次重建。
                 logger.warning("Knowledge index rebuild failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
+        # 启动重建完成后把 BM25 语料也预热一遍；重建路径本来就要遍历整库，这里不该让
+        # 第一问再独自扫描一次。
+        schedule_bm25_prewarm()
     finally:
         db.close()
 
@@ -590,6 +594,9 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
             _keep_knowledge_file_row(entry.id, reason="indexing failed and vector cleanup did not confirm success")
         raise HTTPException(500, _index_failure_detail(exc))
 
+    # 行已提交、向量已写入：立刻在后台重建该知识库的 BM25 语料，让上传后的第一次提问
+    # 不必自己承担整库扫描（issue #288 返工轮 medium-1）。预热是尽力而为，失败不影响上传。
+    schedule_bm25_prewarm(knowledge_base.id)
     return crud_knowledge_file.serialize_knowledge_file(entry)
 
 
@@ -603,7 +610,11 @@ def delete_knowledge(fid: int, user: User = Depends(get_current_user), db: Sessi
         scope="Knowledge file",
         detail="知识文件删除失败，向量库清理异常，请稍后重试。",
     )
+    knowledge_base_id = getattr(entry, "knowledge_base_id", None)
     crud_knowledge_file.delete_knowledge_file(db, fid, user.id)
+    # 删除同样改变了该知识库的 BM25 语料：后台重建，避免下一问仍扫描到已删内容。
+    if knowledge_base_id is not None:
+        schedule_bm25_prewarm(knowledge_base_id)
     return {"message": "ok"}
 
 
