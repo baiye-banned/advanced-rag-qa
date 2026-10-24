@@ -12,7 +12,7 @@ httpx==0.28.1
 python-docx==1.2.0
 pypdf>=6.19.0
 langchain-openai==1.6.7
-openai>=3.23.0
+openai>=3.35.1
 pymilvus[milvus_lite]==3.0.2
 milvus-lite==3.2.1
 python-dotenv>=1.2.4
