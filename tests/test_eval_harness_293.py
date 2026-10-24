@@ -548,7 +548,13 @@ def test_near_duplicate_questions_and_answers_are_reported_with_configurable_thr
     assert "near_duplicate_answer" in warning_codes
 
 
-def test_character_baseline_matches_production_defaults():
+def test_character_baseline_is_an_explicit_legacy_path():
+    """issue #287 之后生产默认走 token 路径，字符基线改为显式传参。
+
+    ``CHARACTER_BASELINE`` 仍用于对比历史口径，但它不再等于 ``chunk_text`` 的默认值：
+    只有显式传入 ``chunk_size`` / ``chunk_overlap`` 时才走字符窗口。这里钉住两件事：
+    默认值保持 None（否则服务端会静默退回字符路径），以及基线配置仍是显式的 1200/150。
+    """
     source = (ROOT / "backend" / "crud" / "knowledge_file.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
 
@@ -563,5 +569,7 @@ def test_character_baseline_matches_production_defaults():
             break
 
     assert defaults is not None
-    assert defaults["chunk_size"] == eval_rag.CHARACTER_BASELINE["chunk_size"]
-    assert defaults["chunk_overlap"] == eval_rag.CHARACTER_BASELINE["chunk_overlap"]
+    assert defaults["chunk_size"] is None
+    assert defaults["chunk_overlap"] is None
+    assert eval_rag.CHARACTER_BASELINE["chunk_size"] == 1200
+    assert eval_rag.CHARACTER_BASELINE["chunk_overlap"] == 150

@@ -25,7 +25,15 @@ from sqlalchemy.pool import StaticPool
 from crud import chat as crud_chat
 from database import session as db_session
 from database.session import Base
-from model.models import Conversation, KnowledgeBase, KnowledgeFile, Message, RevokedToken, User
+from model.models import (
+    Conversation,
+    KnowledgeBase,
+    KnowledgeChunkMetadata,
+    KnowledgeFile,
+    Message,
+    RevokedToken,
+    User,
+)
 from router import chat as chat_router
 from router import knowledge as knowledge_router
 from service import auth_service, chat_service
@@ -58,6 +66,7 @@ def api():
             User.__table__, RevokedToken.__table__,
             KnowledgeBase.__table__,
             KnowledgeFile.__table__,
+            KnowledgeChunkMetadata.__table__,
             Conversation.__table__,
             Message.__table__,
         ],

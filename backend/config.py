@@ -181,32 +181,40 @@ TEXT_FALLBACK_MODEL = os.getenv("TEXT_FALLBACK_MODEL", "qwen3.6-plus")
 DEFAULT_EMBEDDING_TOKEN_SAFETY_RATIO = 0.85  # scan-secrets:allow numeric ratio, not a credential
 
 
-def normalize_token_safety_ratio(value, default: float = DEFAULT_EMBEDDING_TOKEN_SAFETY_RATIO) -> float:
-    """Clamp ``EMBEDDING_TOKEN_SAFETY_RATIO`` into ``(0, 1]``.
+def normalize_token_safety_ratio(
+    value,
+    default: float = DEFAULT_EMBEDDING_TOKEN_SAFETY_RATIO,
+    name: str = "EMBEDDING_TOKEN_SAFETY_RATIO",
+) -> float:
+    """Clamp ``<name>`` into ``(0, 1]``.
 
     A ratio of 0 shrinks the packing budget to a single token and fails every batch;
     a ratio above 1 removes the safety margin the provider tokenizer needs. Both are
     configuration mistakes, so warn and use a usable value instead of honoring them.
+    ``name`` keeps the warning pointing at the knob the operator actually set
+    (embedding packing vs. chunk budget).
     """
     try:
         ratio = float(value)
     except (TypeError, ValueError):
         _logger.warning(
-            "EMBEDDING_TOKEN_SAFETY_RATIO value %r is not a number; using default %s", value, default
+            "%s value %r is not a number; using default %s", name, value, default
         )
         return default
     if ratio <= 0:
         _logger.warning(
-            "EMBEDDING_TOKEN_SAFETY_RATIO value %s must be in (0, 1]; using the default %s "
+            "%s value %s must be in (0, 1]; using the default %s "
             "instead of shrinking the packing budget to nothing",
+            name,
             ratio,
             default,
         )
         return default
     if ratio > 1:
         _logger.warning(
-            "EMBEDDING_TOKEN_SAFETY_RATIO value %s exceeds 1; clamping to 1.0 so requests cannot "
+            "%s value %s exceeds 1; clamping to 1.0 so requests cannot "
             "overrun the model token limit",
+            name,
             ratio,
         )
         return 1.0
@@ -260,6 +268,20 @@ EMBEDDING_MAX_RETRIES = _env_int("EMBEDDING_MAX_RETRIES", 2)
 # 64-item / 60000-character request that the provider rejects.
 EMBEDDING_INGEST_BATCH_SIZE = _env_int("EMBEDDING_INGEST_BATCH_SIZE", EMBEDDING_MAX_BATCH_ITEMS)
 EMBEDDING_INGEST_BATCH_MAX_CHARS = _env_int("EMBEDDING_INGEST_BATCH_MAX_CHARS", 0)
+
+# Chunking (issue #287). Ingestion slices text by a token budget instead of a fixed
+# character window. The limit/target/overlap are expressed in tokens counted by the
+# configured tiktoken encoding; the safety ratio scales the hard limit down so the
+# provider tokenizer has headroom. Character-mode callers of chunk_text (explicit
+# chunk_size/chunk_overlap) are unaffected by these knobs.
+CHUNK_TOKEN_LIMIT = _env_int("CHUNK_TOKEN_LIMIT", 500)
+CHUNK_TOKEN_TARGET = _env_int("CHUNK_TOKEN_TARGET", 400)
+CHUNK_TOKEN_OVERLAP = _env_int("CHUNK_TOKEN_OVERLAP", 50)
+CHUNK_TOKENIZER = os.getenv("CHUNK_TOKENIZER", "cl100k_base").strip() or "cl100k_base"
+CHUNK_TOKEN_SAFETY_RATIO = normalize_token_safety_ratio(
+    _env_float("CHUNK_TOKEN_SAFETY_RATIO", 0.85),
+    name="CHUNK_TOKEN_SAFETY_RATIO",
+)
 
 # Bulk ingestion keeps its own timeout instead of sharing the online-QA one above.
 # A batch now carries at most EMBEDDING_MAX_BATCH_ITEMS chunks (10 by default), so the

@@ -135,6 +135,24 @@ def _ensure_schema_columns():
         _ensure_mysql_varchar_column("users", "password_hash", 255, nullable=False)
         _ensure_mysql_varchar_column("users", "avatar", 500)
 
+    if "knowledge_chunk_metadata" in table_names:
+        # 新表由 create_all 建；老库升级时这张表同样由 create_all 补建。这里兜住的是
+        # 「表已存在但索引/列类型不对」的形态：缺索引会让按 file_id 的清理变成全表扫描，
+        # 缺唯一键会让重复上传累积同一 chunk 的多行。
+        _ensure_single_column_index(
+            "knowledge_chunk_metadata",
+            "file_id",
+            "ix_knowledge_chunk_metadata_file_id",
+        )
+        _ensure_single_column_index(
+            "knowledge_chunk_metadata",
+            "knowledge_base_id",
+            "ix_knowledge_chunk_metadata_knowledge_base_id",
+        )
+        _ensure_chunk_metadata_unique_index()
+        _ensure_mysql_text_column("knowledge_chunk_metadata", "parent_text", "LONGTEXT")
+        _ensure_mysql_text_column("knowledge_chunk_metadata", "metadata_json", "LONGTEXT")
+
     if "chat_trace_sessions" in table_names:
         columns = {column["name"] for column in inspector.get_columns("chat_trace_sessions")}
         _ensure_mysql_varchar_column("chat_trace_sessions", "id", 36, nullable=False)
@@ -192,6 +210,7 @@ def _ensure_mysql_utf8mb4():
         "conversations",
         "messages",
         "knowledge_files",
+        "knowledge_chunk_metadata",
         "chat_trace_sessions",
         "chat_attachment_uploads",
         "revoked_tokens",
@@ -281,6 +300,46 @@ def _ensure_single_column_index(table_name: str, column_name: str, index_name: s
         # 建索引失败不阻塞启动：这些查询退化为全表扫描，结果仍然正确。
         logger.warning(
             "Failed to ensure index %s on %s(%s)", index_name, table_name, column_name, exc_info=True
+        )
+
+
+def _ensure_chunk_metadata_unique_index() -> None:
+    """补 (file_id, chunk_id) 唯一键（issue #287）。
+
+    新表由模型里的 UniqueConstraint 在 create_all 时建好；这里只处理「表已在、唯一键
+    丢了」的老库。不同后端经 inspector 读到的是唯一约束或唯一索引，两种都认。
+    建失败不阻塞启动：重复行只会让 replace_chunk_metadata 的查询多返回几行，
+    写入侧每次都会先按 file_id 清空再插入。
+    """
+    table_name = "knowledge_chunk_metadata"
+    try:
+        inspector = inspect(engine)
+        if table_name not in inspector.get_table_names():
+            return
+        columns = ("file_id", "chunk_id")
+        unique_sets = {
+            tuple(constraint.get("column_names") or [])
+            for constraint in inspector.get_unique_constraints(table_name)
+        }
+        unique_sets.update(
+            tuple(index.get("column_names") or [])
+            for index in inspector.get_indexes(table_name)
+            if index.get("unique")
+        )
+        if columns in unique_sets:
+            return
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "CREATE UNIQUE INDEX `uq_knowledge_chunk_metadata_file_chunk` "
+                    f"ON `{table_name}` (file_id, chunk_id)"
+                )
+            )
+    except Exception:
+        logger.warning(
+            "Failed to ensure the (file_id, chunk_id) unique index on %s",
+            table_name,
+            exc_info=True,
         )
 
 

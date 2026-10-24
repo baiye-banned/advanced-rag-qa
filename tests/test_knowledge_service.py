@@ -70,6 +70,14 @@ def _patch_upload(monkeypatch, calls, failure):
         "delete_knowledge_file",
         lambda db, file_id, user_id: calls.append(("mysql", file_id)),
     )
+    # issue #287 的元数据 CRUD 走真实 SQLAlchemy Session；这些用例的 db 是 object()，
+    # 打桩为空操作，原有用例的调用顺序断言保持不变。
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file, "replace_chunk_metadata", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file, "delete_chunk_metadata", lambda *args, **kwargs: None
+    )
 
 
 def _upload():
@@ -141,6 +149,10 @@ def test_upload_shares_one_ingest_deadline_with_the_embedding_step(monkeypatch):
         lambda entry: {"id": entry.id},
     )
     monkeypatch.setattr(knowledge_service, "add_chunks", fake_add_chunks)
+    # issue #287：上传链路会写切片元数据；本用例的 db 是 FakeDb/object 桩。
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file, "replace_chunk_metadata", lambda *args, **kwargs: None
+    )
 
     started_at = time.monotonic()
     result = _upload()
@@ -568,6 +580,23 @@ class _CleanupSession:
     def __init__(self, log):
         self.log = log
 
+    # 切片元数据清理（issue #287）在「向量没删掉」的分支上会走真实 CRUD 的
+    # query/filter/delete；这是纯数据库操作，不进入本文件的调用顺序断言。
+    def query(self, *_args, **_kwargs):
+        return self
+
+    def filter(self, *_args, **_kwargs):
+        return self
+
+    def delete(self, *_args, **_kwargs):
+        return 0
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
+
     def close(self):
         self.log.append(("db-close",))
 
@@ -910,8 +939,10 @@ def test_timeout_cleanup_keeps_metadata_row_when_vector_delete_fails(monkeypatch
     with caplog.at_level(logging.WARNING):
         knowledge_service._delete_file_vectors_and_row(11, 7)
 
-    # 关键断言：向量没删掉，元数据行必须留下（留下行下次启动会被重建修好）。
-    assert calls == [("vectors", 11)]
+    # 关键断言：向量没删掉，知识文件行必须留下（留下行下次启动会被重建修好）；
+    # issue #287 起清理分支会先开 Session 再试删向量，因此多一条句柄关闭记录。
+    assert [call for call in calls if call[0] != "db-close"] == [("vectors", 11)]
+    assert ("db-close",) in calls
     assert "Keeping knowledge file row" in caplog.text
 
 

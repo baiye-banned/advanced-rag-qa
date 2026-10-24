@@ -1,14 +1,28 @@
 from io import BytesIO
+import json
+import logging
+import os
 import re
+import threading
 
 from fastapi import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, load_only
 
+from config import (
+    CHUNK_TOKENIZER,
+    CHUNK_TOKEN_LIMIT,
+    CHUNK_TOKEN_OVERLAP,
+    CHUNK_TOKEN_SAFETY_RATIO,
+    CHUNK_TOKEN_TARGET,
+    TIKTOKEN_CACHE_DIR,
+)
 from crud.pagination import LIST_DEFAULT_LIMIT, clamp_limit
-from model.models import KnowledgeFile
+from model.models import KnowledgeChunkMetadata, KnowledgeFile
 from service.utils_service import KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE, _internal_error_detail
 
+
+logger = logging.getLogger(__name__)
 
 DOCX_PARSE_FAILED_MESSAGE = "DOCX 解析失败，请确认文件未损坏后重试"
 PDF_PARSE_FAILED_MESSAGE = "PDF 解析失败，请确认文件未损坏后重试"
@@ -103,6 +117,9 @@ def delete_knowledge_file(db: Session, fid: int, user_id: int) -> KnowledgeFile 
     entry = get_knowledge_file(db, fid, user_id)
     if not entry:
         return None
+    # 与文件行同一次提交删除元数据（issue #287）。老文件没有元数据行时这条语句
+    # 删除 0 行，仍照常删文件——历史数据不需要重建。
+    _delete_chunk_metadata_rows(db, fid)
     db.delete(entry)
     db.commit()
     return entry
@@ -228,6 +245,181 @@ _MAX_ORDER_MARKER_LEN = 8
 _ORDER_HEADING_TAIL_MAX_LEN = _LONG_HEADING_MAX_LEN - _MAX_ORDER_MARKER_LEN
 
 
+# ---------------------------------------------------------------------------
+# Token 预算切片（issue #287）
+# ---------------------------------------------------------------------------
+# token 计数是可替换的单一入口：切片预算、metadata.token_count 与测试断言都走它，
+# 不能一处按 token、另一处拿字符数冒充。tiktoken 加载失败时退回 UTF-8 字节长度——
+# BPE token 是字节序列，token 数不会超过 UTF-8 字节数，这是**保守上界**，
+# 切片只会更小，不会超限；同时明确留一条 warning，不静默把字符数当 token。
+_token_encoding = None
+_token_encoding_attempted = False
+_token_encoding_lock = threading.Lock()
+
+
+def _get_chunk_token_encoding():
+    global _token_encoding, _token_encoding_attempted
+    if _token_encoding_attempted:
+        return _token_encoding
+    with _token_encoding_lock:
+        if not _token_encoding_attempted:
+            _token_encoding_attempted = True
+            try:
+                import tiktoken
+
+                cache_dir = (TIKTOKEN_CACHE_DIR or "").strip()
+                if cache_dir:
+                    os.environ["TIKTOKEN_CACHE_DIR"] = cache_dir
+                else:
+                    # 空字符串在 tiktoken 里表示「关闭缓存」，必须删除而不是写入。
+                    os.environ.pop("TIKTOKEN_CACHE_DIR", None)
+                _token_encoding = tiktoken.get_encoding(CHUNK_TOKENIZER)
+            except Exception as exc:
+                logger.warning(
+                    "Chunk tokenizer unavailable: encoding=%s error=%s; falling back to "
+                    "UTF-8 byte length as a conservative token upper bound",
+                    CHUNK_TOKENIZER,
+                    exc,
+                    exc_info=True,
+                )
+                _token_encoding = None
+    return _token_encoding
+
+
+def count_chunk_tokens(text: str) -> int:
+    """切片 token 计数器。测试与生产共用这一个函数，避免两套口径。"""
+    value = "" if text is None else str(text)
+    if not value:
+        return 0
+    encoding = _get_chunk_token_encoding()
+    if encoding is None:
+        return len(value.encode("utf-8"))
+    return len(encoding.encode(value, disallowed_special=()))
+
+
+def resolve_chunk_token_budget() -> tuple[int, int, int]:
+    """返回 ``(目标 token, 实际硬上限, 重叠 token)``。
+
+    安全系数只作用在硬上限上：配置里的 500 是「provider 上限」，实际预算按
+    500 × 0.85 收缩；目标值与重叠值都被夹在实际预算内，避免配置越界后
+    目标永远触发不了硬上限。
+    """
+    hard_limit = max(1, int(CHUNK_TOKEN_LIMIT * CHUNK_TOKEN_SAFETY_RATIO))
+    target = min(max(1, CHUNK_TOKEN_TARGET), hard_limit)
+    overlap = min(max(0, CHUNK_TOKEN_OVERLAP), target)
+    return target, hard_limit, overlap
+
+
+def _hard_split_by_chars(text: str, max_units: int) -> list[str]:
+    pieces = []
+    for start in range(0, len(text), max_units):
+        tail = text[start : start + max_units].strip()
+        if tail:
+            pieces.append(tail)
+    return pieces
+
+
+def _hard_split_by_tokens(text: str, max_tokens: int) -> list[str]:
+    encoding = _get_chunk_token_encoding()
+    if encoding is None:
+        return _hard_split_by_bytes(text, max_tokens)
+    token_ids = encoding.encode(text, disallowed_special=())
+    pieces = []
+    for start in range(0, len(token_ids), max_tokens):
+        piece = encoding.decode(token_ids[start : start + max_tokens]).strip()
+        if piece:
+            pieces.append(piece)
+    return pieces
+
+
+def _hard_split_by_bytes(text: str, max_bytes: int) -> list[str]:
+    """tokenizer 不可用时的保守硬切：按 UTF-8 字节预算切，不再假装字符即 token。"""
+    pieces = []
+    buffer = []
+    used = 0
+    for char in text:
+        char_bytes = len(char.encode("utf-8"))
+        if buffer and used + char_bytes > max_bytes:
+            piece = "".join(buffer).strip()
+            if piece:
+                pieces.append(piece)
+            buffer = []
+            used = 0
+        buffer.append(char)
+        used += char_bytes
+    tail = "".join(buffer).strip()
+    if tail:
+        pieces.append(tail)
+    return pieces
+
+
+def _is_table_row(line: str) -> bool:
+    """DOCX 表格行在抽取文本里是 ``a | b | c``；整行作为一个原子单元，不拆单元格。"""
+    normalized = _normalize_line(line)
+    if " | " not in normalized:
+        return False
+    return len([cell for cell in normalized.split(" | ") if cell.strip()]) >= 2
+
+
+def _chunk_unit(text: str, kind: str, *, level: int | None = None) -> dict:
+    return {
+        "text": text,
+        "kind": kind,
+        "level": level,
+        "table_id": None,
+        "row_no": None,
+        "is_table_header": False,
+    }
+
+
+def _assign_table_positions(units: list[dict]) -> None:
+    """按连续表格行分组，写入 table_id / row_no；首行标记为表头。"""
+    table_id = 0
+    row_no = 0
+    in_table = False
+    for unit in units:
+        if unit["kind"] == "table":
+            if not in_table:
+                table_id += 1
+                row_no = 0
+            row_no += 1
+            unit["table_id"] = table_id
+            unit["row_no"] = row_no
+            unit["is_table_header"] = row_no == 1
+        in_table = unit["kind"] == "table"
+
+
+_ARTICLE_NO_RE = re.compile(rf"^第[{_CHINESE_NUMERAL}0-9]+\s*条")
+
+
+def _first_article_no(lines: list[str]) -> str:
+    """取切片里第一个「第X条」，去掉编号里的空白后作为 article_no。"""
+    for line in lines:
+        match = _ARTICLE_NO_RE.match((line or "").strip())
+        if match:
+            return re.sub(r"\s+", "", match.group(0))
+    return ""
+
+
+def _build_chunk_metadata(text: str, heading_path: dict[int, str], body_units: list[dict]) -> dict:
+    heading_lines = _heading_lines(heading_path)
+    table_units = [unit for unit in body_units if unit.get("kind") == "table"]
+    metadata = {
+        "parent_id": None,
+        "parent_text": None,
+        "section_path": " > ".join(heading_lines),
+        "article_no": _first_article_no([*heading_lines, *(unit.get("text", "") for unit in body_units)]),
+        "token_count": count_chunk_tokens(text),
+        "table_id": table_units[0]["table_id"] if table_units else None,
+        "row_no": table_units[0]["row_no"] if table_units else None,
+        "row_no_end": table_units[-1]["row_no"] if table_units else None,
+        "table_row_count": len(table_units),
+        "is_table_header": any(unit.get("is_table_header") for unit in table_units),
+        "heading_levels": sorted(heading_path),
+    }
+    return metadata
+
+
 def _normalize_line(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -335,23 +527,30 @@ def _is_page_heading(line: str) -> bool:
     return _heading_level(line) == 0
 
 
-def _is_heading(line: str) -> bool:
-    return _heading_level(line) is not None
+def _split_long_segment(
+    segment: str,
+    max_len: int,
+    measure=len,
+    hard_split=None,
+) -> list[str]:
+    """按句末标点、再按逗号/分号回退切分超长段；仍超限时按同一计量单位硬切。
 
-
-def _split_long_segment(segment: str, max_len: int) -> list[str]:
+    ``measure`` 决定预算单位：字符路径传 ``len``，token 路径传 ``count_chunk_tokens``。
+    硬切也必须用同一单位（token 路径按 token 切片），不能在这里悄悄回到字符数。
+    """
     segment = _normalize_line(segment)
     if not segment:
         return []
-    if len(segment) <= max_len:
+    if measure(segment) <= max_len:
         return [segment]
 
+    hard_split = hard_split or _hard_split_by_chars
     pieces: list[str] = []
     for sentence in _SENTENCE_SPLIT_RE.split(segment):
         sentence = sentence.strip()
         if not sentence:
             continue
-        if len(sentence) <= max_len:
+        if measure(sentence) <= max_len:
             pieces.append(sentence)
             continue
 
@@ -361,33 +560,37 @@ def _split_long_segment(segment: str, max_len: int) -> list[str]:
             if not clause:
                 continue
             candidate = f"{clause_buffer}{clause}" if clause_buffer else clause
-            if len(candidate) <= max_len:
+            if measure(candidate) <= max_len:
                 clause_buffer = candidate
                 continue
             if clause_buffer:
                 pieces.append(clause_buffer.strip())
                 clause_buffer = ""
-            if len(clause) <= max_len:
+            if measure(clause) <= max_len:
                 clause_buffer = clause
             else:
-                for start in range(0, len(clause), max_len):
-                    tail = clause[start : start + max_len].strip()
-                    if tail:
-                        pieces.append(tail)
+                pieces.extend(hard_split(clause, max_len))
         if clause_buffer:
             pieces.append(clause_buffer.strip())
 
     return pieces
 
 
-def _semantic_units(block: str, max_len: int) -> list[str]:
+def _semantic_units(
+    block: str,
+    max_len: int,
+    measure=len,
+    hard_split=None,
+) -> list[dict]:
+    """把一段文本拆成标题/正文/表格行单元，并附带结构信息。
+
+    表格行是原子单元：既不并入相邻正文，也不在超限时拆单元格（只记 warning）。
+    """
     lines = [_normalize_line(line) for line in block.split("\n") if _normalize_line(line)]
     if not lines:
         return []
-    if len(lines) == 1:
-        return _split_long_segment(lines[0], max_len)
 
-    units: list[str] = []
+    units: list[dict] = []
     body_buffer: list[str] = []
 
     def flush_body() -> None:
@@ -395,13 +598,26 @@ def _semantic_units(block: str, max_len: int) -> list[str]:
         if not body_buffer:
             return
         body = " ".join(body_buffer).strip()
-        units.extend(_split_long_segment(body, max_len))
+        for piece in _split_long_segment(body, max_len, measure=measure, hard_split=hard_split):
+            units.append(_chunk_unit(piece, "body"))
         body_buffer = []
 
     for line in lines:
-        if _is_heading(line):
+        if _is_table_row(line):
             flush_body()
-            units.append(line)
+            if measure(line) > max_len:
+                logger.warning(
+                    "Table row exceeds the chunk budget; keeping it atomic: size=%s limit=%s text=%r",
+                    measure(line),
+                    max_len,
+                    line[:80],
+                )
+            units.append(_chunk_unit(line, "table"))
+            continue
+        level = _heading_level(line)
+        if level is not None:
+            flush_body()
+            units.append(_chunk_unit(line, "heading", level=level))
         else:
             body_buffer.append(line)
     flush_body()
@@ -416,53 +632,95 @@ def _heading_lines(heading_path: dict[int, str]) -> list[str]:
     return [heading_path[key] for key in sorted(heading_path)]
 
 
-def _content_length(lines: list[str]) -> int:
-    return len("\n".join(line for line in lines if line).strip())
+def _content_measure(lines: list[str], measure=len) -> int:
+    return measure("\n".join(line for line in lines if line).strip())
 
 
-def _overlap_units(body_lines: list[str], max_chars: int) -> list[str]:
-    if max_chars <= 0:
+def _overlap_units(body_units: list[dict], max_units: int, measure=len) -> list[dict]:
+    """取上一片末尾最多两条正文行做重叠，预算单位与切片路径一致。"""
+    if max_units <= 0:
         return []
 
-    selected: list[str] = []
+    selected: list[dict] = []
     total = 0
-    for line in reversed(body_lines):
-        if not line or _is_heading(line):
+    for unit in reversed(body_units):
+        text = unit.get("text") or ""
+        # 标题不是正文；表格行也不做重叠——整行重复既没有上下文收益，还会让下一片
+        # 的 table/row 元数据指向上一片已经出现过的行。
+        if not text or unit.get("kind") in {"heading", "table"}:
             continue
-        candidate_len = len(line)
-        if selected and total + candidate_len > max_chars:
+        candidate_len = measure(text)
+        # 单条比整个重叠预算还大时直接放弃重叠（不硬塞）：token 路径下一个正文单元
+        # 可能接近硬上限，若把整块塞进 pending_overlap，下一片会翻倍超限。
+        if candidate_len > max_units:
             break
-        selected.append(line)
+        if selected and total + candidate_len > max_units:
+            break
+        selected.append(unit)
         total += candidate_len
         if len(selected) >= 2:
             break
     return list(reversed(selected))
 
 
-def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: int = 150) -> list[dict]:
-    """Split text by heading hierarchy, with paragraph/sentence fallback for long sections."""
+def chunk_text(
+    text: str,
+    file_id: int,
+    chunk_size: int | None = None,
+    chunk_overlap: int | None = None,
+) -> list[dict]:
+    """Split text by heading hierarchy, with paragraph/sentence fallback for long sections.
+
+    两种预算模式（issue #287）：
+
+    - 显式传 ``chunk_size`` / ``chunk_overlap`` 时保持原有的**字符**窗口语义，
+      现有调用与测试依赖该行为；
+    - 都不传时走服务默认的 **token** 预算：目标/硬上限/重叠由 ``CHUNK_TOKEN_*``
+      配置，计数统一走 ``count_chunk_tokens``。硬上限已经乘过安全系数。
+
+    每个切片除 ``id`` / ``text`` 外附带 ``metadata``（章节路径、条款编号、token 数、
+    表格行列），供 MySQL 侧 ``knowledge_chunk_metadata`` 落库。
+    """
     text = "" if text is None else str(text)
     if not text.strip():
         return []
 
+    character_mode = chunk_size is not None or chunk_overlap is not None
+    if character_mode:
+        size = 1200 if chunk_size is None else chunk_size
+        overlap = 150 if chunk_overlap is None else chunk_overlap
+        semantic_limit = max(size, 200)
+        flush_limit = semantic_limit
+        overlap_limit = max(overlap, 0)
+        measure = len
+        hard_split = _hard_split_by_chars
+    else:
+        flush_limit, semantic_limit, overlap_limit = resolve_chunk_token_budget()
+        measure = count_chunk_tokens
+        hard_split = _hard_split_by_tokens
+    enforce_hard = not character_mode
+    hard_limit = semantic_limit
+
     normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
     raw_blocks = [block.strip() for block in re.split(r"\n\s*\n+", normalized_text) if block.strip()]
-    semantic_limit = max(chunk_size, 200)
-    overlap_limit = max(chunk_overlap, 0)
 
-    units: list[str] = []
+    units: list[dict] = []
     for block in raw_blocks:
-        units.extend(_semantic_units(block, semantic_limit))
+        units.extend(
+            _semantic_units(block, semantic_limit, measure=measure, hard_split=hard_split)
+        )
+    # 表格编号必须按整篇文档的连续行分配：块（空行）边界不打断同一张表。
+    _assign_table_positions(units)
 
-    def assemble(candidate_units: list[str], *, as_body: bool) -> tuple[list[dict], dict[int, str]]:
+    def assemble(candidate_units: list[dict], *, as_body: bool) -> tuple[list[dict], dict[int, str]]:
         """把候选单元按标题层级组装成切片。
 
         as_body=True 时所有单元一律当正文（结构兜底重跑用），此时不会产生标题路径。
         """
         chunks: list[dict] = []
         heading_path: dict[int, str] = {}
-        current_body: list[str] = []
-        pending_overlap: list[str] = []
+        current_body: list[dict] = []
+        pending_overlap: list[dict] = []
         # 已经被写进过切片的标题**层位**（不是标题文本）。按层位记而不是按文本记：
         # 制度文档里同一行会重复出现（40 行同文语料很常见），按文本记会把「这一行
         # 进过库」误判成「这个位置进过库」，同一行只留一份、其余仍被丢掉。
@@ -480,13 +738,39 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
             # 收回来那一种，而它同时会从 heading_path 里摘掉，不会再当一次前缀；
             # _overlap_units 也会跳过标题行。
             heading_lines = _heading_lines(heading_path)
-            content_lines = [line for line in [*heading_lines, *pending_overlap, *current_body] if line]
+            body_units = [*pending_overlap, *current_body]
+            content_lines = [*heading_lines, *(unit["text"] for unit in body_units)]
 
             chunk_text_value = "\n".join(content_lines).strip()
+            # token 路径的硬上限保护：重叠是「锦上添花」，不能把它顶过硬上限。
+            # 去掉重叠后仍超限时只留 warning——正文不能再丢（超长表格行就是这种形态）。
+            if enforce_hard and chunk_text_value:
+                chunk_tokens = count_chunk_tokens(chunk_text_value)
+                if chunk_tokens > hard_limit and pending_overlap:
+                    body_units = list(current_body)
+                    content_lines = [*heading_lines, *(unit["text"] for unit in body_units)]
+                    chunk_text_value = "\n".join(content_lines).strip()
+                    chunk_tokens = count_chunk_tokens(chunk_text_value)
+                if chunk_tokens > hard_limit:
+                    logger.warning(
+                        "Chunk exceeds the token hard limit; keeping the text intact: "
+                        "tokens=%s limit=%s file_id=%s",
+                        chunk_tokens,
+                        hard_limit,
+                        file_id,
+                    )
             if chunk_text_value:
-                chunks.append({"id": f"{len(chunks)}", "text": chunk_text_value})
+                chunks.append(
+                    {
+                        "id": f"{len(chunks)}",
+                        "text": chunk_text_value,
+                        "metadata": _build_chunk_metadata(
+                            chunk_text_value, heading_path, body_units
+                        ),
+                    }
+                )
                 emitted_levels.update(heading_path)
-            pending_overlap = _overlap_units(current_body, overlap_limit)
+            pending_overlap = _overlap_units(current_body, overlap_limit, measure)
             current_body = []
 
         def _rescue_dropped_headings(min_level: int | None) -> None:
@@ -517,11 +801,11 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
                 rescued.append(heading_path.pop(key))
             if not rescued:
                 return
-            current_body.extend(rescued)
+            current_body.extend(_chunk_unit(line, "heading") for line in rescued)
             flush_chunk()
 
         for unit in candidate_units:
-            level = None if as_body else _heading_level(unit)
+            level = None if as_body else unit.get("level")
             if level == 0:
                 flush_chunk()
                 pending_overlap = []
@@ -532,15 +816,20 @@ def chunk_text(text: str, file_id: int, chunk_size: int = 1200, chunk_overlap: i
                 # flush 之后再判：走空的 flush 说明这些标题一个都没被带进切片。
                 _rescue_dropped_headings(level)
                 heading_path = _trim_heading_path(heading_path, level)
-                heading_path[level] = unit
+                heading_path[level] = unit["text"]
                 # 换了新标题，这一层位「进过库」的记录必须作废，否则这一行被覆盖时
                 # 会被误判成已经进过库而丢掉。
                 emitted_levels.discard(level)
                 pending_overlap = []
                 continue
 
-            projected_lines = [*_heading_lines(heading_path), *pending_overlap, *current_body, unit]
-            if current_body and _content_length(projected_lines) > semantic_limit:
+            projected_lines = [
+                *_heading_lines(heading_path),
+                *(item["text"] for item in pending_overlap),
+                *(item["text"] for item in current_body),
+                unit["text"],
+            ]
+            if current_body and _content_measure(projected_lines, measure) > flush_limit:
                 flush_chunk()
             current_body.append(unit)
 
@@ -584,4 +873,68 @@ def chunk_coverage_ratio(text: str, chunks: list[dict]) -> float:
         return 0.0
     covered = sum(len(chunk.get("text") or "") for chunk in chunks)
     return covered / len(source)
+
+
+def replace_chunk_metadata(
+    db: Session,
+    file_id: int,
+    knowledge_base_id: int | None,
+    chunks: list[dict],
+) -> None:
+    """整体替换一个文件的切片元数据行（issue #287）。
+
+    先按 file_id 删旧行再插新行，并在**一次提交**里完成：重复上传/启动重建不会把
+    同一 chunk 累积成多行。调用方负责失败回滚；老文件没有元数据行时同样可直接调用。
+    """
+    _delete_chunk_metadata_rows(db, file_id)
+    for index, chunk in enumerate(chunks or []):
+        metadata = chunk.get("metadata") or {}
+        # 列宽截断：病态标题/编号不能让整次上传因为 MySQL 的严格模式而失败。
+        chunk_id = str(chunk.get("id", index))[:64]
+        db.add(
+            KnowledgeChunkMetadata(
+                file_id=file_id,
+                knowledge_base_id=knowledge_base_id,
+                chunk_id=chunk_id,
+                parent_id=(str(metadata["parent_id"])[:64] if metadata.get("parent_id") else None),
+                section_path=str(metadata.get("section_path") or "")[:1000],
+                article_no=str(metadata.get("article_no") or "")[:64],
+                token_count=_metadata_int(metadata.get("token_count")),
+                table_id=_metadata_optional_int(metadata.get("table_id")),
+                row_no=_metadata_optional_int(metadata.get("row_no")),
+                parent_text=metadata.get("parent_text"),
+                metadata_json=json.dumps(metadata, ensure_ascii=False, default=str, sort_keys=True),
+            )
+        )
+    db.commit()
+
+
+def delete_chunk_metadata(db: Session, file_id: int) -> None:
+    """删除一个文件的全部切片元数据行；没有行时是幂等空操作。"""
+    _delete_chunk_metadata_rows(db, file_id)
+    db.commit()
+
+
+def _delete_chunk_metadata_rows(db: Session, file_id: int) -> None:
+    # fetch：把被删对象从 identity map 一并摘掉，整体替换后同 id 的新行不会触发
+    # SQLAlchemy 的「identity 已被占用」告警。
+    db.query(KnowledgeChunkMetadata).filter(
+        KnowledgeChunkMetadata.file_id == file_id
+    ).delete(synchronize_session="fetch")
+
+
+def _metadata_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _metadata_optional_int(value) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
