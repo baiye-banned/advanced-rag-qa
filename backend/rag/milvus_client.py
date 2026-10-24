@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -55,6 +56,8 @@ from pymilvus.orm.schema import CollectionSchema, FieldSchema  # noqa: E402
 _restore_milvus_uri_env(_milvus_uri_env)
 
 _client: MilvusClient | None = None
+# 进程内单例的初始化锁：检索经 asyncio.to_thread 并发进入，check-then-construct 必须原子化。
+_milvus_client_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 
 
@@ -220,8 +223,17 @@ def _client_kwargs() -> dict:
 
 def _connect_milvus() -> MilvusClient:
     global _client
+    # 两重检查：已初始化的路径不加锁，避免每轮检索都串行化。
     if _client is None:
-        _client = MilvusClient(**_client_kwargs())
+        # 首轮检索会从多个 to_thread 工作线程并发进来。Milvus Lite 对同一数据目录
+        # 只允许一个 server 实例，未加锁时多个线程会同时构造 MilvusClient，后来的
+        # 实例拿不到目录锁（DataDirLockedError），整轮检索直接 500。
+        # 也不能改成每个线程各建一个 Lite client：锁是进程级文件锁，同一进程同样
+        # 互斥，只会把并发请求变成持续失败；单例才是 Lite 的正确用法。
+        with _milvus_client_lock:
+            if _client is None:
+                # 构造成功才赋值：失败时 _client 仍为 None，后续调用可以重试。
+                _client = MilvusClient(**_client_kwargs())
     return _client
 
 
