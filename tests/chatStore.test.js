@@ -17,6 +17,8 @@ const stubSource = [
   'export const getMessagesCalls = []',
   'export const getMessagesParams = []',
   'export const deleteCalls = []',
+  // 与 deleteCalls 平行：保留每次调用的 options，断言编辑/重新生成的保留附件语义。
+  'export const deleteOptions = []',
   'export const chatAPI = {',
   '  getConversations: (params) => new Promise((resolve) => {',
   '    const entry = { params, resolve }',
@@ -31,8 +33,9 @@ const stubSource = [
   '    pending.set(id, queue)',
   '  }),',
   '  deleteConversation: async () => {},',
-  '  deleteMessage: (id) => new Promise((resolve, reject) => {',
+  '  deleteMessage: (id, options) => new Promise((resolve, reject) => {',
   '    deleteCalls.push(id)',
+  '    deleteOptions.push(options)',
   '    const queue = deletePending.get(id) || []',
   '    queue.push({ resolve, reject })',
   '    deletePending.set(id, queue)',
@@ -111,6 +114,7 @@ const stubSource = [
   '  feedbackPending.clear()',
   '  deletePending.clear()',
   '  deleteCalls.length = 0',
+  '  deleteOptions.length = 0',
   '  conversationResolvers.length = 0',
   '  conversationRequests.length = 0',
   '}',
@@ -155,7 +159,7 @@ globalThis.window = {
 
 const { createPinia, setActivePinia } = await import('pinia')
 const { useChatStore } = await import('../src/stores/chat.js')
-const { respond, respondLatest, respondError, respondFeedback, respondFeedbackError, respondConversations, respondConversation, respondDelete, respondDeleteError, conversationRequests, resetStub, streams, getMessagesCalls, getMessagesParams, deleteCalls } =
+const { respond, respondLatest, respondError, respondFeedback, respondFeedbackError, respondConversations, respondConversation, respondDelete, respondDeleteError, conversationRequests, resetStub, streams, getMessagesCalls, getMessagesParams, deleteCalls, deleteOptions } =
   await import(chatApiStub)
 
 const conversation = (id, knowledgeBaseId = null) => ({
@@ -1329,6 +1333,31 @@ test('deleteMessage：助手消息只删本地这一条，并刷新会话列表�
 
   assert.equal(await deletion, true)
   assert.equal(store.conversations[0].updated_at, '2026-10-24T10:00:00')
+})
+
+test('deleteMessage：编辑/重新生成透传 keepAttachments，普通删除不带选项', async () => {
+  const store = createStore([conversation('a')])
+  await openConversation(store, 'a', [
+    roleMessage(1, 'user', '第一问'),
+    roleMessage(2, 'assistant', '第一答'),
+  ])
+
+  // 编辑/重新生成：选项原样交给 API 层，由它翻译成 keep_attachments=true。
+  const kept = store.deleteMessage(1, { keepAttachments: true })
+  await flush()
+  assert.deepEqual(deleteOptions, [{ keepAttachments: true }])
+
+  await respondToDelete(store, 1, [conversation('a')])
+  assert.equal(await kept, true)
+
+  // 普通删除按钮：不传第二个参数，后端继续走 #311 的墓碑回收。
+  const plain = store.deleteMessage(2)
+  await flush()
+  // store 的默认参数是空对象；API 层据此不带 keep_attachments 查询参数。
+  assert.deepEqual(deleteOptions, [{ keepAttachments: true }, {}])
+
+  await respondToDelete(store, 2, [conversation('a')])
+  assert.equal(await plain, true)
 })
 
 test('deleteMessage：用户消息连同其后的所有本地消息一起截断', async () => {

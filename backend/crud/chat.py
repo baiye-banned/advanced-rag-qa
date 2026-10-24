@@ -723,7 +723,8 @@ def _attachment_keys(raw_attachments) -> list[str]:
     return keys
 
 
-def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | None:
+def delete_message(db: Session, message_id: int, user_id: int,
+                   keep_attachments: bool = False) -> list[int] | None:
     """删除一条消息，返回实际删掉的消息 id（按 id 升序）；查无此消息或不属于该用户返回 None。
 
     语义（issue #256）：
@@ -744,6 +745,14 @@ def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | No
     到期后领取执行；失败时 `clear_attachment_claim` 会把行放回队列。不能只给「还没有行」
     的键插 pending 行——真实链路上传时一定已登记、发送时盖了 `consumed_at`，那样写会让
     所有实际用过的附件都漏出回收视野（对象桶是 public-read，泄漏即长期可读）。
+
+    `keep_attachments=True`（issue #253）：编辑/重新生成会在删除后**立即**用同一批
+    `object_key` 重发，此时若照常登记墓碑，发送路径会把这些键判死而丢掉附件。该分支因此
+    跳过附件墓碑这一步，完全不改 `ChatAttachmentUpload` 行（保持 consumed 状态与归属），
+    消息删除、`updated_at` 推进、记忆摘要作废等其余语义与默认路径完全一致。调用方承诺
+    「删完马上重发」；若重发失败，这些行会停在 consumed 且不再被任何消息引用——属已知
+    泄漏（对象仍在桶里，但清扫不可见），不在本函数内补偿，由 PR 后续计划跟踪。默认
+    `False` 时行为与 #311 完全一致。
     """
     message = get_message_by_user(db, message_id, user_id)
     if message is None:
@@ -772,23 +781,25 @@ def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | No
     )
     deleted_ids = [row_id for row_id, _raw in rows]
 
-    # 附件键必须在删行之前收集；删完就再也读不到这些消息引用过什么。
-    candidate_keys = {
-        object_key
-        for _row_id, raw_attachments in rows
-        for object_key in _attachment_keys(raw_attachments)
-    }
+    # 附件键必须在删行之前收集；删完就再也读不到这些消息引用过什么。保留附件的删除
+    # 不做这一步：调用方马上重发同一批键，任何墓碑登记都会让这次重发被拒签。
     orphan_keys: list[str] = []
-    if candidate_keys:
-        surviving_keys: set[str] = set()
-        surviving_rows = (
-            db.query(Message.attachments)
-            .filter(Message.id.notin_(deleted_ids))
-            .all()
-        )
-        for (raw_attachments,) in surviving_rows:
-            surviving_keys.update(_attachment_keys(raw_attachments))
-        orphan_keys = sorted(candidate_keys - surviving_keys)
+    if not keep_attachments:
+        candidate_keys = {
+            object_key
+            for _row_id, raw_attachments in rows
+            for object_key in _attachment_keys(raw_attachments)
+        }
+        if candidate_keys:
+            surviving_keys: set[str] = set()
+            surviving_rows = (
+                db.query(Message.attachments)
+                .filter(Message.id.notin_(deleted_ids))
+                .all()
+            )
+            for (raw_attachments,) in surviving_rows:
+                surviving_keys.update(_attachment_keys(raw_attachments))
+            orphan_keys = sorted(candidate_keys - surviving_keys)
 
     try:
         db.query(Message).filter(delete_condition).delete(synchronize_session=False)

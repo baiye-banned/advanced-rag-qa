@@ -25,8 +25,14 @@ export const chatAPI = {
     return request.delete(`/chat/conversations/${id}`)
   },
   // 删除单条消息（issue #256）：用户消息截断其后，助手消息只删一条。
-  deleteMessage(id) {
-    return request.delete(`/chat/messages/${id}`)
+  // options.keepAttachments（issue #253）：编辑/重新生成马上重发原附件时置 true，
+  // 后端跳过附件墓碑登记。普通删除不传第二个参数，请求形态保持不变。
+  deleteMessage(id, options = {}) {
+    const { keepAttachments = false } = options
+    if (!keepAttachments) return request.delete(`/chat/messages/${id}`)
+    return request.delete(`/chat/messages/${id}`, {
+      params: { keep_attachments: true },
+    })
   },
   renameConversation(id, title) {
     return request.put(`/chat/conversations/${id}`, { title })

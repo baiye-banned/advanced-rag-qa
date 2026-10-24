@@ -1471,9 +1471,10 @@ test('编辑提交：恰好一次 DELETE 截断旧问答，再以新文本重发
     await settle(view)
 
     // 承重①：后端截断路径真的走了，且只走一次。
+    // 带 keep_attachments=true：紧接着重发的是同一批 object_key，后端不能把它们登记成墓碑。
     assert.deepEqual(callsOf('delete'), [
-      { method: 'delete', args: ['/chat/messages/1'] },
-    ], '编辑提交应当先删掉原提问及其后的回答')
+      { method: 'delete', args: ['/chat/messages/1', { params: { keep_attachments: true } }] },
+    ], '编辑提交应当先删掉原提问及其后的回答，并保留附件登记')
     assert.equal(streamCalls.length, 1, '截断成功后应当恰好重发一次')
     const body = JSON.parse(streamCalls[0].options.body)
     assert.equal(body.question, '修改后的问题', '流式请求体应当是新文本')
@@ -1733,10 +1734,11 @@ test('重新生成：先 DELETE 原提问做服务端截断，再重发原问题
     await until(view, () => view.text().includes('你好，世界'))
     await settle(view)
 
-    // 承重：走的是后端截断（DELETE 原提问 id=1），不是前端 replaceMessages。
+    // 承重：走的是后端截断（DELETE 原提问 id=1），不是前端 replaceMessages；
+    // 同样带 keep_attachments=true，否则重发时附件键已被回收。
     assert.deepEqual(callsOf('delete'), [
-      { method: 'delete', args: ['/chat/messages/1'] },
-    ], '重新生成应当删除原提问及其后的回答')
+      { method: 'delete', args: ['/chat/messages/1', { params: { keep_attachments: true } }] },
+    ], '重新生成应当删除原提问及其后的回答，并保留附件登记')
     assert.deepEqual(confirmations, [], '重新生成不应弹出删除确认框')
     assert.equal(streamCalls.length, 1, '截断成功后应当恰好重发一次')
     const body = JSON.parse(streamCalls[0].options.body)

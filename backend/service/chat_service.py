@@ -480,10 +480,16 @@ def delete_conversation(cid: str, user: User = Depends(get_current_user),
     return {"message": "ok"}
 
 
-def delete_message(message_id: int, user: User = Depends(get_current_user),
+def delete_message(message_id: int, keep_attachments: bool = Query(False),
+                   user: User = Depends(get_current_user),
                    db: Session = Depends(get_db)):
-    """删除单条消息（issue #256）；截断/单条语义与联动清理都在 CRUD 的同一次事务里完成。"""
-    deleted_ids = crud_chat.delete_message(db, message_id, user.id)
+    """删除单条消息（issue #256）；截断/单条语义与联动清理都在 CRUD 的同一次事务里完成。
+
+    `keep_attachments=true`（issue #253）仅供编辑/重新生成：删完立即重发同一批 object_key，
+    因此跳过附件墓碑登记；默认 false 仍是 #311 的回收语义。归属校验不受该参数影响。
+    """
+    deleted_ids = crud_chat.delete_message(db, message_id, user.id,
+                                          keep_attachments=keep_attachments)
     if deleted_ids is None:
         # 查无此消息与「消息属于别人」共用同一分支：归属校验随查询完成，不区分两者。
         raise HTTPException(404, "消息不存在")

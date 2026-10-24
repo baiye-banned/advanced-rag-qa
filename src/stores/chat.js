@@ -599,7 +599,9 @@ export const useChatStore = defineStore('chat', () => {
 
   // 删除单条消息（issue #256）：先请求后端，成功后才改本地视图。
   // 失败时本地保持不变并原样抛出，提示由 request.js 拦截器统一给出。
-  async function deleteMessage(messageId) {
+  // options.keepAttachments：编辑/重新生成在删除后立即重发原附件，置 true 让后端保留
+  // 附件登记行；普通删除不传，默认走 #311 的墓碑回收。成功路径与竞态守卫不受影响。
+  async function deleteMessage(messageId, options = {}) {
     // 流式期间拒绝删除：正在生成的回答还没落库，此时删消息会让流式收尾把内容写回。
     if (streaming.value || !messageId) return false
 
@@ -607,7 +609,7 @@ export const useChatStore = defineStore('chat', () => {
     // 才能改 messages——否则旧会话的 index 会把新会话的尾部截掉。
     const conversationId = currentId.value
 
-    await chatAPI.deleteMessage(messageId)
+    await chatAPI.deleteMessage(messageId, options)
 
     // 已经切走：服务端的删除照常生效，但当前窗口属于另一个会话，绝不碰它的
     // messages / hasMoreMessages / 评估轮询。只刷新侧栏（与视图无关）。

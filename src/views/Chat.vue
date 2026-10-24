@@ -918,7 +918,8 @@ async function submitEdit(message) {
   editSubmitting.value = true
   try {
     // 先由后端截断这条提问及其后的回答，再重发，刷新后才不会把旧回答带回来。
-    const deleted = await chatStore.deleteMessage(message.id)
+    // 保留附件登记：紧接着重发的是同一批 object_key，不能被当成回收候选。
+    const deleted = await chatStore.deleteMessage(message.id, { keepAttachments: true })
     if (!deleted) {
       ElMessage.warning('正在生成回答，暂不能编辑')
       return
@@ -1001,8 +1002,8 @@ async function regenerate(index) {
   cancelEdit()
   try {
     // 与编辑重发共用同一条后端截断路径：先删掉原提问及其后的回答，再重发。
-    // 只在前端 replaceMessages 会让刷新后的旧回答重新出现。
-    const deleted = await chatStore.deleteMessage(previousUserMessage.id)
+    // 只在前端 replaceMessages 会让刷新后的旧回答重新出现。同样保留附件登记。
+    const deleted = await chatStore.deleteMessage(previousUserMessage.id, { keepAttachments: true })
     if (!deleted) {
       ElMessage.warning('正在生成回答，暂不能重新生成')
       return
