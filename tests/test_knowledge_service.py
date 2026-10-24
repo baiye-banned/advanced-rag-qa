@@ -290,6 +290,9 @@ def test_rebuild_existing_knowledge_index_refreshes_chunk_metadata(monkeypatch):
     chunks = [{"id": "0", "text": "第一段", "metadata": {"section_path": "第一章"}}]
     calls = []
 
+    # 本用例钉住 #287 的单层元数据刷新语义；父子切片（#289）的元数据写入
+    # 由 tests/test_parent_child_289.py 覆盖。
+    monkeypatch.setattr(knowledge_service, "PARENT_CHILD_ENABLED", False)
     monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _fake_rebuild_session(entries))
     monkeypatch.setattr(
         knowledge_service.crud_knowledge_file,

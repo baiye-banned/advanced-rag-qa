@@ -520,7 +520,13 @@ def _first_article_no(lines: list[str]) -> str:
     return ""
 
 
-def _build_chunk_metadata(text: str, heading_path: dict[int, str], body_units: list[dict]) -> dict:
+def _build_chunk_metadata(
+    text: str,
+    heading_path: dict[int, str],
+    body_units: list[dict],
+    *,
+    overlap_text: str = "",
+) -> dict:
     heading_lines = _heading_lines(heading_path)
     table_units = [unit for unit in body_units if unit.get("kind") == "table"]
     metadata = {
@@ -529,6 +535,10 @@ def _build_chunk_metadata(text: str, heading_path: dict[int, str], body_units: l
         "section_path": " > ".join(heading_lines),
         "article_no": _first_article_no([*heading_lines, *(unit.get("text", "") for unit in body_units)]),
         "token_count": count_chunk_tokens(text),
+        # 本片开头真正从上一片带过来的重叠文本（issue #289 返工）。parent 拼接时
+        # 只按这段精确剥离；没有重叠时为空字符串，绝不能用「上一片末尾 == 本片开头」
+        # 之类的位置比较去猜——正文里重复出现的句子/表格行会被误删。
+        "overlap_text": overlap_text,
         "table_id": table_units[0]["table_id"] if table_units else None,
         "row_no": table_units[0]["row_no"] if table_units else None,
         "row_no_end": table_units[-1]["row_no"] if table_units else None,
@@ -904,7 +914,7 @@ def chunk_text(
         # 层位在重新赋值时清掉（见下方 set），flush 成功时把当时路径里的层位全记上。
         emitted_levels: set[int] = set()
 
-        def emit_chunk(body_units: list[dict]) -> None:
+        def emit_chunk(body_units: list[dict], *, overlap_text: str = "") -> None:
             """把一组正文单元连同当前标题路径写成一片。"""
             heading_lines = _heading_lines(heading_path)
             content_lines = [*heading_lines, *(unit["text"] for unit in body_units if unit["text"])]
@@ -916,7 +926,10 @@ def chunk_text(
                     "id": f"{len(chunks)}",
                     "text": chunk_text_value,
                     "metadata": _build_chunk_metadata(
-                        chunk_text_value, heading_path, body_units
+                        chunk_text_value,
+                        heading_path,
+                        body_units,
+                        overlap_text=overlap_text,
                     ),
                 }
             )
@@ -942,7 +955,12 @@ def chunk_text(
 
             if not enforce_hard:
                 # 字符路径保持原有语义：一次 flush 只成一片，重叠允许一条超预算单元。
-                emit_chunk([*overlap_units, *body_units])
+                emit_chunk(
+                    [*overlap_units, *body_units],
+                    overlap_text="\n".join(
+                        unit["text"] for unit in overlap_units if unit.get("text")
+                    ),
+                )
                 pending_overlap = _overlap_units(body_units, overlap_limit, measure)
                 return
 
@@ -951,6 +969,9 @@ def chunk_text(
             queue = [*overlap_units, *body_units]
             overlap_ids = {id(unit) for unit in overlap_units}
             last_group_body: list[dict] = []
+            # 一次 flush 可能因为硬上限被拆成多片；重叠只会出现在第一片开头，
+            # 后续片没有带过来的文本，metadata 里必须是空串。
+            first_group = True
 
             if heading_tokens >= hard_limit:
                 # 标题本身已经吃满硬上限：无论怎么切正文都会超限。保住文本，留一次告警。
@@ -997,7 +1018,15 @@ def chunk_text(
                     warn_hard_limit(count_chunk_tokens(heading_text) + measure(unit.get("text")))
                     group.append(unit)
                 if group:
-                    emit_chunk(group)
+                    group_overlap_text = ""
+                    if first_group:
+                        group_overlap_text = "\n".join(
+                            item["text"]
+                            for item in group
+                            if id(item) in overlap_ids and item.get("text")
+                        )
+                    emit_chunk(group, overlap_text=group_overlap_text)
+                    first_group = False
                     last_group_body = [unit for unit in group if id(unit) not in overlap_ids]
 
             # 重叠只从「本片自己的正文」里取；上一片带来的重叠不再二次重叠，避免滚雪球。
@@ -1095,6 +1124,543 @@ def chunk_text(
     return chunks
 
 
+# ---------------------------------------------------------------------------
+# 父子切片（issue #289）
+# ---------------------------------------------------------------------------
+# child 入库并参与向量/关键词召回，parent 只落 MySQL 侧元数据。parent 的边界取章节
+# （``section_path``）与条款（``article_no``）：同一章节里的连续 child 归到同一 parent，
+# 新条款重新开一个 parent，下一章一定重新开。这样长条款被切成多片时仍能合并回完整
+# 上下文，不同章节也不会因为 text 相邻而被误聚合。
+
+
+def _context_prefix(file_name: str, metadata: dict, *, max_tokens: int) -> str:
+    """child 的确定性上下文前缀：文档名/章节/条款，不调用模型。
+
+    前缀会计入 child 的 token 预算，所以必须有上界：超长文件名或病态章节路径不能把
+    正文挤没。截断逐字符进行，结果只依赖输入文本，同一份文档重复上传得到同一前缀。
+    """
+    parts: list[str] = []
+    name = str(file_name or "").strip()
+    if name:
+        parts.append(f"文档：{name}")
+    section = str(metadata.get("section_path") or "").strip()
+    if section:
+        parts.append(f"章节：{section}")
+    article = str(metadata.get("article_no") or "").strip()
+    if article:
+        parts.append(f"条款：{article}")
+    if not parts:
+        return ""
+    body = "｜".join(parts)
+    while body and count_chunk_tokens(f"【{body}】") > max_tokens:
+        body = body[:-1]
+    body = body.rstrip("｜")
+    return f"【{body}】" if body else ""
+
+
+def _group_chunks_by_parent(chunks: list[dict], *, max_tokens: int) -> list[dict]:
+    """按章节/条款边界把单层切片分组，顺序与原文一致。
+
+    ``max_tokens`` 是 parent 的硬上界：无标题的纯文本（或病态超长章节）如果整篇
+    聚成一个 parent，最终上下文槽位会大到无法使用。到达上界时开启新 parent，
+    正常的条款/小节远低于该值，不会被拆开。
+    """
+    groups: list[dict] = []
+    current: list[dict] = []
+    current_section = ""
+    current_article = ""
+    current_tokens = 0
+
+    def flush() -> None:
+        nonlocal current, current_tokens
+        if current:
+            groups.append(
+                {
+                    "chunks": current,
+                    "section_path": current_section,
+                    "article_no": current_article,
+                }
+            )
+            current = []
+            current_tokens = 0
+
+    for chunk in chunks:
+        metadata = chunk.get("metadata") or {}
+        section = str(metadata.get("section_path") or "")
+        article = str(metadata.get("article_no") or "")
+        starts_new_article = bool(article) and article != current_article
+        # #287 已经把 token 数算进 metadata；沿用它可以避免整篇重新分词。
+        chunk_tokens = _metadata_int(metadata.get("token_count")) or count_chunk_tokens(
+            chunk.get("text") or ""
+        )
+        if current and (
+            section != current_section
+            or starts_new_article
+            or current_tokens + chunk_tokens > max_tokens
+        ):
+            flush()
+        if not current:
+            current_section = section
+            current_article = article
+        elif article:
+            current_article = article
+        current.append(chunk)
+        current_tokens += chunk_tokens
+    flush()
+    return groups
+
+
+# 切分后的 child 不得小到没有检索价值：一个小碎片既占一个上下文槽位，又因为缺少
+# 上下文而几乎不可能被命中。只有正文真的超过硬上限时才切，切完再保证这个下限。
+MIN_CHILD_TOKEN_COUNT = 100
+
+
+def _strip_duplicate_context_headings(
+    text: str, metadata: dict, *, prefix: str = ""
+) -> str:
+    """剥掉正文开头已经含有的章节/条款标题，避免与前缀重复。
+
+    #287 的每个切片以当前标题路径开头（``第一章 总则`` / ``第一条``），而 child 的
+    确定性前缀又带「章节/条款」。两处都保留会让同一标题在 child 里出现两次：既浪费
+    约 20~40 token 的预算，也让接近目标长度的切片被误判为超限而切成两片。
+
+    只剥**行首且整行等于**标题路径中的行，以及正文首行重复的条款编号；标题和正文
+    写在同一行时只去掉重复的编号本身，不动后面的正文。
+
+    ``prefix`` 必须一并传入：病态超长文件名会让 ``_context_prefix`` 从尾部截断，
+    可能把章节/条款整段截掉。此时正文里的标题不能再剥，否则标题会从前缀和正文
+    两边一起消失。
+    """
+    if not text:
+        return text
+    compact_prefix = re.sub(r"\s+", "", prefix or "")
+    heading_lines = {
+        _normalize_line(part)
+        for part in str(metadata.get("section_path") or "").split(" > ")
+        if _normalize_line(part)
+        and re.sub(r"\s+", "", _normalize_line(part)) in compact_prefix
+    }
+    article = re.sub(r"\s+", "", str(metadata.get("article_no") or ""))
+    if article and article not in compact_prefix:
+        article = ""
+    lines = text.split("\n")
+    index = 0
+    while index < len(lines) and heading_lines and _normalize_line(lines[index]) in heading_lines:
+        index += 1
+    if index < len(lines) and article:
+        first_line = _normalize_line(lines[index])
+        if re.sub(r"\s+", "", first_line) == article:
+            index += 1
+        else:
+            marker = _ARTICLE_NO_RE.match(first_line)
+            if marker and re.sub(r"\s+", "", marker.group(0)) == article:
+                remainder = first_line[marker.end():].lstrip(" ：:、.．\t")
+                if remainder:
+                    lines[index] = remainder
+                else:
+                    index += 1
+    stripped = "\n".join(lines[index:]).strip("\n")
+    # 只有标题、没有正文的病态切片不能因为剥离而变成空文本。
+    return stripped if stripped.strip() else text
+
+
+def _parent_text_for_group(chunks: list[dict]) -> str:
+    """把同一 parent 的 child 正文拼回父级文本。
+
+    结构化切片的每片都会重复章节标题；后续片段里重复的标题前缀在这里剥掉，避免
+    parent 文本里出现多次「第二章 … / 第三条」。剥离只针对完全相同的首部标题，
+    正文里的重复行（制度文档很常见）原样保留。
+
+    #287 的 token 路径还会把上一片末尾最多两条正文单元作为重叠带到下一片开头。
+    这里只剥 ``chunk_text`` 实际写进 ``metadata["overlap_text"]`` 的那一段：先去掉
+    重复标题，若正文确实以这段重叠开头才精确删除，否则一行也不删。不能再按
+    「上一片末尾 == 当前片开头」做位置比较——正文里本来就重复的句子、段落和表格行
+    会被误判成重叠，parent 句子数会平白少于原文。
+    """
+    parts: list[str] = []
+    for chunk in chunks:
+        metadata = chunk.get("metadata") or {}
+        text = str(chunk.get("text") or "")
+        if parts:
+            section = str(metadata.get("section_path") or "")
+            heading_prefix = "\n".join(
+                part.strip() for part in section.split(" > ") if part.strip()
+            )
+            if heading_prefix and text.startswith(heading_prefix):
+                text = text[len(heading_prefix):].lstrip("\n")
+        if not text.strip():
+            continue
+        overlap_text = str(metadata.get("overlap_text") or "")
+        if overlap_text and text.startswith(overlap_text):
+            text = text[len(overlap_text):].lstrip("\n")
+        body_text = text.strip()
+        if body_text:
+            parts.append(body_text)
+    return "\n".join(parts).strip()
+
+
+def _child_text_units(text: str, max_tokens: int) -> list[str]:
+    """把正文切成可拼回的细粒度单元：行、句，超长句再按从句/token 回退。
+
+    单元本身保持原顺序和标点，``"".join(units)`` 还原正文（仅超长句会经历
+    ``_split_long_segment`` 的空白归一化）。换行作为独立单元保留，避免重新拼装时
+    把原本的段落结构丢掉。
+    """
+    units: list[str] = []
+    for line_index, line in enumerate(text.split("\n")):
+        if line_index:
+            units.append("\n")
+        if not line:
+            continue
+        for sentence in _SENTENCE_SPLIT_RE.split(line):
+            if not sentence:
+                continue
+            if count_chunk_tokens(sentence) <= max_tokens:
+                units.append(sentence)
+                continue
+            units.extend(
+                piece
+                for piece in _split_long_segment(
+                    sentence,
+                    max_tokens,
+                    measure=count_chunk_tokens,
+                    hard_split=_hard_split_by_tokens,
+                )
+                if piece
+            )
+    return units
+
+
+def _pack_child_units(
+    units: list[str], parts: int, max_tokens: int
+) -> list[list[str]]:
+    """把单元按目标大小装进 ``parts`` 个片段，片段之间尽量均衡。
+
+    均衡是「不留 < MIN_CHILD_TOKEN_COUNT 碎片」的前提：只按行贪心填满预算时，末尾
+    很容易剩下一两句。每片至少装到当前剩余量的平均值，同时保证剩余单元还能装进
+    剩余片数（每片不超过 ``max_tokens``）。
+    """
+    if not units:
+        return []
+    parts = max(1, min(parts, len(units)))
+    packed: list[list[str]] = []
+    index = 0
+    remaining_tokens = count_chunk_tokens("".join(units))
+    for part in range(parts):
+        remaining_parts = parts - part
+        if remaining_parts == 1:
+            packed.append(units[index:])
+            break
+        target = (remaining_tokens + remaining_parts - 1) // remaining_parts
+        take = 1
+        while take < len(units) - index:
+            piece_tokens = count_chunk_tokens("".join(units[index:index + take]))
+            if piece_tokens >= target:
+                break
+            next_text = "".join(units[index:index + take + 1])
+            if count_chunk_tokens(next_text) > max_tokens:
+                break
+            rest_tokens = count_chunk_tokens("".join(units[index + take:]))
+            if rest_tokens > (remaining_parts - 1) * max_tokens:
+                take += 1
+                continue
+            take += 1
+        # 目标大小之上仍可能装不下剩余内容（例如大量短句），继续取到容量允许为止。
+        while take < len(units) - index:
+            rest_tokens = count_chunk_tokens("".join(units[index + take:]))
+            if rest_tokens <= (remaining_parts - 1) * max_tokens:
+                break
+            candidate = "".join(units[index:index + take + 1])
+            if count_chunk_tokens(candidate) > max_tokens:
+                break
+            take += 1
+        packed.append(units[index:index + take])
+        index += take
+        remaining_tokens = count_chunk_tokens("".join(units[index:]))
+    return packed
+
+
+def _group_token_count(group: list[str]) -> int:
+    return count_chunk_tokens("".join(group))
+
+
+def _enforce_child_group_budget(
+    groups: list[list[str]], budget: int
+) -> None:
+    """把仍超过 ``budget`` 的片段重新切小（原地修改）。
+
+    行/句单元可能长到 ``budget/2`` 以上：两个这样的单元装不进同一片，贪心装箱就会
+    把余量全压到最后一片。这里用更细的粒度（句 -> 从句 -> token）重切该片段，
+    保留句末边界的优先级；极端原子输入才按 token 硬切。
+    """
+    index = 0
+    while index < len(groups):
+        tokens = _group_token_count(groups[index])
+        if tokens <= budget:
+            index += 1
+            continue
+        text = "".join(groups[index])
+        parts = max(2, (tokens + budget - 1) // budget)
+        finer_units = _child_text_units(text, max(1, budget // 2))
+        replacement = _pack_child_units(finer_units, parts, budget)
+        if (
+            len(replacement) <= 1
+            or any(_group_token_count(group) > budget for group in replacement)
+        ):
+            replacement = [[piece] for piece in _hard_split_by_tokens(text, budget)]
+        groups[index:index + 1] = replacement
+        index += len(replacement)
+
+
+def _rebalance_child_groups(
+    groups: list[list[str]], budget: int, min_tokens: int
+) -> None:
+    """从相邻片段借单元，消除小于 ``min_tokens`` 的碎片（原地修改）。
+
+    均衡装箱偶尔会遇到「短句 + 接近上限的长句」这种组合：短句单独成片时不足
+    下限，下一句又装不进来。先尝试移动相邻片段里的单元，再合并/两等分；只有极端
+    输入才按 token 中点硬切。所有分支都保持片段总数不增加、正文不丢。
+    """
+    index = 0
+    while index < len(groups):
+        if _group_token_count(groups[index]) >= min_tokens or len(groups) == 1:
+            index += 1
+            continue
+
+        # 1) 从上一片借单元（保持上一片自身也 >= 下限）。
+        if index > 0:
+            previous = groups[index - 1]
+            while (
+                _group_token_count(groups[index]) < min_tokens
+                and len(previous) > 1
+                and _group_token_count(previous[:-1]) >= min_tokens
+                and _group_token_count(groups[index] + [previous[-1]]) <= budget
+            ):
+                groups[index].insert(0, previous.pop())
+            if _group_token_count(groups[index]) >= min_tokens:
+                index += 1
+                continue
+            combined = previous + groups[index]
+            if (
+                _group_token_count(previous) >= min_tokens
+                and _group_token_count(combined) <= budget
+            ):
+                groups[index - 1:index + 1] = [combined]
+                index = max(0, index - 1)
+                continue
+            halves = _pack_child_units(combined, 2, budget)
+            if len(halves) == 2 and all(
+                _group_token_count(group) >= min_tokens for group in halves
+            ):
+                groups[index - 1:index + 1] = halves
+                index += 1
+                continue
+
+        # 2) 从下一片借单元。
+        if index + 1 < len(groups):
+            following = groups[index + 1]
+            while (
+                _group_token_count(groups[index]) < min_tokens
+                and len(following) > 1
+                and _group_token_count(following[1:]) >= min_tokens
+                and _group_token_count(groups[index] + [following[0]]) <= budget
+            ):
+                groups[index].append(following.pop(0))
+            if _group_token_count(groups[index]) >= min_tokens:
+                index += 1
+                continue
+            combined = groups[index] + following
+            if (
+                _group_token_count(following) >= min_tokens
+                and _group_token_count(combined) <= budget
+            ):
+                groups[index:index + 2] = [combined]
+                index += 1
+                continue
+            halves = _pack_child_units(combined, 2, budget)
+            if len(halves) == 2 and all(
+                _group_token_count(group) >= min_tokens for group in halves
+            ):
+                groups[index:index + 2] = halves
+                index += 1
+                continue
+
+        # 3) 极端输入：按 token 中点把「碎片的邻居 + 碎片」两等分。
+        neighbor = index - 1 if index > 0 else index + 1
+        if 0 <= neighbor < len(groups):
+            first, second = sorted((index, neighbor))
+            combined_text = "".join(groups[first] + groups[second])
+            midpoint = max(1, (count_chunk_tokens(combined_text) + 1) // 2)
+            halves = _hard_split_by_tokens(combined_text, midpoint)
+            if len(halves) == 2 and all(
+                count_chunk_tokens(piece) >= min_tokens for piece in halves
+            ):
+                replacement = [[piece] for piece in halves]
+                groups[first:second + 1] = replacement
+        index += 1
+
+
+def _hard_split_children(
+    text: str, budget: int, min_tokens: int
+) -> list[str]:
+    """超大正文的线性快路径：按 token 硬切，只修复末尾的碎片。
+
+    只为病态输入（例如一行超长表格）准备：这类文本没有行/句边界可用，逐单元
+    均衡装箱会退化成 O(n²) 的重复分词。正常切片远达不到这个规模。
+    """
+    pieces = [piece for piece in _hard_split_by_tokens(text, budget) if piece]
+    if len(pieces) > 1 and count_chunk_tokens(pieces[-1]) < min_tokens:
+        combined = pieces[-2] + pieces[-1]
+        if count_chunk_tokens(combined) <= budget:
+            pieces[-2:] = [combined]
+        else:
+            midpoint = max(1, (count_chunk_tokens(combined) + 1) // 2)
+            halves = _hard_split_by_tokens(combined, midpoint)
+            pieces[-2:] = halves if len(halves) == 2 else [combined]
+    return pieces
+
+
+def _split_children_body(
+    text: str,
+    budget: int,
+    *,
+    min_tokens: int = MIN_CHILD_TOKEN_COUNT,
+) -> list[str]:
+    """在 token 预算内切分 child 正文，并保证不产生过小的碎片。
+
+    单层切片本身已按 #287 的预算切过；只有加上前缀后真正超过硬上限才走到这里。
+    先按行/句均衡装箱，末尾若仍小于 ``min_tokens``，就与上一片重新均分（合得下时
+    直接合并）。所有片段按原顺序拼接后覆盖完整正文。
+    """
+    if not text:
+        return []
+    total = count_chunk_tokens(text)
+    if total <= budget:
+        return [text]
+
+    # 病态超长正文（单行原子表格等）走线性快路径，避免逐单元重复分词。
+    if total > budget * 32:
+        return _hard_split_children(text, budget, min_tokens)
+
+    parts = max(2, (total + budget - 1) // budget)
+    units = _child_text_units(text, budget)
+    if len(units) > 1024:
+        return _hard_split_children(text, budget, min_tokens)
+    packed = _pack_child_units(units, parts, budget)
+    if len(packed) <= 1:
+        # 没有可用的行/句边界（例如单个原子表格行）：保留完整正文，不制造碎片。
+        return [text]
+    # 先保证每片不超预算（必要时把长句再切细），再消除 < min_tokens 的碎片；
+    # 借单元可能把片段推回预算之外，因此再各做一轮。
+    _enforce_child_group_budget(packed, budget)
+    _rebalance_child_groups(packed, budget, min_tokens)
+    _enforce_child_group_budget(packed, budget)
+    _rebalance_child_groups(packed, budget, min_tokens)
+    return ["".join(group) for group in packed if group]
+
+
+def build_parent_child_chunks(
+    chunks: list[dict],
+    *,
+    file_name: str = "",
+) -> tuple[list[dict], list[dict]]:
+    """把 #287 的单层切片转换成 ``(children, parents)``（issue #289）。
+
+    - children 带 ``metadata.parent_id``，是写入 Milvus 的唯一对象；文本前加确定性
+      上下文前缀，前缀计入同一个 token 预算。
+    - parents 使用 ``p:<序号>`` 作为独立 chunk_id，只落 MySQL 侧元数据表；
+      ``parent_text`` 只存一份在 parent 行上，检索侧按 child 的 parent_id 回查。
+    - 关闭 ``PARENT_CHILD_ENABLED`` 的调用方不应调用本函数（服务层负责分支），
+      单层切片语义因此保持不变。
+    """
+    base_chunks = [chunk for chunk in (chunks or []) if isinstance(chunk, dict)]
+    if not base_chunks:
+        return [], []
+
+    target, hard_limit, _overlap = resolve_chunk_token_budget()
+    # 前缀最多占硬上限的四分之一：正常文件名/章节路径远低于此，异常输入也不会
+    # 让正文预算变成 0。
+    prefix_cap = max(1, hard_limit // 4)
+    # parent 上限按「目标值 × 8」：普通条款/小节（通常 1~3 个 child）完整保留；
+    # 无标题的整篇纯文本不会聚成一个无法塞进上下文窗口的巨型 parent。
+    parent_token_cap = max(hard_limit, target * 8)
+    children: list[dict] = []
+    parents: list[dict] = []
+
+    for parent_index, group in enumerate(
+        _group_chunks_by_parent(base_chunks, max_tokens=parent_token_cap)
+    ):
+        parent_id = f"p:{parent_index}"
+        parent_text = _parent_text_for_group(group["chunks"])
+        group_children: list[dict] = []
+
+        for base in group["chunks"]:
+            metadata = dict(base.get("metadata") or {})
+            prefix = _context_prefix(file_name, metadata, max_tokens=prefix_cap)
+            prefix_tokens = count_chunk_tokens(prefix)
+            # 正文开头已经含有的章节/条款标题不再重复进 child；前缀只补正文缺的部分。
+            body_text = _strip_duplicate_context_headings(
+                str(base.get("text") or ""), metadata, prefix=prefix
+            )
+            full_text = (
+                f"{prefix}\n{body_text}" if prefix and body_text else (prefix or body_text)
+            )
+            if count_chunk_tokens(full_text) <= hard_limit:
+                # 预算口径是硬上限（已乘安全系数），不是目标值：接近目标、加前缀后
+                # 仍在硬上限内的切片保持 1 个 child，否则前缀会让 child 数成倍增长。
+                pieces = [body_text]
+            else:
+                # 留 1 个 token 给前缀与正文之间的换行。
+                body_budget = max(1, hard_limit - prefix_tokens - 1)
+                pieces = _split_children_body(body_text, body_budget)
+                if not pieces:
+                    pieces = [body_text]
+
+            base_id = str(base.get("id", len(children)))
+            for piece_index, piece in enumerate(pieces):
+                child_id = base_id if len(pieces) == 1 else f"{base_id}.{piece_index}"
+                child_text = f"{prefix}\n{piece}" if prefix and piece else (prefix or piece)
+                child_metadata = {
+                    **metadata,
+                    "kind": "child",
+                    "parent_id": parent_id,
+                    # parent 正文只落在 parent 行，child 行不再复制一份：一整篇
+                    # 无标题文本会产生数千个 child，逐行复制 parent 会把存储撑爆。
+                    "parent_text": None,
+                    "context_prefix": prefix,
+                    "token_count": count_chunk_tokens(child_text),
+                }
+                group_children.append(
+                    {"id": child_id, "text": child_text, "metadata": child_metadata}
+                )
+
+        children.extend(group_children)
+        first_metadata = group["chunks"][0].get("metadata") or {}
+        parents.append(
+            {
+                "id": parent_id,
+                "text": parent_text,
+                "metadata": {
+                    "kind": "parent",
+                    "parent_id": None,
+                    "parent_text": parent_text,
+                    "section_path": group["section_path"],
+                    "article_no": group["article_no"],
+                    "token_count": count_chunk_tokens(parent_text),
+                    "table_id": first_metadata.get("table_id"),
+                    "row_no": first_metadata.get("row_no"),
+                    "row_no_end": first_metadata.get("row_no_end"),
+                    "table_row_count": first_metadata.get("table_row_count", 0),
+                    "is_table_header": bool(first_metadata.get("is_table_header")),
+                    "heading_levels": first_metadata.get("heading_levels", []),
+                    "child_chunk_ids": [child["id"] for child in group_children],
+                },
+            }
+        )
+
+    return children, parents
+
+
 # 入库文本合计低于原文该比例即视为异常：分块规则可能把正文整段丢掉了。
 KNOWLEDGE_INDEX_MIN_COVERAGE_RATIO = 0.5
 
@@ -1130,6 +1696,11 @@ def replace_chunk_metadata(
         metadata = chunk.get("metadata") or {}
         # 列宽截断：病态标题/编号不能让整次上传因为 MySQL 的严格模式而失败。
         chunk_id = str(chunk.get("id", index))[:64]
+        # parent_text 已有独立 LONGTEXT 列；父级正文可能很长，再序列化一份到
+        # metadata_json 会让每行体积翻倍（issue #289 的 10MB 上传实测 MemoryError）。
+        stored_metadata = {
+            key: value for key, value in metadata.items() if key != "parent_text"
+        }
         db.add(
             KnowledgeChunkMetadata(
                 file_id=file_id,
@@ -1142,7 +1713,9 @@ def replace_chunk_metadata(
                 table_id=_metadata_optional_int(metadata.get("table_id")),
                 row_no=_metadata_optional_int(metadata.get("row_no")),
                 parent_text=metadata.get("parent_text"),
-                metadata_json=json.dumps(metadata, ensure_ascii=False, default=str, sort_keys=True),
+                metadata_json=json.dumps(
+                    stored_metadata, ensure_ascii=False, default=str, sort_keys=True
+                ),
             )
         )
     db.commit()

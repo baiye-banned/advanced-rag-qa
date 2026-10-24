@@ -22,11 +22,13 @@ from config import (
     BM25_MAX_DOCS,
     BM25_MAX_SCORED_CANDIDATES,
     BM25_MAX_TERMS,
+    PARENT_CHILD_ENABLED,
+    PARENT_CONTEXT_MAX_TOKENS,
     RETRIEVAL_ROUTE_TOP_K,
 )
-from crud.knowledge_file import strip_extraction_markers
+from crud.knowledge_file import count_chunk_tokens, strip_extraction_markers
 from database.session import SessionLocal
-from model.models import KnowledgeFile
+from model.models import KnowledgeChunkMetadata, KnowledgeFile
 from rag.bm25 import (
     BM25CorpusTooLarge,
     BM25Index,
@@ -42,6 +44,7 @@ from rag.milvus_client import (
     query_vectors,
 )
 from rag.rerank import (
+    KEYWORD_CHUNK_NAMESPACE,
     chunk_content_key,
     chunk_key,
     chunk_scheme,
@@ -327,6 +330,11 @@ async def retrieve_knowledge(
     reranked, rerank_trace = await rerank_chunks(ranking_question, fused[:12])
     trace["rerank"] = rerank_trace
     final_chunks = select_final_chunks(reranked or fused, keyword_chunks)
+    # 父子切片（issue #289）：RRF 与 rerank 始终作用于 child，聚合只发生在最终选择
+    # 之后——同一 parent 的多个 child 在这里合并成一个上下文槽位。旧数据、元数据表
+    # 不可用或开关关闭时原样返回 child，聊天链路不受影响。
+    final_chunks, parent_child_trace = await expand_parent_chunks(final_chunks, db)
+    trace["parent_child"] = parent_child_trace
     await _trace_add(
         trace_recorder,
         "retriever_done",
@@ -337,6 +345,7 @@ async def retrieve_knowledge(
             "rrf": trace["rrf"],
             "rerank": rerank_trace,
             "bm25": trace["bm25"],
+            "parent_child": parent_child_trace,
         },
         result={"final_chunks_count": len(final_chunks)},
         note="retrieve_knowledge 完成，最终 chunk 会进入回答生成链。",
@@ -1369,6 +1378,224 @@ def rrf_fuse(route_results: list[tuple[str, list[dict]]], k: int = 60) -> list[d
             entry["rrf_score"] += 1.0 / (k + rank)
             entry["routes"].append({"route": route, "rank": rank})
     return sorted(fused.values(), key=lambda item: item["rrf_score"], reverse=True)
+
+
+def _candidate_file_id(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _expand_parent_chunks_sync(
+    db: Session | None, chunks: list[dict]
+) -> tuple[list[dict], dict]:
+    """按 ``(file_id, chunk_id)`` 读元数据，把 child 命中合并成 parent（issue #289）。
+
+    关键字窗口来自原文偏移，不是入库 child 的 ``chunk_id``；两套编号都可能从 0 开始，
+    按 id 查会把关键字窗口错配到别的 child，所以关键字候选一律按 child 内容降级。
+    没有元数据行（旧文件）或缺少 ``parent_id``/``parent_text`` 时同样原样返回。
+    """
+    session = db
+    owns_session = session is None
+    if owns_session:
+        session = SessionLocal()
+    try:
+        candidates: list[tuple[int, str]] = []
+        keyword_unmapped = 0
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
+            if chunk_scheme(chunk) == KEYWORD_CHUNK_NAMESPACE:
+                keyword_unmapped += 1
+                continue
+            chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or "")
+            if chunk_id:
+                candidates.append((_candidate_file_id(chunk.get("file_id")), chunk_id))
+            else:
+                keyword_unmapped += 1
+
+        stats = {
+            "children": len(chunks),
+            "candidates": len(candidates),
+            "mapped": 0,
+            "expanded": 0,
+            "merged": 0,
+            "fallback": 0,
+            "keyword_unmapped": keyword_unmapped,
+        }
+        if not candidates:
+            return chunks, stats
+
+        file_ids = {file_id for file_id, _ in candidates}
+        chunk_ids = {chunk_id for _, chunk_id in candidates}
+        child_rows = (
+            session.query(KnowledgeChunkMetadata)
+            .filter(
+                KnowledgeChunkMetadata.file_id.in_(file_ids),
+                KnowledgeChunkMetadata.chunk_id.in_(chunk_ids),
+            )
+            .all()
+        )
+        by_key = {(int(row.file_id), str(row.chunk_id)): row for row in child_rows}
+
+        # parent 正文只存一份在 ``p:`` 行上；这里按 child 的 parent_id 回查，
+        # 避免每个 child 行都复制一遍父级全文。
+        parent_ids = {str(row.parent_id) for row in child_rows if row.parent_id}
+        parent_by_key: dict[tuple[int, str], KnowledgeChunkMetadata] = {}
+        if parent_ids:
+            parent_rows = (
+                session.query(KnowledgeChunkMetadata)
+                .filter(
+                    KnowledgeChunkMetadata.file_id.in_(file_ids),
+                    KnowledgeChunkMetadata.chunk_id.in_(parent_ids),
+                )
+                .all()
+            )
+            parent_by_key = {
+                (int(row.file_id), str(row.chunk_id)): row for row in parent_rows
+            }
+
+        expanded: list[dict] = []
+        seen_parents: set[tuple[int, str]] = set()
+        for chunk in chunks:
+            if not isinstance(chunk, dict):
+                expanded.append(chunk)
+                continue
+            if chunk_scheme(chunk) == KEYWORD_CHUNK_NAMESPACE:
+                expanded.append(chunk)
+                continue
+            chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or "")
+            file_id = _candidate_file_id(chunk.get("file_id"))
+            child_row = by_key.get((file_id, chunk_id))
+            if child_row is None:
+                # 旧文件没有元数据行，或关键字窗口的编号不属于入库 child。
+                stats["fallback"] += 1
+                expanded.append(chunk)
+                continue
+            stats["mapped"] += 1
+            parent_row = (
+                parent_by_key.get((file_id, str(child_row.parent_id)))
+                if child_row.parent_id
+                else None
+            )
+            if parent_row is None or not parent_row.parent_text:
+                # #287 的行没有父子关系，或 parent 行缺失/为空：按单层切片降级。
+                stats["fallback"] += 1
+                expanded.append(chunk)
+                continue
+            parent_key = (file_id, str(parent_row.chunk_id))
+            if parent_key in seen_parents:
+                # 同一 parent 只占一个最终上下文槽位；先出现的 child 决定顺序与分值。
+                stats["merged"] += 1
+                continue
+            seen_parents.add(parent_key)
+            stats["expanded"] += 1
+            expanded.append(
+                {
+                    **chunk,
+                    "content": parent_row.parent_text,
+                    "parent_id": str(parent_row.chunk_id),
+                    "parent_text": parent_row.parent_text,
+                    "parent_section_path": parent_row.section_path or child_row.section_path or "",
+                    "parent_article_no": parent_row.article_no or child_row.article_no or "",
+                    "parent_expanded": True,
+                }
+            )
+        return expanded, stats
+    finally:
+        if owns_session:
+            session.close()
+
+
+def _apply_parent_context_budget(
+    chunks: list[dict], max_tokens: int
+) -> tuple[list[dict], int, int]:
+    """按 parent 边界把聚合后的上下文压到绝对 token 上限以内。
+
+    返回 ``(保留的切片, 保留后的 token 数, 丢弃的切片数)``。只在超限时从尾部整块丢弃：
+    把 parent 从中间截断会丢掉但书/例外，正是父子聚合要保留的内容。至少保留第一个
+    槽位——单个 parent 本身超限时没有更细的边界可退，保留它并在 trace 里标记 truncated。
+    """
+    tokens = [count_chunk_tokens(str(chunk.get("content") or "")) for chunk in chunks]
+    total = sum(tokens)
+    if total <= max_tokens:
+        return chunks, total, 0
+    kept = list(chunks)
+    kept_tokens = total
+    dropped = 0
+    while len(kept) > 1 and kept_tokens > max_tokens:
+        kept_tokens -= tokens[len(kept) - 1]
+        kept.pop()
+        dropped += 1
+    return kept, kept_tokens, dropped
+
+
+async def expand_parent_chunks(
+    chunks: list[dict], db: Session | None = None
+) -> tuple[list[dict], dict]:
+    """检索侧父子聚合入口：任何失败都退回 child 内容并写 trace，不抛给聊天链路。"""
+    if not PARENT_CHILD_ENABLED:
+        return chunks, {
+            "enabled": False,
+            "status": "disabled",
+            "children": len(chunks),
+            "expanded_tokens": 0,
+            "truncated": False,
+        }
+    if not chunks:
+        return chunks, {
+            "enabled": True,
+            "status": "empty",
+            "children": 0,
+            "expanded_tokens": 0,
+            "truncated": False,
+        }
+    try:
+        expanded, stats = await asyncio.to_thread(_expand_parent_chunks_sync, db, chunks)
+    except Exception as exc:
+        # 异常原文只进日志；trace 只留固定原因码（沿用 #263 的护栏）。
+        logger.warning(
+            "Parent chunk expansion failed, falling back to child content: %s",
+            exc,
+            exc_info=True,
+        )
+        return chunks, {
+            "enabled": True,
+            "status": "fallback",
+            "reason": "metadata_unavailable",
+            "children": len(chunks),
+            "expanded_tokens": 0,
+            "truncated": False,
+        }
+
+    if stats["expanded"]:
+        status = "done" if stats["fallback"] == 0 and stats["keyword_unmapped"] == 0 else "partial"
+    else:
+        status = "fallback"
+
+    if stats["expanded"]:
+        # 只有真的聚合出 parent 时才施加父级上下文上限；纯 child 回退必须保持 #287
+        # 的单层行为，不能因为打开开关而悄悄丢掉候选。
+        expanded, expanded_tokens, dropped = _apply_parent_context_budget(
+            expanded, PARENT_CONTEXT_MAX_TOKENS
+        )
+        stats["truncated"] = dropped > 0
+        stats["dropped"] = dropped
+    else:
+        expanded_tokens = 0
+        stats["truncated"] = False
+    stats["expanded_tokens"] = expanded_tokens
+
+    trace = {"enabled": True, "status": status, **stats}
+    if status == "fallback":
+        if not stats["candidates"]:
+            trace["reason"] = "no_child_candidates"
+        elif stats["mapped"] == 0:
+            trace["reason"] = "metadata_missing"
+        else:
+            trace["reason"] = "no_parent_metadata"
+    return expanded, trace
 
 
 def _normalize_decision(data: dict) -> dict:

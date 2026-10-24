@@ -39,7 +39,7 @@ def _build_sources(chunks: list[dict]) -> list[dict]:
         content = _text_value(chunk.get("content")).strip()
         if not content:
             continue
-        sources.append({
+        source = {
             "index": index,
             "file_id": chunk.get("file_id", 0),
             "file_name": chunk.get("file_name", "Untitled"),
@@ -51,7 +51,15 @@ def _build_sources(chunks: list[dict]) -> list[dict]:
             "rerank_reason": chunk.get("rerank_reason", ""),
             "content": content,
             "excerpt": content[:180] + ("..." if len(content) > 180 else ""),
-        })
+        }
+        # 父子切片（issue #289）：命中 child、返回 parent 时附带可选元数据。
+        # 旧客户端忽略这些新增键；没有 parent 的候选保持与原响应完全一致。
+        if chunk.get("parent_id"):
+            source["parent_id"] = chunk.get("parent_id")
+            source["parent_section_path"] = chunk.get("parent_section_path", "")
+            source["parent_article_no"] = chunk.get("parent_article_no", "")
+            source["parent_expanded"] = True
+        sources.append(source)
     return sources
 
 

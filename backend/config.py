@@ -340,6 +340,21 @@ CHUNK_TOKEN_SAFETY_RATIO = normalize_token_safety_ratio(
     name="CHUNK_TOKEN_SAFETY_RATIO",
 )
 
+# Parent-child chunking (issue #289). Children are embedded and recalled; the matching
+# parent keeps the article/section context and is returned after rerank. Off by default:
+# #293 currently only provides a phase-1 dry-run, so there is no measured Recall@5 /
+# citation-hit evidence comparing single-layer (#287) against parent-child. Enable it
+# only after phase 2 shows no regression. When false, ingestion and retrieval both keep
+# the single-layer #287 behavior. Old files without metadata rows automatically fall back
+# to their child content even when this is true.
+PARENT_CHILD_ENABLED = _env_bool("PARENT_CHILD_ENABLED", False)
+# Absolute cap for the aggregated parent context. Rerank returns at most five slots and a
+# parent can hold several children, so without a cap a few long parents can fill the whole
+# model window. Over the cap, whole trailing parents are dropped -- never cut mid-parent
+# (a half parent loses exactly the conditions/exceptions the expansion was meant to keep).
+# The retrieval trace records ``expanded_tokens`` and ``truncated``.
+PARENT_CONTEXT_MAX_TOKENS = max(1, _env_int("PARENT_CONTEXT_MAX_TOKENS", 6000))
+
 # Bulk ingestion keeps its own timeout instead of sharing the online-QA one above.
 # A batch now carries at most EMBEDDING_MAX_BATCH_ITEMS chunks (10 by default), so the
 # per-request body is much smaller than the old 64-chunk shape; 60s still covers a slow
