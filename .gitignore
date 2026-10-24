@@ -25,6 +25,7 @@ deepseek.txt
 .envrc
 
 # Runtime data
+testdata/
 backend/chroma_data/
 backend/uploads/
 backend/*.db
