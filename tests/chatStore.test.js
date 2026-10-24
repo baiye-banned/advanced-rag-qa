@@ -8,10 +8,13 @@ const stubSource = [
   // 反馈是独立的出口：getMessages 的 pending 队列由 respond/respondError 驱动，
   // 混在一起会让「消费一条反馈响应」顺手吃掉一条消息响应。
   'const feedbackPending = new Map()',
+  // 删除同样单独排队：删消息成功后 store 会刷新会话列表，和反馈响应互不干扰。
+  'const deletePending = new Map()',
   'const conversationResolvers = []',
   'export const streams = []',
   'export const getMessagesCalls = []',
   'export const getMessagesParams = []',
+  'export const deleteCalls = []',
   'export const chatAPI = {',
   '  getConversations: () => new Promise((resolve) => conversationResolvers.push(resolve)),',
   '  getMessages: (id, params) => new Promise((resolve, reject) => {',
@@ -22,6 +25,12 @@ const stubSource = [
   '    pending.set(id, queue)',
   '  }),',
   '  deleteConversation: async () => {},',
+  '  deleteMessage: (id) => new Promise((resolve, reject) => {',
+  '    deleteCalls.push(id)',
+  '    const queue = deletePending.get(id) || []',
+  '    queue.push({ resolve, reject })',
+  '    deletePending.set(id, queue)',
+  '  }),',
   '  renameConversation: async () => {},',
   '  setMessageFeedback: (id, feedback) => new Promise((resolve, reject) => {',
   '    const queue = feedbackPending.get(id) || []',
@@ -73,11 +82,25 @@ const stubSource = [
   '  feedbackPending.set(id, queue)',
   '  if (entry) entry.reject(error)',
   '}',
+  'export function respondDelete(id) {',
+  '  const queue = deletePending.get(id) || []',
+  '  const entry = queue.shift()',
+  '  deletePending.set(id, queue)',
+  '  if (entry) entry.resolve({ message: "ok" })',
+  '}',
+  'export function respondDeleteError(id, error) {',
+  '  const queue = deletePending.get(id) || []',
+  '  const entry = queue.shift()',
+  '  deletePending.set(id, queue)',
+  '  if (entry) entry.reject(error)',
+  '}',
   // 每条用例开始前清空桩状态：某条用例提前断言失败时可能留下没人消费的 resolver，
   // 若不清理，下一条用例的 respond() 会把它消费掉，导致该用例永远等不到自己的响应。
   'export function resetStub() {',
   '  pending.clear()',
   '  feedbackPending.clear()',
+  '  deletePending.clear()',
+  '  deleteCalls.length = 0',
   '  conversationResolvers.length = 0',
   '}',
   'export function streamChat(options) {',
@@ -121,7 +144,7 @@ globalThis.window = {
 
 const { createPinia, setActivePinia } = await import('pinia')
 const { useChatStore } = await import('../src/stores/chat.js')
-const { respond, respondLatest, respondError, respondFeedback, respondFeedbackError, respondConversations, resetStub, streams, getMessagesCalls, getMessagesParams } =
+const { respond, respondLatest, respondError, respondFeedback, respondFeedbackError, respondDelete, respondDeleteError, respondConversations, resetStub, streams, getMessagesCalls, getMessagesParams, deleteCalls } =
   await import(chatApiStub)
 
 const conversation = (id, knowledgeBaseId = null) => ({
@@ -135,6 +158,11 @@ const message = (id, content, ragasStatus = '') => ({
   role: 'assistant',
   content,
   ragas_status: ragasStatus,
+})
+
+const roleMessage = (id, role, content, ragasStatus = '') => ({
+  ...message(id, content, ragasStatus),
+  role,
 })
 
 const contents = (store) => store.messages.map((item) => item.content)
@@ -1245,4 +1273,114 @@ test('请求期间切走又切回，迟到的刷新不截断新加载的历史',
   await refreshing
 
   assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1))
+})
+
+// ---------------------------------------------------------------------------
+// k. 删除单条消息（issue #256）：用户消息截断、助手消息单删、失败不动本地
+// ---------------------------------------------------------------------------
+
+async function openConversation(store, id, rows) {
+  const opening = store.selectConversation(id)
+  respond(id, rows)
+  await opening
+}
+
+// 删除成功后 store 会刷新会话列表：等删除响应落地，再回应这次刷新。
+async function respondToDelete(store, messageId, conversations = []) {
+  await flush()
+  respondDelete(messageId)
+  await flush()
+  respondConversations(conversations)
+  return store
+}
+
+test('deleteMessage：助手消息只删本地这一条，并刷新会话列表反映 updated_at', async () => {
+  const store = createStore([conversation('a')])
+  await openConversation(store, 'a', [
+    roleMessage(1, 'user', '第一问'),
+    roleMessage(2, 'assistant', '第一答'),
+    roleMessage(3, 'user', '第二问'),
+  ])
+
+  const deletion = store.deleteMessage(2)
+  await flush()
+  // API 先行：请求在途时本地一条都不能少，避免失败后视图与后端不一致。
+  assert.deepEqual(deleteCalls, [2])
+  assert.deepEqual(contents(store), ['第一问', '第一答', '第二问'])
+
+  respondDelete(2)
+  await flush()
+  assert.deepEqual(contents(store), ['第一问', '第二问'], '助手消息只删自己')
+
+  const refreshed = { ...conversation('a'), updated_at: '2026-10-24T10:00:00' }
+  respondConversations([refreshed])
+
+  assert.equal(await deletion, true)
+  assert.equal(store.conversations[0].updated_at, '2026-10-24T10:00:00')
+})
+
+test('deleteMessage：用户消息连同其后的所有本地消息一起截断', async () => {
+  const store = createStore([conversation('a')])
+  await openConversation(store, 'a', [
+    roleMessage(1, 'user', '第一问'),
+    roleMessage(2, 'assistant', '第一答'),
+    roleMessage(3, 'user', '第二问'),
+    roleMessage(4, 'assistant', '第二答'),
+  ])
+
+  const deletion = store.deleteMessage(3)
+  await respondToDelete(store, 3, [conversation('a')])
+
+  assert.equal(await deletion, true)
+  assert.deepEqual(contents(store), ['第一问', '第一答'])
+  assert.equal(store.currentId, 'a', '截断不等于清空会话')
+})
+
+test('deleteMessage：接口失败时本地消息原样保留并抛出错误', async () => {
+  const store = createStore([conversation('a')])
+  await openConversation(store, 'a', [
+    roleMessage(1, 'user', '第一问'),
+    roleMessage(2, 'assistant', '第一答'),
+  ])
+
+  const deletion = store.deleteMessage(2)
+  await flush()
+  respondDeleteError(2, new Error('删除失败'))
+
+  await assert.rejects(deletion, /删除失败/)
+  assert.deepEqual(contents(store), ['第一问', '第一答'], '失败不得留下乐观删除的痕迹')
+  assert.deepEqual(deleteCalls, [2])
+})
+
+test('deleteMessage：流式期间拒绝删除，且不发出请求', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+  store.sendMessage('正在生成的问题')
+  assert.equal(store.streaming, true)
+
+  assert.equal(await store.deleteMessage(1), false)
+  assert.deepEqual(deleteCalls, [], '流式期间不得调用删除接口')
+
+  store.clearMessages() // 中止在途流，避免污染后续用例
+})
+
+test('deleteMessage：删空消息后保留当前会话，进入空态而不是新对话', async () => {
+  const store = createStore([conversation('a')])
+  await openConversation(store, 'a', [roleMessage(2, 'assistant', '唯一一条')])
+
+  const deletion = store.deleteMessage(2)
+  await respondToDelete(store, 2, [conversation('a')])
+
+  assert.equal(await deletion, true)
+  assert.deepEqual(store.messages, [])
+  assert.equal(store.currentId, 'a')
+  assert.equal(store.hasMoreMessages, false)
+})
+
+test('deleteMessage：没有本地 id 的消息不可删除', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  assert.equal(await store.deleteMessage(null), false)
+  assert.deepEqual(deleteCalls, [])
 })

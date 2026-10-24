@@ -473,6 +473,16 @@ def delete_conversation(cid: str, user: User = Depends(get_current_user),
     return {"message": "ok"}
 
 
+def delete_message(message_id: int, user: User = Depends(get_current_user),
+                   db: Session = Depends(get_db)):
+    """删除单条消息（issue #256）；截断/单条语义与联动清理都在 CRUD 的同一次事务里完成。"""
+    deleted_ids = crud_chat.delete_message(db, message_id, user.id)
+    if deleted_ids is None:
+        # 查无此消息与「消息属于别人」共用同一分支：归属校验随查询完成，不区分两者。
+        raise HTTPException(404, "消息不存在")
+    return {"message": "ok", "deleted_message_ids": deleted_ids}
+
+
 def rename_conversation(cid: str, body: RenameRequest, user: User = Depends(get_current_user),
                         db: Session = Depends(get_db)):
     title = body.title.strip()

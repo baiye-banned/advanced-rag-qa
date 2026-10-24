@@ -104,7 +104,8 @@ def list_conversations(
        会话按它排序不稳定，翻页会重复或漏行。补一个唯一且不重复的主键做末位键，
        `(updated_at, id)` 就是全序，游标比较才有确定答案。
 
-    已知边界：`updated_at` 是可变的——四类写入方都会改写它：新消息（本单新增的 `touch_conversation`）、
+    已知边界：`updated_at` 是可变的——五类写入方都会改写它：新消息（`_save_user_message` 的
+    `touch_conversation`）、删除消息（`delete_message` 的 `touch_conversation`，issue #256）、
     重命名（`rename_conversation`）、记忆摘要写入（`rag/memory_service.py` 的
     `_write_memory_summary_text`）、删除知识库时的会话改绑（`crud/knowledge_base.py`）；
     启动期那条裸 SQL 回填（`database/session.py`）绕过 ORM、**不会**改写它（有意为之）。
@@ -678,6 +679,120 @@ def get_message_by_user(db: Session, message_id: int, user_id: int) -> Message |
         .filter(Message.id == message_id, Conversation.user_id == user_id)
         .first()
     )
+
+
+def _attachment_keys(raw_attachments) -> list[str]:
+    """从一列 JSON 附件里取出对象键；脏数据项直接跳过（与 list_conversation_attachment_owners 同款）。"""
+    keys: list[str] = []
+    for item in load_json_value(raw_attachments, []):
+        if not isinstance(item, dict):
+            continue
+        object_key = item.get("object_key")
+        if isinstance(object_key, str) and object_key:
+            keys.append(object_key)
+    return keys
+
+
+def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | None:
+    """删除一条消息，返回实际删掉的消息 id（按 id 升序）；查无此消息或不属于该用户返回 None。
+
+    语义（issue #256）：
+    - 用户消息 = **截断**：连同同一会话里 id 不小于它的后续消息一起删。这与「编辑后重发」
+      是同一件事，只是这里不重新写入；
+    - 助手消息 = 只删这一条，它前面的提问与后面的回答都保留。
+
+    归属沿用 `get_message_by_user`：消息与 conversations 做 join 再按 user_id 过滤，
+    别人的消息在查询里就不存在，因此对调用方只呈现 404，不会回显正文。
+
+    一次提交里完成四件事：删消息、推进会话 `updated_at`、必要时作废记忆摘要、给不再被
+    任何消息引用的附件键登记回收行。任何一步失败都整体回滚——不存在「消息删了但侧栏没动」
+    或「摘要清了但消息还在」的中间态。
+
+    附件**不在这里删对象**（不调用 OSS / `_reclaim_chat_attachments` / `delete_attachment_uploads`）：
+    请求路径只登记一条 pending 行（created_at=now），由既有的 `reclaim_orphan_chat_attachments`
+    按 TTL 清扫。同键已有登记行时不覆盖——那行可能正被发送侧消费或已被判死，改写它会
+    制造「活消息引用已删对象」的竞态。
+    """
+    message = get_message_by_user(db, message_id, user_id)
+    if message is None:
+        return None
+    conversation = get_conversation(db, message.conversation_id, user_id)
+    if conversation is None:
+        # 防御性分支：上面的 join 已经保证会话属于该用户。保留它让归属判据在两条查询里
+        # 都成立，读到这行时别当成一条真实的竞态。
+        return None
+
+    if message.role == "user":
+        # 截断：同会话、id >= 目标消息的全部行（包括目标本身）。
+        delete_condition = and_(
+            Message.conversation_id == message.conversation_id,
+            Message.id >= message.id,
+        )
+    else:
+        # 助手消息只删这一条；其它角色（历史脏数据）同样按单条处理。
+        delete_condition = Message.id == message.id
+
+    rows = db.query(Message.id, Message.attachments).filter(delete_condition).all()
+    deleted_ids = [row_id for row_id, _raw in rows]
+
+    # 附件键必须在删行之前收集；删完就再也读不到这些消息引用过什么。
+    candidate_keys = {
+        object_key
+        for _row_id, raw_attachments in rows
+        for object_key in _attachment_keys(raw_attachments)
+    }
+    orphan_keys: list[str] = []
+    if candidate_keys:
+        surviving_keys: set[str] = set()
+        surviving_rows = (
+            db.query(Message.attachments)
+            .filter(Message.id.notin_(deleted_ids))
+            .all()
+        )
+        for (raw_attachments,) in surviving_rows:
+            surviving_keys.update(_attachment_keys(raw_attachments))
+        orphan_keys = sorted(candidate_keys - surviving_keys)
+
+    try:
+        db.query(Message).filter(delete_condition).delete(synchronize_session=False)
+
+        # 删除也是内容变更：侧栏按 updated_at 排序，不推进它，删完的会话仍沉在旧位置。
+        # `onupdate` 只在会话行真的被 UPDATE 时触发，所以必须显式 touch（同 #239）。
+        touch_conversation(db, conversation.id, user_id)
+
+        # 记忆摘要若覆盖了任一被删消息，摘要文本里就可能残留已删内容。不做句级清洗
+        # （摘要是模型生成的连续文本，按行/句裁剪只会得到一段断裂的中间态），直接作废、
+        # 让下一轮重新生成；指针之前被删时摘要仍然有效，不碰。
+        pointer = conversation.memory_summary_upto_message_id or 0
+        if any(deleted_id <= pointer for deleted_id in deleted_ids):
+            conversation.memory_summary = ""
+            conversation.memory_summary_upto_message_id = 0
+            conversation.memory_updated_at = None
+
+        if orphan_keys:
+            # 同键已有行时**不改写**：那行的状态（待消费 / 已消费 / 墓碑）是另一条链路的
+            # 事实，覆盖它会把正在发送的附件误判成孤儿，或让已被判死的对象重新放行。
+            existing_keys = {
+                object_key
+                for (object_key,) in db.query(ChatAttachmentUpload.object_key)
+                .filter(ChatAttachmentUpload.object_key.in_(orphan_keys))
+                .all()
+            }
+            db.add_all([
+                ChatAttachmentUpload(
+                    object_key=object_key,
+                    user_id=user_id,
+                    created_at=datetime.now(),
+                )
+                for object_key in orphan_keys
+                if object_key not in existing_keys
+            ])
+
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return deleted_ids
 
 
 def get_trace_session_by_message(db: Session, message_id: int, user_id: int) -> ChatTraceSession | None:
