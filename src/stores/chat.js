@@ -139,6 +139,10 @@ export const useChatStore = defineStore('chat', () => {
     const previous = conversationKeyword()
     conversationQuery.value = next
     if (next.trim() === previous) return conversations.value
+    // 检索词真的变了，列表即将被搜索结果替换：历史管理模式下的旧选中项可能已经
+    // 不在新列表里，但「已选 N/M」仍会统计它们，批量删除就会删掉用户看不见的会话。
+    // 只在实际变化时清空，同词重复调用（含仅空白差异）保持选中不变。
+    selectedConversationIds.value = []
     conversationCursor = null
     hasMoreConversations.value = false
     return fetchConversations()

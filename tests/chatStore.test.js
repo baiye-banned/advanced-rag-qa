@@ -1384,3 +1384,49 @@ test('清空检索词后恢复默认列表，请求不再带 q', async () => {
   assert.deepEqual(conversationIds(store), ['a', 'b'])
   assert.equal(store.hasMoreConversations, false)
 })
+
+test('检索词变化时清空历史管理模式下已选中的会话', async () => {
+  const store = createStore([conversation('c1'), conversation('c2'), conversation('c3')])
+  store.enterHistoryManageMode()
+  store.toggleConversationSelection('c1')
+  store.toggleConversationSelection('c2')
+  assert.deepEqual(store.selectedConversationIds, ['c1', 'c2'])
+
+  const searched = store.setConversationQuery('报表')
+  respondConversations([conversationRow('hit', '报表统计')])
+  await searched
+
+  // 搜索结果只剩一条命中项，旧选中项已不在列表里：不清空的话「已选 2 / 1」
+  // 会让批量删除删掉用户根本看不见的 c1/c2。
+  assert.deepEqual(store.selectedConversationIds, [])
+  assert.deepEqual(conversationIds(store), ['hit'])
+})
+
+test('检索词未实际变化时不清空选中（幂等调用不误清）', async () => {
+  const store = createStore([conversation('c1')])
+  const searched = store.setConversationQuery('报表')
+  respondConversations([conversationRow('hit', '报表统计')])
+  await searched
+  store.toggleConversationSelection('hit')
+  assert.deepEqual(store.selectedConversationIds, ['hit'])
+
+  const requestsBefore = conversationRequests.length
+  // 仅首尾空白不同 = 同一个检索词：短路返回，不发请求，也不能动选中集合。
+  await store.setConversationQuery('  报表  ')
+
+  assert.equal(conversationRequests.length, requestsBefore)
+  assert.deepEqual(store.selectedConversationIds, ['hit'])
+})
+
+test('搜索后全选只覆盖当前可见的命中项', async () => {
+  const store = createStore([conversation('c1'), conversation('c2'), conversation('c3')])
+  store.enterHistoryManageMode()
+
+  const searched = store.setConversationQuery('报表')
+  respondConversations([conversationRow('hit-1', '报表一'), conversationRow('hit-2', '报表二')])
+  await searched
+
+  store.toggleSelectAllConversations()
+
+  assert.deepEqual(store.selectedConversationIds, ['hit-1', 'hit-2'])
+})

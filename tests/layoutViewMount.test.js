@@ -596,3 +596,55 @@ test('标题检索 S1：输入防抖后只发一次带 q 的请求，空结果�
     await close(view)
   }
 })
+
+test('标题检索 S2：检索词变化清空历史管理模式下的选中项，批量删除随之禁用', async () => {
+  const { view } = await mountLayout({ conversations: [CONV1, CONV2] })
+
+  try {
+    const { useChatStore } = await import(
+      new URL('../src/stores/chat.js', import.meta.url).href
+    )
+    const chatStore = useChatStore(view.pinia)
+
+    chatStore.enterHistoryManageMode()
+    chatStore.toggleConversationSelection('c1')
+    chatStore.toggleConversationSelection('c2')
+    await settle(view)
+
+    assert.match(view.text(), /已选 2 \/ 2/, '前置：两条会话应当都已选中')
+    const deleteButton = view
+      .queryAll('button')
+      .find((node) => node.textContent.trim() === '删除选中')
+    assert.ok(deleteButton, '历史管理模式下应当渲染「删除选中」按钮')
+    assert.equal(deleteButton.disabled, false, '选中两条时批量删除应当可用')
+
+    // 只命中第一条：检索后列表被替换，选中集合也必须归零。
+    respond('get', (url, config) => {
+      if (url === '/chat/conversations') {
+        return config?.params?.q ? [CONV1] : [CONV1, CONV2]
+      }
+      if (url === '/user/profile') return PROFILE
+      return {}
+    })
+
+    const before = conversationListCalls().length
+    typeInto(view.query('.conversation-search input'), '第一段')
+
+    const reset = await until(view, () => view.text().includes('已选 0 / 1'), 2000)
+    assert.ok(reset, '检索生效后「已选」应当归零并跟随新列表长度')
+    assert.ok(
+      conversationListCalls().slice(before).every((entry) => entry.args[1].params.q === '第一段'),
+      '检索请求应当带上新的检索词'
+    )
+
+    const disabled = await until(view, () => {
+      const button = view
+        .queryAll('button')
+        .find((node) => node.textContent.trim() === '删除选中')
+      return Boolean(button?.disabled)
+    }, 2000)
+    assert.ok(disabled, '没有选中项时批量删除按钮应当禁用')
+  } finally {
+    await close(view)
+  }
+})
