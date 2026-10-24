@@ -1189,7 +1189,9 @@ MIN_CHILD_TOKEN_COUNT = 100
 _MAX_PARENT_OVERLAP_UNITS = 2
 
 
-def _strip_duplicate_context_headings(text: str, metadata: dict) -> str:
+def _strip_duplicate_context_headings(
+    text: str, metadata: dict, *, prefix: str = ""
+) -> str:
     """剥掉正文开头已经含有的章节/条款标题，避免与前缀重复。
 
     #287 的每个切片以当前标题路径开头（``第一章 总则`` / ``第一条``），而 child 的
@@ -1198,15 +1200,23 @@ def _strip_duplicate_context_headings(text: str, metadata: dict) -> str:
 
     只剥**行首且整行等于**标题路径中的行，以及正文首行重复的条款编号；标题和正文
     写在同一行时只去掉重复的编号本身，不动后面的正文。
+
+    ``prefix`` 必须一并传入：病态超长文件名会让 ``_context_prefix`` 从尾部截断，
+    可能把章节/条款整段截掉。此时正文里的标题不能再剥，否则标题会从前缀和正文
+    两边一起消失。
     """
     if not text:
         return text
+    compact_prefix = re.sub(r"\s+", "", prefix or "")
     heading_lines = {
         _normalize_line(part)
         for part in str(metadata.get("section_path") or "").split(" > ")
         if _normalize_line(part)
+        and re.sub(r"\s+", "", _normalize_line(part)) in compact_prefix
     }
     article = re.sub(r"\s+", "", str(metadata.get("article_no") or ""))
+    if article and article not in compact_prefix:
+        article = ""
     lines = text.split("\n")
     index = 0
     while index < len(lines) and heading_lines and _normalize_line(lines[index]) in heading_lines:
@@ -1575,7 +1585,7 @@ def build_parent_child_chunks(
             prefix_tokens = count_chunk_tokens(prefix)
             # 正文开头已经含有的章节/条款标题不再重复进 child；前缀只补正文缺的部分。
             body_text = _strip_duplicate_context_headings(
-                str(base.get("text") or ""), metadata
+                str(base.get("text") or ""), metadata, prefix=prefix
             )
             full_text = (
                 f"{prefix}\n{body_text}" if prefix and body_text else (prefix or body_text)

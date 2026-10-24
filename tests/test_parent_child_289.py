@@ -358,6 +358,14 @@ def test_context_prefix_is_deterministic_and_budgeted():
     assert long_children
     assert max(count_chunk_tokens(child["text"]) for child in long_children) <= _hard_limit()
     assert all(child["text"].strip() for child in long_children)
+    # 前缀被文件名截断、章/条标签没进前缀时，正文里的标题必须保留，不能两边都丢。
+    long_child = next(
+        child for child in long_children if child["metadata"]["section_path"] == "第五条"
+    )
+    body_after_prefix = long_child["text"][
+        len(long_child["metadata"]["context_prefix"]):
+    ].lstrip("\n")
+    assert body_after_prefix.startswith("第五条")
 
 
 def test_base_chunk_near_target_with_prefix_stays_one_child():
