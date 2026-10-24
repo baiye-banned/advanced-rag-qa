@@ -55,6 +55,7 @@ from rag.memory_service import (
 from rag.vision_service import _build_effective_question
 from rag.milvus_client import embedding_backend_status, embedding_trace_status
 from rag.chains import stream_rag_answer
+from rag.llm import ANSWER_GENERATION_FAILED_MESSAGE
 from rag.retrieval import decide_need_rag, retrieve_knowledge
 
 
@@ -1180,7 +1181,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             await trace.add(
                                 "generation_failed",
                                 "_stream_deepseek_response",
-                                result={"message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败"},
+                                result={"message": event.get("message") or event.get("content") or ANSWER_GENERATION_FAILED_MESSAGE},
                                 note="模型生成阶段失败，系统会返回错误事件，并且不会保存失败 assistant 消息。",
                             )
                             for payload in _trace_sse_payloads(trace):
@@ -1188,7 +1189,7 @@ async def stream_chat(body: ChatRequest, authorization: str = Header("")):
                             data = json.dumps(
                                 {
                                     "type": "error",
-                                    "message": event.get("message") or event.get("content") or "DeepSeek 网络请求失败",
+                                    "message": event.get("message") or event.get("content") or ANSWER_GENERATION_FAILED_MESSAGE,
                                 },
                                 ensure_ascii=False,
                             )

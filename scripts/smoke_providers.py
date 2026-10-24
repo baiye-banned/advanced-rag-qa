@@ -280,10 +280,13 @@ def check_text_fallback(live: bool) -> str:
         finally:
             llm.ChatOpenAI = original
 
-    async def collect() -> list[str]:
-        return [chunk async for chunk in llm._stream_model_chunks(model, [("user", QUESTION)])]
+    async def collect() -> str:
+        parts = []
+        async for chunk in llm._stream_model_chunks(model, [("user", QUESTION)]):
+            parts.append(llm._chunk_text(chunk))
+        return "".join(parts)
 
-    text = "".join(asyncio.run(collect()))
+    text = asyncio.run(collect())
     if not text.strip():
         raise AssertionError("text fallback model produced no content")
     return f"model={config.TEXT_FALLBACK_MODEL} chars={len(text)}"

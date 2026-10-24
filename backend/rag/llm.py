@@ -4,6 +4,15 @@ import re
 from typing import Any
 
 from langchain_openai import ChatOpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    ContentFilterFinishReasonError,
+    PermissionDeniedError,
+    RateLimitError,
+)
 
 from config import (
     DEEPSEEK_API_KEY,
@@ -24,6 +33,93 @@ logger = logging.getLogger(__name__)
 LLM_GENERATION_FAILED_MESSAGE = "DeepSeek 生成失败"
 LLM_TEXT_FALLBACK_FAILED_MESSAGE = "文本后备模型生成失败"
 ANSWER_GENERATION_FAILED_MESSAGE = "回答生成失败，请稍后重试"
+
+# 生成失败按原因给固定前缀：缺 Key 不能再说成网络故障，网络故障也不能被当成配置问题。
+# 异常原文只进 logger，这些文案才进 SSE error 事件（前端原样显示）。
+DEEPSEEK_API_KEY_MISSING_MESSAGE = "DeepSeek API Key 未配置，请在 .env 中配置 DEEPSEEK_API_KEY"  # scan-secrets:allow 用户提示文案，不是凭据值
+DEEPSEEK_API_KEY_INVALID_MESSAGE = "DeepSeek API Key 无效或被拒绝，请检查 .env 中的 DEEPSEEK_API_KEY"  # scan-secrets:allow 用户提示文案，不是凭据值
+DEEPSEEK_TRANSPORT_FAILED_MESSAGE = "DeepSeek 网络/上游请求失败"
+DEEPSEEK_CONTENT_FILTERED_MESSAGE = "DeepSeek 模型拒绝生成该内容，请调整提问后重试"
+# 后备模型的拦截判定与 DeepSeek 无关，文案里不能出现 DeepSeek 字样，否则用户会误以为是主模型的问题。
+TEXT_FALLBACK_CONTENT_FILTERED_MESSAGE = "模型拒绝生成该内容，请调整提问后重试"
+TEXT_FALLBACK_DISABLED_HINT = "；文本后备模型未启用，请设置 TEXT_FALLBACK_ENABLED=true。"
+TEXT_FALLBACK_UNCONFIGURED_HINT = "；文本后备模型未配置，请配置 TEXT_FALLBACK_API_KEY 或 DASHSCOPE_API_KEY。"
+
+# DeepSeek 对内容风险既可能回 finish_reason=content_filter（流式），也可能直接回 400
+# 「Content Exists Risk」（非流式/网关层）。两种形态都归入同一用户文案，避免空流静默结束。
+_CONTENT_FILTER_MARKERS = ("content_filter", "content exists risk", "content risk")
+
+
+class LLMCredentialError(RuntimeError):
+    """本地缺少模型凭据；单独成型以便与网络/上游失败分流。
+
+    继承 RuntimeError，保持既有调用方与测试的异常契约不变。
+    """
+
+
+def _is_transport_error(exc: Exception) -> bool:
+    """网络断开、超时、限流与上游 5xx 归入传输类；本地缺 Key 与模型拒绝另行分流。
+
+    401（`AuthenticationError`）与 403（`PermissionDeniedError`）虽然也是 4xx，但语义是
+    凭据缺失/被拒绝，由 `_classify_deepseek_failure` 单独归入 invalid_credentials；其余
+    4xx（400/404/422）不是传输故障，留给 generation 兜底。
+    """
+    if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError)):
+        return True
+    return isinstance(exc, APIStatusError) and exc.status_code >= 500
+
+
+def _is_content_filter_error(exc: Exception) -> bool:
+    """识别模型侧内容过滤：SDK 的 content_filter 异常，或 DeepSeek 的 400 风险提示。"""
+    if isinstance(exc, ContentFilterFinishReasonError):
+        return True
+    if isinstance(exc, APIStatusError) and exc.status_code == 400:
+        text = str(exc).lower()
+        return any(marker in text for marker in _CONTENT_FILTER_MARKERS)
+    return False
+
+
+def _chunk_finish_reason(chunk: Any) -> str:
+    """从流式 chunk 里取 finish_reason；不同版本/供应商放在 response_metadata 或 additional_kwargs。"""
+    for attr in ("response_metadata", "additional_kwargs"):
+        metadata = getattr(chunk, attr, None)
+        if isinstance(metadata, dict):
+            reason = metadata.get("finish_reason")
+            if reason:
+                return str(reason)
+    return ""
+
+
+def _is_content_filter_chunk(chunk: Any) -> bool:
+    """流式 chunk 的终态是否由内容过滤触发。
+
+    这条检查是必要的：`ContentFilterFinishReasonError` 只在结构化输出（带 response_format）
+    的解析路径上抛；普通 `astream` 只会在最后一个 chunk 的元数据里带 finish_reason，
+    不在这里拦下就会变成「空流正常结束」。
+    """
+    return "content_filter" in _chunk_finish_reason(chunk).lower()
+
+
+def _chunk_text(chunk: Any) -> str:
+    """统一取出流式文本；测试替身可能直接 yield 字符串。"""
+    if isinstance(chunk, str):
+        return chunk
+    return _message_text(getattr(chunk, "content", ""))
+
+
+def _classify_deepseek_failure(exc: Exception) -> tuple[str, str]:
+    """把生成异常映射为 (日志分类, 用户固定文案前缀)；异常原文只交给 logger。"""
+    if isinstance(exc, LLMCredentialError):
+        return "missing_credentials", DEEPSEEK_API_KEY_MISSING_MESSAGE
+    # OpenAI SDK 把 401 映射为 AuthenticationError、403 映射为 PermissionDeniedError，
+    # 二者是兄弟类型（都继承 APIStatusError），必须一起识别，否则 403 会掉进 generation 兜底。
+    if isinstance(exc, (AuthenticationError, PermissionDeniedError)):
+        return "invalid_credentials", DEEPSEEK_API_KEY_INVALID_MESSAGE
+    if _is_content_filter_error(exc):
+        return "content_filtered", DEEPSEEK_CONTENT_FILTERED_MESSAGE
+    if _is_transport_error(exc):
+        return "transport", DEEPSEEK_TRANSPORT_FAILED_MESSAGE
+    return "generation", LLM_GENERATION_FAILED_MESSAGE
 
 
 def normalize_deepseek_model(model: str) -> str:
@@ -53,7 +149,7 @@ def openai_chat_url(base_url: str) -> str:
 
 def get_deepseek_model(*, streaming: bool = False, temperature: float = 0.1, max_tokens: int | None = None):
     if not DEEPSEEK_API_KEY:
-        raise RuntimeError("DeepSeek API Key 未配置")
+        raise LLMCredentialError("DeepSeek API Key 未配置")
     kwargs = {
         "api_key": DEEPSEEK_API_KEY,
         "base_url": openai_base_url(DEEPSEEK_BASE_URL),
@@ -70,7 +166,7 @@ def get_deepseek_model(*, streaming: bool = False, temperature: float = 0.1, max
 
 def get_text_fallback_model(*, streaming: bool = False, temperature: float = 0.1, max_tokens: int | None = None):
     if not TEXT_FALLBACK_API_KEY:
-        raise RuntimeError("文本后备模型 API Key 未配置")
+        raise LLMCredentialError("文本后备模型 API Key 未配置")
     kwargs = {
         "api_key": TEXT_FALLBACK_API_KEY,
         "base_url": openai_base_url(TEXT_FALLBACK_BASE_URL),
@@ -152,27 +248,61 @@ async def stream_answer_events(
 
     try:
         async for chunk in _stream_model_chunks(get_deepseek_model(streaming=True, temperature=0.1), messages):
-            yield chunk
+            # 内容过滤可能只体现在最后一个 chunk 的 finish_reason 上（普通 astream 不会抛
+            # ContentFilterFinishReasonError），必须在这里显式转为 error，否则空流会被当成
+            # 正常结束。过滤不是传输故障，不切换后备模型——换个模型继续生成会绕过内容策略。
+            if _is_content_filter_chunk(chunk):
+                logger.warning("DeepSeek stream generation stopped by content filter")
+                await _trace_add(
+                    trace,
+                    "langchain_generation_failed",
+                    "ChatOpenAI.astream",
+                    result={
+                        "provider": "DeepSeek",
+                        "failure_kind": "content_filtered",
+                        "error": DEEPSEEK_CONTENT_FILTERED_MESSAGE,
+                    },
+                    note="DeepSeek 流式生成被内容过滤终止；不切换后备模型，也不保存失败回答。",
+                )
+                yield {"type": "error", "message": DEEPSEEK_CONTENT_FILTERED_MESSAGE}
+                return
+            text = _chunk_text(chunk)
+            if text:
+                yield text
         return
     except Exception as exc:
-        logger.warning("DeepSeek stream generation failed: %s", exc, exc_info=True)
+        failure_kind, failure_prefix = _classify_deepseek_failure(exc)
+        logger.warning(
+            "DeepSeek stream generation failed (%s): %s",
+            failure_kind,
+            exc,
+            exc_info=True,
+        )
         await _trace_add(
             trace,
             "langchain_generation_failed",
             "ChatOpenAI.astream",
-            result={"provider": "DeepSeek", "error": LLM_GENERATION_FAILED_MESSAGE},
+            result={
+                "provider": "DeepSeek",
+                "failure_kind": failure_kind,
+                "error": failure_prefix,
+            },
             note="DeepSeek 流式生成失败；如果文本后备模型可用，LangChain 会切换到后备模型继续生成。",
         )
+        if failure_kind == "content_filtered":
+            # 内容过滤与网络/配置故障不同：后备模型不会改变上游的内容裁决。
+            yield {"type": "error", "message": DEEPSEEK_CONTENT_FILTERED_MESSAGE}
+            return
         if not TEXT_FALLBACK_ENABLED:
             yield {
                 "type": "error",
-                "message": "DeepSeek 网络请求失败，且文本后备模型未启用，请设置 TEXT_FALLBACK_ENABLED=true。",
+                "message": failure_prefix + TEXT_FALLBACK_DISABLED_HINT,
             }
             return
         if not TEXT_FALLBACK_API_KEY:
             yield {
                 "type": "error",
-                "message": "DeepSeek 网络请求失败，且文本后备模型未配置，请配置 TEXT_FALLBACK_API_KEY 或 DASHSCOPE_API_KEY。",
+                "message": failure_prefix + TEXT_FALLBACK_UNCONFIGURED_HINT,
             }
             return
 
@@ -202,7 +332,20 @@ async def stream_answer_events(
             note="LangChain 切换到 OpenAI 兼容文本后备模型继续本轮回答。",
         )
         async for chunk in _stream_model_chunks(get_text_fallback_model(streaming=True, temperature=0.1), messages):
-            yield chunk
+            if _is_content_filter_chunk(chunk):
+                logger.warning("text fallback stream generation stopped by content filter")
+                await _trace_add(
+                    trace,
+                    "langchain_text_fallback_failed",
+                    "ChatOpenAI.astream",
+                    result={"failure_kind": "content_filtered", "error": TEXT_FALLBACK_CONTENT_FILTERED_MESSAGE},
+                    note="文本后备模型同样被内容过滤终止，本轮回答返回错误事件。",
+                )
+                yield {"type": "error", "message": TEXT_FALLBACK_CONTENT_FILTERED_MESSAGE}
+                return
+            text = _chunk_text(chunk)
+            if text:
+                yield text
     except Exception as exc:
         await _trace_add(
             trace,
@@ -248,10 +391,9 @@ def build_answer_messages(question: str, context: str, memory_context: str, use_
 
 
 async def _stream_model_chunks(model: ChatOpenAI, messages: list[tuple[str, str]]):
+    """原样产出 provider 的流式 chunk，让调用方能读到 finish_reason 等元数据。"""
     async for chunk in model.astream(messages):
-        text = _message_text(chunk.content)
-        if text:
-            yield text
+        yield chunk
 
 
 def parse_json_object(content: str) -> dict:
