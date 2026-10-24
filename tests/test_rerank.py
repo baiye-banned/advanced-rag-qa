@@ -66,7 +66,7 @@ def test_rerank_falls_back_to_llm_when_qwen3_fails(monkeypatch):
     assert reranked[0]["id"] == "a"
     assert trace["provider"] == "deepseek_fallback"
     assert trace["fallback_from"] == "qwen3-rerank"
-    assert "qwen unavailable" in trace["fallback_reason"]
+    assert trace["fallback_reason"] == rerank.RERANK_FALLBACK_MESSAGE
 
 
 def test_rerank_returns_empty_when_qwen3_and_llm_fail(monkeypatch):

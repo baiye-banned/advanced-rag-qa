@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 from typing import Any
 
@@ -17,6 +18,15 @@ from config import (
 )
 from rag.llm import call_chat_json
 
+logger = logging.getLogger(__name__)
+
+# rerank trace 会随消息落库，并由消息接口反复回吐给客户端；上游 URL、异常类型、
+# key、配置路径与原始错误串一律只进服务端日志，trace 里只写这些固定文案（issue #263）。
+RERANK_FAILED_MESSAGE = "重排服务暂时不可用"
+RERANK_FALLBACK_MESSAGE = "主重排服务不可用，已切换备用重排"
+RERANK_ALL_FAILED_MESSAGE = "主重排与备用重排均不可用"
+RERANK_FALLBACK_FAILED_MESSAGE = "备用重排服务暂时不可用"
+
 
 async def rerank_chunks(question: str, chunks: list[dict]) -> tuple[list[dict], dict]:
     if not chunks:
@@ -25,21 +35,28 @@ async def rerank_chunks(question: str, chunks: list[dict]) -> tuple[list[dict], 
         return await _rerank_chunks_with_qwen3(question, chunks)
     except Exception as exc:
         if not RERANK_LLM_FALLBACK_ENABLED:
+            logger.warning("rerank failed [scope=rerank_primary]: %s", exc, exc_info=True)
             return [], {
                 "status": "failed",
                 "provider": RERANK_PROVIDER,
                 "model": RERANK_MODEL,
-                "error": str(exc),
+                "error": RERANK_FAILED_MESSAGE,
                 "items": [],
             }
         reranked, trace = await _rerank_chunks_with_llm(question, chunks)
         if trace.get("status") == "done":
+            logger.warning(
+                "rerank fallback succeeded [scope=rerank_fallback_success]: %s", exc, exc_info=True
+            )
             trace["provider"] = "deepseek_fallback"
             trace["fallback_from"] = RERANK_MODEL
-            trace["fallback_reason"] = str(exc)
+            trace["fallback_reason"] = RERANK_FALLBACK_MESSAGE
         else:
+            logger.warning(
+                "rerank fallback failed [scope=rerank_fallback_failed]: %s", exc, exc_info=True
+            )
             trace["fallback_from"] = RERANK_MODEL
-            trace["fallback_reason"] = str(exc)
+            trace["fallback_reason"] = RERANK_ALL_FAILED_MESSAGE
         return reranked, trace
 
 
@@ -173,7 +190,15 @@ async def _rerank_chunks_with_llm(question: str, chunks: list[dict]) -> tuple[li
         reranked.sort(key=lambda item: _to_float(item.get("rerank_score")), reverse=True)
         return reranked, {"status": "done", "provider": "deepseek", "items": trace_items}
     except Exception as exc:
-        return [], {"status": "failed", "provider": "deepseek", "error": str(exc), "items": []}
+        logger.warning(
+            "llm rerank failed [scope=rerank_llm_fallback]: %s", exc, exc_info=True
+        )
+        return [], {
+            "status": "failed",
+            "provider": "deepseek",
+            "error": RERANK_FALLBACK_FAILED_MESSAGE,
+            "items": [],
+        }
 
 
 def select_final_chunks(ranked_chunks: list[dict], keyword_chunks: list[dict]) -> list[dict]:
