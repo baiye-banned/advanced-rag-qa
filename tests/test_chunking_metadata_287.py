@@ -37,10 +37,12 @@ from crud.knowledge_file import (
     chunk_text,
     count_chunk_tokens,
     extract_docx_text,
+    get_knowledge_content,
     resolve_chunk_token_budget,
 )
 from database.session import Base
 from model.models import KnowledgeChunkMetadata, KnowledgeFile, User
+from rag import retrieval
 from service import knowledge_service
 
 
@@ -258,6 +260,58 @@ def test_docx_multi_table_keeps_document_order_and_per_table_metadata():
     assert all("\x00" not in chunk["text"] for chunk in chunks)
 
 
+def test_table_boundary_sentinel_never_leaks_from_content_or_bm25_windows(metadata_db):
+    """哨兵随抽取文本落库，但预览接口与 BM25 候选都必须先剥离（issue #287）。
+
+    两张相邻表格之间没有段落，``extract_docx_text`` 会插入 ``_TABLE_BOUNDARY``；
+    这段文本原样存进 ``KnowledgeFile.content``。如果读取边界不清理，
+    ``get_knowledge_content`` 会把它显示给用户，BM25 也会把
+    ``__RAG_TABLE_BOUNDARY__`` 当成一个高文档频率的伪词项并让 NUL 进入候选正文。
+    """
+    docx = pytest.importorskip("docx")
+    document = docx.Document()
+    document.add_paragraph("第一章 表单")
+    first = document.add_table(rows=2, cols=2)
+    for row_index, cells in enumerate([("姓名", "部门"), ("张三", "研发部")]):
+        for column_index, value in enumerate(cells):
+            first.rows[row_index].cells[column_index].text = value
+    # 相邻第二张表：中间没有段落，只有哨兵能把两张表分开。
+    second = document.add_table(rows=2, cols=2)
+    for row_index, cells in enumerate([("违规行为", "处罚"), ("迟到", "旷工半天")]):
+        for column_index, value in enumerate(cells):
+            second.rows[row_index].cells[column_index].text = value
+
+    buffer = BytesIO()
+    document.save(buffer)
+    extracted = extract_docx_text(buffer.getvalue())
+    assert "\x00__RAG_TABLE_BOUNDARY__\x00" in extracted
+
+    db = metadata_db.db
+    entry = crud_knowledge_file.create_knowledge_file(
+        db,
+        knowledge_base_id=5,
+        name="表单.docx",
+        size=len(extracted),
+        content=extracted,
+        user_id=7,
+    )
+
+    payload = get_knowledge_content(db, entry.id, 7)
+    assert "__RAG_TABLE_BOUNDARY__" not in payload["content"]
+    assert "\x00" not in payload["content"]
+
+    windows = list(retrieval._bm25_window_texts(extracted))
+    assert windows
+    assert all("__RAG_TABLE_BOUNDARY__" not in window for window in windows)
+    assert all("\x00" not in window for window in windows)
+
+    retrieval.clear_bm25_cache()
+    candidates = retrieval.keyword_recall(db, 5, ["姓名", "违规行为"], 10)
+    assert candidates
+    assert all("__RAG_TABLE_BOUNDARY__" not in chunk["content"] for chunk in candidates)
+    assert all("\x00" not in chunk["content"] for chunk in candidates)
+
+
 def test_token_hard_limit_is_enforced_with_multi_level_headings_and_long_clause():
     """标题前缀 + 正文必须一起算预算；超出硬上限的部分顺延到下一片。"""
     body = "员工应当遵守考勤请假和信息安全要求" * 300
@@ -284,6 +338,24 @@ def test_hard_split_never_rewrites_rare_characters_or_emoji():
     assert len(pieces) > 1
     assert "".join(pieces) == text
     assert "�" not in "".join(pieces)
+
+
+def test_hard_split_treats_source_replacement_characters_as_normal_text():
+    """源文本自带的 U+FFFD 是合法正文，不能当成「切点切坏了」而放弃硬切。
+
+    GBK 文本按 UTF-8 解码（``errors="replace"``）就会得到 U+FFFD。旧实现只要解码结果
+    里出现这个字符就判定切点非法，于是整段剩余文本被一次性塞进最后一片，硬上限失效。
+    """
+    text = ("考勤制度�迟到处理�" * 30)
+    max_tokens = 16
+
+    pieces = _hard_split_by_tokens(text, max_tokens)
+
+    assert len(pieces) > 1
+    assert "".join(pieces) == text
+    # 合法 U+FFFD 不能阻止切点落在字符边界上：每一片都应在硬预算内。
+    assert all(count_chunk_tokens(piece) <= max_tokens for piece in pieces)
+    assert "".join(pieces).count("�") == text.count("�")
 
 
 def test_character_path_overlap_still_allows_one_oversized_unit():

@@ -41,6 +41,21 @@ _EMPTY_CONTENT_HINT_EXTENSIONS = (".docx", ".pdf", ".txt", ".md")
 _TABLE_BOUNDARY = "\x00__RAG_TABLE_BOUNDARY__\x00"
 
 
+def strip_extraction_markers(text: str) -> str:
+    """剥离抽取阶段写入正文内部、只服务于切片的哨兵。
+
+    ``extract_docx_text`` 会把 ``_TABLE_BOUNDARY`` 插进存库的正文里，切片阶段据此分表；
+    它不是原文的一部分，因此任何把正文交给调用方的地方（预览、BM25 窗口）都必须先剥离。
+    哨兵已经包含 NUL，额外清理裸 NUL 是为了不把控制字符泄漏到 API 响应与索引词表。
+    """
+    if not text:
+        return ""
+    cleaned = text.replace(_TABLE_BOUNDARY, "")
+    if "\x00" in cleaned:
+        cleaned = cleaned.replace("\x00", "")
+    return cleaned
+
+
 def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
     return {
         "id": file_entry.id,
@@ -134,7 +149,7 @@ def get_knowledge_content(db: Session, fid: int, user_id: int) -> dict | None:
     entry = get_knowledge_file(db, fid, user_id)
     if not entry:
         return None
-    content = entry.content or ""
+    content = strip_extraction_markers(entry.content or "")
     if not content and (entry.name or "").lower().endswith(_EMPTY_CONTENT_HINT_EXTENSIONS):
         content = "该文件上传时未抽取内容，请重新上传以生成预览。"
     return {
@@ -362,12 +377,14 @@ def _decode_token_slice(encoding, token_ids: list[int]) -> str | None:
     tiktoken 的默认 ``decode`` 用 ``errors="replace"``：BPE token 是字节序列，切片
     可能刚好切断一个 UTF-8 字符，结果里就会多出 U+FFFD。硬切不能这样改写正文，所以
     这里用 strict 解码，让调用方把切点退回字符边界（issue #287）。
+
+    判据只能是解码异常：源文本本身可能合法地含有 U+FFFD（GBK 文本按 UTF-8 解码时
+    就会得到它），按结果里有没有 U+FFFD 来判断会把合法正文误判成坏切点。
     """
     try:
-        value = encoding.decode(token_ids, errors="strict")
+        return encoding.decode(token_ids, errors="strict")
     except UnicodeDecodeError:
         return None
-    return None if "�" in value else value
 
 
 def _hard_split_by_tokens(text: str, max_tokens: int) -> list[str]:
@@ -442,7 +459,13 @@ def _hard_split_by_bytes(text: str, max_bytes: int) -> list[str]:
 
 
 def _is_table_row(line: str) -> bool:
-    """DOCX 表格行在抽取文本里是 ``a | b | c``；整行作为一个原子单元，不拆单元格。"""
+    """DOCX 表格行在抽取文本里是 ``a | b | c``；整行作为一个原子单元，不拆单元格。
+
+    这是纯文本启发式，没有来源标记：上传的 txt/md 里若有一行恰好含 ``" | "`` 且被切成
+    两列以上，也会被当成表格行（原子化、不参与正文重叠、元数据带 table_id/row_no）。
+    这是 issue #287 引入的兼容性变化，而非 DOCX 专属收紧；需要区分来源时再在抽取阶段
+    带标记，而不是在这里猜。
+    """
     normalized = _normalize_line(line)
     if " | " not in normalized:
         return False

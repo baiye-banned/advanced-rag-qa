@@ -24,6 +24,7 @@ from config import (
     BM25_MAX_TERMS,
     RETRIEVAL_ROUTE_TOP_K,
 )
+from crud.knowledge_file import strip_extraction_markers
 from database.session import SessionLocal
 from model.models import KnowledgeFile
 from rag.bm25 import (
@@ -866,7 +867,12 @@ def _iter_knowledge_base_contents(
 
 
 def _bm25_window_texts(content: str) -> Iterator[str]:
-    """Same ``KEYWORD_CHUNK_SIZE``/overlap windows the keyword route retrieves."""
+    """Same ``KEYWORD_CHUNK_SIZE``/overlap windows the keyword route retrieves.
+
+    DOCX 正文里可能带着抽取阶段的表格边界哨兵；索引/打分都必须先把哨兵剥掉，否则
+    ``__RAG_TABLE_BOUNDARY__`` 会成为一个文档频率很高的伪词项，NUL 也会进入窗口正文。
+    """
+    content = strip_extraction_markers(content)
     for start in _keyword_chunk_starts(len(content)):
         text = content[start : start + KEYWORD_CHUNK_SIZE].strip()
         if text:
@@ -1191,6 +1197,8 @@ def _collect_file_keyword_candidates(
     预排序入堆，完整 BM25 只在扫描结束后对堆内窗口做一次（见 ``_keyword_recall_ranked``）。
     触顶时堆外窗口会被截断，最终 top-k 是近似排序。
     """
+    # 候选正文会原样返回给重排/回答链路；抽取哨兵只服务于入库切片，不能从这里泄漏。
+    content = strip_extraction_markers(content)
     if _needs_exact_window_scan(content):
         return _collect_file_keyword_candidates_exact(
             file_id, file_name, content, clean_keywords, budget, best, order, bm25

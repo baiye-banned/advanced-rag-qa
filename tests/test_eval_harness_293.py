@@ -573,3 +573,52 @@ def test_character_baseline_is_an_explicit_legacy_path():
     assert defaults["chunk_overlap"] is None
     assert eval_rag.CHARACTER_BASELINE["chunk_size"] == 1200
     assert eval_rag.CHARACTER_BASELINE["chunk_overlap"] == 150
+
+
+def test_current_token_baseline_matches_config_defaults():
+    """``CURRENT_TOKEN_BASELINE`` 必须与 config 的默认值一致，不能各写各的。
+
+    评估脚本刻意不 import backend（离线运行），所以这里用 AST 读取 config.py 的
+    ``DEFAULT_CHUNK_TOKEN_*`` 常量与 ``_env_int`` / ``_env_float`` 的字面量默认值；
+    任何一处漂移都会让报告里的「current-token」基线不再是生产默认口径。
+    """
+    tree = ast.parse((ROOT / "backend" / "config.py").read_text(encoding="utf-8"))
+
+    constants = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id.startswith("DEFAULT_CHUNK_TOKEN_")
+        ):
+            constants[node.targets[0].id] = ast.literal_eval(node.value)
+
+    assert constants == {
+        "DEFAULT_CHUNK_TOKEN_LIMIT": 500,
+        "DEFAULT_CHUNK_TOKEN_TARGET": 400,
+        "DEFAULT_CHUNK_TOKEN_OVERLAP": 50,
+    }
+
+    env_defaults = {}
+    for node in ast.walk(tree):
+        if not (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"_env_int", "_env_float"}
+            and len(node.args) >= 2
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[1], ast.Constant)
+        ):
+            continue
+        env_defaults[node.args[0].value] = node.args[1].value
+
+    assert env_defaults["CHUNK_TOKEN_LIMIT"] == constants["DEFAULT_CHUNK_TOKEN_LIMIT"]
+    assert env_defaults["CHUNK_TOKEN_TARGET"] == constants["DEFAULT_CHUNK_TOKEN_TARGET"]
+    assert env_defaults["CHUNK_TOKEN_OVERLAP"] == constants["DEFAULT_CHUNK_TOKEN_OVERLAP"]
+
+    baseline = eval_rag.CURRENT_TOKEN_BASELINE
+    assert baseline["token_limit"] == env_defaults["CHUNK_TOKEN_LIMIT"]
+    assert baseline["token_target"] == env_defaults["CHUNK_TOKEN_TARGET"]
+    assert baseline["token_overlap"] == env_defaults["CHUNK_TOKEN_OVERLAP"]
+    assert baseline["token_safety_ratio"] == env_defaults["CHUNK_TOKEN_SAFETY_RATIO"]

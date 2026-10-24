@@ -159,8 +159,11 @@ python scripts/eval_rag.py --dry-run \
   `CHUNK_TOKEN_SAFETY_RATIO`）。
 
 一阶段只在报告的 `baseline` 段记录这两套配置（`status=configuration_only`），不运行
-真实 embedding/检索，因此不给出召回分数。`tests/test_eval_harness_293.py` 会从生产
-函数的 AST 默认值反查字符基线数字，配置漂移时测试失败。二阶段再把 token 切片与
+真实 embedding/检索，因此不给出召回分数。`tests/test_eval_harness_293.py` 用 AST 钉住
+基线口径：`chunk_text` 的 `chunk_size` / `chunk_overlap` 默认值必须是 `None`（生产默认
+走 token 路径），`legacy-character` 的 1200/150 是显式的历史常量；同时读取
+`backend/config.py` 中 `DEFAULT_CHUNK_TOKEN_*` 与 `_env_int` / `_env_float` 的字面量
+默认值，逐项与 `current-token` 基线比对，任一处漂移都会失败。二阶段再把 token 切片与
 父子切片、BM25 一起跑同一问题集。
 
 ## 5. 报告结构
