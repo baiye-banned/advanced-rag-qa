@@ -24,6 +24,10 @@ export const chatAPI = {
   deleteConversation(id) {
     return request.delete(`/chat/conversations/${id}`)
   },
+  // 删除单条消息（issue #256）：用户消息截断其后，助手消息只删一条。
+  deleteMessage(id) {
+    return request.delete(`/chat/messages/${id}`)
+  },
   renameConversation(id, title) {
     return request.put(`/chat/conversations/${id}`, { title })
   },

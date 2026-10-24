@@ -188,6 +188,21 @@
               </div>
             </div>
 
+            <!-- 用户消息没有悬浮操作栏，删除入口放在气泡内正文下方，避免遮住内容。 -->
+            <div v-if="message.role === 'user'" class="mt-1 flex justify-end">
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 rounded px-1 py-0.5 text-xs text-white/70 transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                data-testid="delete-message"
+                data-message-role="user"
+                :disabled="!message.id || chatStore.streaming"
+                @click="onDeleteMessage(message)"
+              >
+                <el-icon><Delete /></el-icon>
+                删除
+              </button>
+            </div>
+
             <div
               v-if="message.role === 'assistant'"
               class="pointer-events-none absolute right-2 top-2 flex rounded-md border border-slate-200 bg-white/95 opacity-0 shadow-xs transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 focus-within:pointer-events-auto focus-within:opacity-100"
@@ -216,6 +231,16 @@
                   :class="message.feedback === -1 ? 'text-brand-600' : 'text-slate-400'"
                   :disabled="!message.id"
                   @click="onFeedback(message, -1)"
+                />
+              </el-tooltip>
+              <el-tooltip content="删除" placement="bottom">
+                <el-button
+                  link
+                  :icon="Delete"
+                  data-testid="delete-message"
+                  data-message-role="assistant"
+                  :disabled="!message.id || chatStore.streaming"
+                  @click="onDeleteMessage(message)"
                 />
               </el-tooltip>
             </div>
@@ -489,6 +514,7 @@ import {
   ChatDotSquare,
   CloseBold,
   CopyDocument,
+  Delete,
   Document,
   Download,
   Edit,
@@ -507,6 +533,7 @@ import { useKnowledgeStore } from '@/stores/knowledge'
 import { chatAPI } from '@/api/chat'
 import { CHAT_SUGGESTIONS } from '@/utils/chatSuggestions'
 import { copyText } from '@/utils/clipboard'
+import { confirmCenteredDelete } from '@/utils/confirm'
 import { getConversationExportErrorMessage, saveConversationMarkdown } from '@/utils/chatExport'
 import { ACCEPTED_IMAGE_INPUT, validateImageFile } from '@/utils/fileValidation'
 import {
@@ -777,6 +804,38 @@ function onFeedback(message, value) {
   const next = message.feedback === value ? 0 : value
   // 失败提示由 request.js 拦截器统一给出；这里必须接住 rejection（store 回滚后会重新抛出）。
   chatStore.setMessageFeedback(message.id, next).catch(() => {})
+}
+
+async function onDeleteMessage(message) {
+  if (!message.id || chatStore.streaming) return
+
+  const isQuestion = message.role === 'user'
+  try {
+    await confirmCenteredDelete(
+      isQuestion ? '删除该提问及其后的全部消息？' : '删除这条回答？',
+      '删除消息'
+    )
+  } catch {
+    // 取消确认：不调用删除接口。
+    return
+  }
+
+  // 确认框打开的这段时间里用户可能已经开始生成回答：store 此时直接返回 false、
+  // 不发删除请求。不能沿用「调用过就成功」的写法，否则消息还在却提示已删除。
+  const conversationId = chatStore.currentId
+  const wasLast = chatStore.messages[chatStore.messages.length - 1]?.id === message.id
+  try {
+    const deleted = await chatStore.deleteMessage(message.id)
+    if (!deleted) {
+      ElMessage.warning('正在生成回答，暂不能删除')
+      return
+    }
+    ElMessage.success(isQuestion ? '已删除该提问及其后的消息' : '已删除该回答')
+    // 请求期间切走时不要滚动另一个会话的窗口。
+    if (chatStore.currentId === conversationId && (isQuestion || wasLast)) scrollToBottom()
+  } catch {
+    // 失败提示由 request.js 拦截器统一给出，这里不再弹第二次。
+  }
 }
 
 async function regenerate(index) {

@@ -597,6 +597,50 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  // 删除单条消息（issue #256）：先请求后端，成功后才改本地视图。
+  // 失败时本地保持不变并原样抛出，提示由 request.js 拦截器统一给出。
+  async function deleteMessage(messageId) {
+    // 流式期间拒绝删除：正在生成的回答还没落库，此时删消息会让流式收尾把内容写回。
+    if (streaming.value || !messageId) return false
+
+    // 请求期间用户可能切换会话。记住发起时的会话：响应落地后只有「仍停在同一会话」
+    // 才能改 messages——否则旧会话的 index 会把新会话的尾部截掉。
+    const conversationId = currentId.value
+
+    await chatAPI.deleteMessage(messageId)
+
+    // 已经切走：服务端的删除照常生效，但当前窗口属于另一个会话，绝不碰它的
+    // messages / hasMoreMessages / 评估轮询。只刷新侧栏（与视图无关）。
+    if (currentId.value !== conversationId) {
+      await fetchConversations().catch(() => {})
+      return true
+    }
+
+    // 仍停在原会话：等待期间消息列表可能被流式收尾或刷新改过，按 id 重新定位。
+    // 复用 await 前的 index 会在列表缩短/重排后截错位置。
+    const index = messages.value.findIndex((message) => message.id === messageId)
+    if (index >= 0) {
+      const target = messages.value[index]
+      if (target.role === 'user') {
+        // 用户消息 = 截断：它和它之后的所有本地消息一起消失（与后端语义一致）。
+        messages.value = messages.value.slice(0, index)
+      } else {
+        messages.value = messages.value.filter((message) => message.id !== messageId)
+      }
+    }
+    if (!messages.value.length) {
+      // 会话被删空时保留当前会话（空态）：清 currentId 会让视图回到「新对话」。
+      hasMoreMessages.value = false
+    }
+    if (!messages.value.some((message) => isPendingRagasStatus(message.ragas_status))) {
+      stopEvaluationPolling()
+    }
+    // 后端已推进 updated_at，刷新最新一页让侧栏「最近活动」排序生效；
+    // 刷新失败不影响已经成功的删除。
+    await fetchConversations().catch(() => {})
+    return true
+  }
+
   // options.shouldWrite：可选的额外写入条件，用于「收尾刷新」这类需要按请求归属判定的调用方；
   // 默认只按会话归属判定（用户还在该会话就写入），保持既有调用行为不变。
   async function refreshMessages(id = currentId.value, options = {}) {
@@ -814,6 +858,7 @@ export const useChatStore = defineStore('chat', () => {
     stopGeneration,
     finishStreaming,
     deleteConversation,
+    deleteMessage,
     renameConversation,
     setMessageFeedback,
     clearMessages,

@@ -797,13 +797,19 @@ def test_no_http_route_can_delete_an_arbitrary_object_key(api):
 
     清扫只认「库里登记过、且超过保留窗口」的键，是服务端单方面发起的动作；多一个接受
     客户端指定键的删除接口，就是给任何登录用户开一个借服务端 AK 删桶对象的入口。
+
+    issue #256 的删消息接口同样不碰回收面：它以 message_id 为参数，object_key 由服务端
+    从消息附件里推导、只登记待回收行，客户端仍然无法指定要删哪个对象。
     """
     chat_routes = [route for route in chat_router.router.routes]
     delete_routes = [
         route for route in chat_routes
         if "DELETE" in getattr(route, "methods", set())
     ]
-    assert [route.path for route in delete_routes] == ["/api/chat/conversations/{cid}"]
+    assert [route.path for route in delete_routes] == [
+        "/api/chat/messages/{message_id}",
+        "/api/chat/conversations/{cid}",
+    ]
 
 
 # ---------------------------------------------------------------------------

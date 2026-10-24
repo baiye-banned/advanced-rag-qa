@@ -28,6 +28,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mountSfc } from './helpers/vueMount.js'
 import { calls, callsOf, resetRequestStub, respond } from './helpers/stubApiRequest.js'
+import { confirmations, resetConfirmStub, respondWith } from './helpers/stubConfirm.js'
 
 // vue-router 必须**动态** import，且排在 vueMount 之后 —— 它自己 import 'vue'，
 // 而 vue 的 runtime-dom 在模块求值时就抓走 document
@@ -39,6 +40,7 @@ const { createMemoryHistory, createRouter } = await import('vue-router')
 
 const MODULES = {
   'api/request.js': new URL('./helpers/stubApiRequest.js', import.meta.url).href,
+  'utils/confirm.js': new URL('./helpers/stubConfirm.js', import.meta.url).href,
 }
 
 const KB1 = { id: 'kb1', name: 'KB1' }
@@ -131,6 +133,7 @@ async function mountChat({
   responses = {},
 } = {}) {
   resetRequestStub()
+  resetConfirmStub()
   respond('get', (url) => {
     if (url === '/knowledge-bases') return bases
     if (url === '/chat/conversations') return [CONV1]
@@ -1129,6 +1132,212 @@ test('参考资料卡片：file_id 为 0/缺失/非数字时不可点击，也�
 
     assert.equal(router.currentRoute.value.fullPath, '/chat/c1', '无效 file_id 不应发生任何跳转')
     assert.equal(drawerHidden(sourceDrawer()), false, '点击无效卡片不应收起抽屉（它本来就没有行为）')
+  } finally {
+    await close(view)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// k. 删除单条消息（issue #256）：确认文案、按角色删除、流式与本地消息守卫
+//
+// 视图这一层负责三件事：入口的可见/可用性、先确认再发请求、把 store 的结果
+// 留在屏幕上。删除语义（用户消息截断、助手消息单删）由 store 用例与后端用例钉住，
+// 这里只验证点击真的走到 `DELETE /chat/messages/{id}`，且取消时一个请求都不发。
+// ---------------------------------------------------------------------------
+
+function deleteButtons(view, role) {
+  return view.queryAll(`[data-testid="delete-message"][data-message-role="${role}"]`)
+}
+
+test('删除按钮：用户与助手消息各有一个入口，落库后可点', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const buttons = view.queryAll('[data-testid="delete-message"]')
+    assert.equal(buttons.length, 2, 'PERSISTED 的两条消息各应有一个删除入口')
+    assert.equal(deleteButtons(view, 'user').length, 1, '用户消息应当有删除入口')
+    assert.equal(deleteButtons(view, 'assistant').length, 1, '助手消息应当有删除入口')
+    for (const button of buttons) {
+      assert.equal(button.disabled, false, '已落库的消息，删除入口应当可点')
+    }
+  } finally {
+    await close(view)
+  }
+})
+
+test('删除消息：取消确认不调用删除接口，消息原样保留', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const store = await viewStore(view)
+    respondWith('cancel')
+    const button = deleteButtons(view, 'assistant')[0]
+    button.click()
+    await settle(view)
+
+    // 承重：确认框文案按角色区分，且取消后没有任何 DELETE。
+    assert.deepEqual(confirmations, [{ message: '删除这条回答？', title: '删除消息' }])
+    assert.equal(callsOf('delete').length, 0, '取消确认不得发出删除请求')
+    assert.equal(store.messages.length, 2, '取消后本地消息应当原样保留')
+    assert.match(view.text(), /你好，世界/, '取消后助手气泡应当还在屏幕上')
+  } finally {
+    await close(view)
+  }
+})
+
+test('删除消息：确认后助手消息只删一条，并刷新会话列表', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const store = await viewStore(view)
+    const conversationRefreshes = () =>
+      callsOf('get').filter((entry) => entry.args[0] === '/chat/conversations').length
+    const refreshesBefore = conversationRefreshes()
+
+    deleteButtons(view, 'assistant')[0].click()
+    await settle(view)
+
+    assert.deepEqual(confirmations, [{ message: '删除这条回答？', title: '删除消息' }])
+    assert.deepEqual(callsOf('delete'), [
+      { method: 'delete', args: ['/chat/messages/2'] },
+    ], '助手消息应当只删目标这一条')
+    assert.deepEqual(store.messages.map((message) => message.id), [1], '本地只应剩下提问')
+    assert.doesNotMatch(view.text(), /你好，世界/, '被删的助手气泡应当从屏幕上消失')
+    assert.equal(deleteButtons(view, 'assistant').length, 0)
+    assert.equal(
+      conversationRefreshes(),
+      refreshesBefore + 1,
+      '删除成功后应当刷新会话列表，让 updated_at 排序生效'
+    )
+  } finally {
+    await close(view)
+  }
+})
+
+test('删除消息：确认后用户消息连同其后的消息一起截断，并保留当前会话', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const store = await viewStore(view)
+
+    deleteButtons(view, 'user')[0].click()
+    await settle(view)
+
+    // 文案必须说清「及其后的全部消息」，不能只说删这一条。
+    assert.deepEqual(confirmations, [{ message: '删除该提问及其后的全部消息？', title: '删除消息' }])
+    assert.deepEqual(callsOf('delete'), [
+      { method: 'delete', args: ['/chat/messages/1'] },
+    ])
+    assert.equal(store.messages.length, 0, '提问及其后的回答都应当从本地消失')
+    assert.equal(store.currentId, 'c1', '删空后应保留当前会话（空态），而不是切回新对话')
+    assert.equal(view.queryAll('[data-testid="delete-message"]').length, 0)
+  } finally {
+    await close(view)
+  }
+})
+
+test('删除消息：删除失败时消息留在屏幕上，且不弹成功提示', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const store = await viewStore(view)
+    respond('delete', () => {
+      throw new Error('删除失败')
+    })
+
+    deleteButtons(view, 'assistant')[0].click()
+    await settle(view)
+
+    // 请求发出一次、失败被视图接住（未处理 rejection 会让 node --test 直接失败）。
+    assert.equal(callsOf('delete').length, 1, '无论成败，删除请求都应当发出一次')
+    assert.deepEqual(store.messages.map((message) => message.id), [1, 2], '失败后本地消息不变')
+    assert.match(view.text(), /你好，世界/, '失败后气泡应当留在屏幕上')
+  } finally {
+    await close(view)
+  }
+})
+
+test('删除按钮：没有 id 的本地消息禁用，且点击不发请求', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const store = await viewStore(view)
+    store.addMessage({ role: 'assistant', content: '本地回答', isLocal: true })
+    await view.flush(2)
+
+    const localButton = deleteButtons(view, 'assistant').at(-1)
+    assert.ok(localButton, '本地助手消息也应当渲染出删除入口')
+    assert.equal(localButton.disabled, true, '没有 id 的消息不可删除')
+
+    // 绕过 disabled 的点击抑制，直接派发：视图自己的守卫也必须挡住。
+    localButton.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await view.flush(2)
+    assert.equal(confirmations.length, 0, '不可删除的消息不得弹出确认框')
+    assert.equal(callsOf('delete').length, 0, '不可删除的消息不得发出请求')
+  } finally {
+    await close(view)
+  }
+})
+
+test('删除消息：确认框打开后开始流式，不报成功并保留消息', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const store = await viewStore(view)
+    respondWith('confirm')
+
+    // 点击同步打开确认框（记录会立刻落下），await 的续体要等当前栈结束才跑。
+    deleteButtons(view, 'assistant')[0].click()
+    // 确认框还开着时用户开始了生成：store 的删除入口会直接返回 false、不发请求。
+    store.streaming = true
+    await settle(view)
+
+    assert.deepEqual(confirmations, [{ message: '删除这条回答？', title: '删除消息' }])
+    assert.equal(store.streaming, true)
+    assert.equal(callsOf('delete').length, 0, '流式期间不得发出删除请求')
+    assert.deepEqual(
+      store.messages.map((message) => message.id),
+      [1, 2],
+      '没有真正删除时消息必须留在本地'
+    )
+    assert.match(view.text(), /你好，世界/, '没有真正删除时气泡必须留在屏幕上')
+    assert.deepEqual(
+      view.messages.filter((message) => message.level === 'success'),
+      [],
+      'store 返回 false 时不得报「已删除」'
+    )
+    assert.deepEqual(
+      view.messages.filter((message) => message.level === 'warning').map((message) => message.message),
+      ['正在生成回答，暂不能删除'],
+      '应当明确提示此刻不能删除'
+    )
+  } finally {
+    await close(view)
+  }
+})
+
+test('删除按钮：流式生成期间全部禁用，点击也不发请求', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    // 让流式请求悬着不返回，把 streaming 固定在 true。
+    globalThis.fetch = () => new Promise(() => {})
+    globalThis.__streamCalls = []
+    await sendQuestion(view, '流式中的新问题')
+    await view.flush(3)
+    assert.equal((await viewStore(view)).streaming, true, '前置：此时应当在流式生成中')
+
+    const buttons = view.queryAll('[data-testid="delete-message"]')
+    assert.ok(buttons.length >= 2, '流式期间既有消息的入口仍应渲染')
+    for (const button of buttons) {
+      assert.equal(button.disabled, true, '流式期间删除入口应当禁用')
+    }
+
+    // disabled 只挡用户点击；视图里的 streaming 守卫还要挡住程序化派发。
+    deleteButtons(view, 'assistant')[0].dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await view.flush(2)
+    assert.equal(confirmations.length, 0, '流式期间不得弹出确认框')
+    assert.equal(callsOf('delete').length, 0, '流式期间不得发出删除请求')
   } finally {
     await close(view)
   }
