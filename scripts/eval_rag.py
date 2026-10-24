@@ -9,17 +9,29 @@ are sound, so phase 2 can plug real retrieval and generation runs into the same 
 
 Question-set format (JSON array, UTF-8). Every entry has these fields:
 
-    id               stable string, unique inside the file
-    question         question text
-    expected_answer  reference answer (for an unanswerable entry: the refusal criteria)
-    evidence         section/clause labels that prove the answer; [] only when answerable=false
-    category         single_fact | numeric_deadline | cross_section | table |
-                     negation_exception | unanswerable | exact_term | ...
-    answerable       boolean
+    id                stable string, unique inside the file
+    question          question text
+    expected_answer   reference answer (for an unanswerable entry: the refusal criteria)
+    evidence          human-readable section/clause labels; [] only when answerable=false
+    expected_doc      production ``file_name`` of the source file; one string for all
+                      evidence units or a list parallel to ``expected_sections``
+    expected_sections section heading/clause text that must appear in a chunk's
+                      ``content``; a list with one entry per evidence unit
+    category          single_fact | numeric_deadline | cross_section | table |
+                      negation_exception | unanswerable | exact_term | ...
+    answerable        boolean
 
-``exact_term`` entries also carry ``exact_terms`` (a non-empty list of literal terms);
-they are the 20 exact-term fixtures reserved for #288 (BM25). Any extra category name is
-accepted, but the six required categories are reported when missing.
+``expected_doc`` + ``expected_sections`` make evidence matching executable against the
+real retrieval shape (``file_name``/``chunk_id``/``content``). When they are absent the
+harness falls back to the legacy ``evidence`` label-in-content rule, but the bundled
+fixture always supplies them.
+
+``exact_term`` entries also carry ``exact_terms`` (a non-empty list of literal terms) and
+the question must contain at least one of those terms verbatim; they are the 20 exact-term
+fixtures reserved for #288 (BM25). Any extra category name is accepted, but the six
+required categories are reported when missing.
+
+An empty question array is a validation error (exit code 1), not an accepted no-op.
 
 Usage:
 
@@ -38,6 +50,7 @@ in ``METRIC_DEFINITIONS`` below. Exit codes: 0 = validation passed, 1 = validati
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import json
 import sys
@@ -59,9 +72,17 @@ REQUIRED_CATEGORIES = (
 )
 EXACT_TERM_CATEGORY = "exact_term"
 
+# Default difflib ratio used to flag near-duplicate question/answer pairs. The value is
+# configurable from the CLI (``--duplicate-threshold``) and from ``validate_questions``.
+DEFAULT_DUPLICATE_THRESHOLD = 0.9
+# An answer pair is only flagged when the questions are at least this similar; this keeps
+# short generic answers ("应明确拒答") from being reported across unrelated questions.
+ANSWER_PAIR_QUESTION_FLOOR = 0.5
+
 METRIC_KEYS = (
     "recall_at_5",
     "recall_at_20",
+    "mrr_at_5",
     "citation_hit",
     "answer_correctness",
     "refusal_correctness",
@@ -72,6 +93,7 @@ METRIC_KEYS = (
 METRIC_DEFINITIONS = {
     "recall_at_5": "检索前 5 条中包含的标准依据数 / 该题标准依据总数，可答题按题取平均。",
     "recall_at_20": "检索前 20 条中包含的标准依据数 / 该题标准依据总数，可答题按题取平均。",
+    "mrr_at_5": "首个相关 chunk 排在检索前 5 位时取 1/rank，否则取 0；可答题按题取平均。",
     "citation_hit": "答案引用的来源命中标准依据的可答题数 / 参与判定的可答题数。",
     "answer_correctness": "答案判定正确的可答题数 / 参与判定的可答题数。",
     "refusal_correctness": "正确拒答的不可答题数 / 参与判定的不可答题数。",
@@ -101,6 +123,148 @@ def _is_nonempty_str(value) -> bool:
 
 def _normalize_label(value) -> str:
     return " ".join(str(value or "").split()).casefold()
+
+
+def _normalize_doc_name(value) -> str:
+    """Normalize a production ``file_name`` for comparison (case/space/extension)."""
+    text = _normalize_label(value)
+    for suffix in (".markdown", ".md", ".txt", ".pdf", ".docx", ".doc"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    return text.strip()
+
+
+def _doc_matches(chunk_file_name, expected_doc) -> bool:
+    actual = _normalize_doc_name(chunk_file_name)
+    expected = _normalize_doc_name(expected_doc)
+    return bool(actual) and bool(expected) and actual == expected
+
+
+def _section_in_content(chunk_content, section) -> bool:
+    needle = _normalize_label(section)
+    return bool(needle) and needle in _normalize_label(chunk_content)
+
+
+def expected_evidence_units(question: dict) -> list:
+    """Return executable expected-evidence units for a question.
+
+    A unit is ``{"doc", "section", "label"}``. The structured ``expected_doc`` /
+    ``expected_sections`` fields are preferred; when absent (legacy external sets) each
+    ``evidence`` label becomes a unit with ``doc=None`` and ``section=None``.
+    """
+    sections = question.get("expected_sections")
+    docs = question.get("expected_doc")
+    labels = [label for label in question.get("evidence") or [] if _is_nonempty_str(label)]
+
+    if isinstance(sections, list) and sections and all(_is_nonempty_str(item) for item in sections):
+        if _is_nonempty_str(docs):
+            doc_list = [docs] * len(sections)
+        elif (
+            isinstance(docs, list)
+            and len(docs) == len(sections)
+            and all(_is_nonempty_str(item) for item in docs)
+        ):
+            doc_list = docs
+        else:
+            doc_list = [None] * len(sections)
+        return [
+            {
+                "doc": doc_list[index],
+                "section": section,
+                "label": labels[index] if index < len(labels) else section,
+            }
+            for index, section in enumerate(sections)
+        ]
+
+    return [{"doc": None, "section": None, "label": label} for label in labels]
+
+
+def _chunk_matches_evidence_unit(chunk: dict, unit: dict) -> bool:
+    """Match a production chunk against one structured evidence unit.
+
+    The primary rule is ``file_name`` equality (extension-insensitive) plus the section
+    heading/clause appearing in ``content``. Content-only chunks (no ``file_name``) and
+    legacy units (no doc/section) fall back to label/section text matching so callers
+    that only expose ``content`` still get an executable, if weaker, mapping.
+    """
+    content = chunk.get("content")
+    doc = unit.get("doc")
+    section = unit.get("section")
+    label = unit.get("label")
+
+    if doc:
+        file_name = chunk.get("file_name")
+        if _is_nonempty_str(file_name) and not _doc_matches(file_name, doc):
+            return False
+        # Content-only chunks (no file_name) fall back to the section heading or the full
+        # evidence label, which itself names the source document.
+        return _section_in_content(content, section) or (
+            _is_nonempty_str(label) and _normalize_label(label) in _normalize_label(content)
+        )
+
+    if section:
+        return _section_in_content(content, section)
+    return _chunk_matches_evidence(chunk, label)
+
+
+def _chunk_matches_evidence(chunk: dict, expected_label: str) -> bool:
+    normalized_expected = _normalize_label(expected_label)
+    if not normalized_expected:
+        return False
+    labels = chunk.get("evidence")
+    if isinstance(labels, str):
+        labels = [labels]
+    elif not isinstance(labels, list):
+        labels = []
+    if any(_normalize_label(label) == normalized_expected for label in labels or []):
+        return True
+    # Fallback for callers that only expose chunk text: the clause label appears in it.
+    return normalized_expected in _normalize_label(chunk.get("content"))
+
+
+def _find_near_duplicates(questions: list, threshold: float = DEFAULT_DUPLICATE_THRESHOLD) -> list:
+    """Return near-duplicate question/answer pairs using difflib ratios."""
+    candidates = [
+        (index, entry)
+        for index, entry in enumerate(questions)
+        if isinstance(entry, dict) and _is_nonempty_str(entry.get("id"))
+    ]
+    duplicates = []
+    for left in range(len(candidates)):
+        left_index, left_entry = candidates[left]
+        for right in range(left + 1, len(candidates)):
+            right_index, right_entry = candidates[right]
+            question_similarity = difflib.SequenceMatcher(
+                None,
+                _normalize_label(left_entry.get("question")),
+                _normalize_label(right_entry.get("question")),
+            ).ratio()
+            answer_similarity = difflib.SequenceMatcher(
+                None,
+                _normalize_label(left_entry.get("expected_answer")),
+                _normalize_label(right_entry.get("expected_answer")),
+            ).ratio()
+            kind = None
+            if question_similarity >= threshold:
+                kind = "question"
+            elif (
+                answer_similarity >= threshold
+                and question_similarity >= ANSWER_PAIR_QUESTION_FLOOR
+            ):
+                kind = "answer"
+            if kind is None:
+                continue
+            duplicates.append(
+                {
+                    "kind": kind,
+                    "ids": [left_entry.get("id"), right_entry.get("id")],
+                    "indexes": [left_index, right_index],
+                    "question_similarity": round(question_similarity, 6),
+                    "answer_similarity": round(answer_similarity, 6),
+                }
+            )
+    return duplicates
 
 
 def _display_question_set(path: Path) -> dict:
@@ -198,9 +362,108 @@ def _validate_exact_terms(entry: dict, entry_id, index: int, errors: list, missi
                 "reason": "数组元素必须是非空字符串",
             }
         )
+        return
+    question = entry.get("question")
+    if category == EXACT_TERM_CATEGORY and _is_nonempty_str(question):
+        normalized_question = _normalize_label(question)
+        if not any(
+            _normalize_label(term) in normalized_question
+            for term in exact_terms
+            if _is_nonempty_str(term)
+        ):
+            errors.append(
+                {
+                    "code": "exact_term_not_in_question",
+                    "index": index,
+                    "id": entry_id,
+                    "field": "exact_terms",
+                    "reason": "question 必须至少包含一个 exact_terms 字面词项",
+                    "terms": list(exact_terms),
+                }
+            )
 
 
-def validate_questions(questions: list) -> dict:
+def _validate_expected_evidence(entry: dict, entry_id, index: int, errors: list, warnings: list) -> None:
+    """Validate the optional structured evidence mapping."""
+    docs = entry.get("expected_doc")
+    sections = entry.get("expected_sections")
+    if docs is None and sections is None:
+        if entry.get("answerable") is True and entry.get("evidence"):
+            warnings.append(
+                {
+                    "code": "missing_evidence_mapping",
+                    "index": index,
+                    "id": entry_id,
+                    "reason": "建议提供 expected_doc + expected_sections，以便按 file_name 与章节匹配",
+                }
+            )
+        return
+    if docs is None or sections is None:
+        errors.append(
+            {
+                "code": "invalid_field",
+                "index": index,
+                "id": entry_id,
+                "field": "expected_doc" if docs is None else "expected_sections",
+                "reason": "expected_doc 与 expected_sections 必须同时提供",
+            }
+        )
+        return
+    if _is_nonempty_str(docs):
+        docs_valid = True
+    elif isinstance(docs, list):
+        docs_valid = bool(docs) and all(_is_nonempty_str(item) for item in docs)
+    else:
+        docs_valid = False
+    if not docs_valid:
+        errors.append(
+            {
+                "code": "invalid_field",
+                "index": index,
+                "id": entry_id,
+                "field": "expected_doc",
+                "reason": "必须是非空字符串或非空字符串数组",
+            }
+        )
+    if not isinstance(sections, list) or not sections or any(
+        not _is_nonempty_str(item) for item in sections
+    ):
+        errors.append(
+            {
+                "code": "invalid_field",
+                "index": index,
+                "id": entry_id,
+                "field": "expected_sections",
+                "reason": "必须是非空字符串数组",
+            }
+        )
+        return
+    if isinstance(docs, list) and len(docs) != len(sections):
+        errors.append(
+            {
+                "code": "invalid_field",
+                "index": index,
+                "id": entry_id,
+                "field": "expected_doc",
+                "reason": "expected_doc 数组长度必须与 expected_sections 一致",
+            }
+        )
+    evidence = entry.get("evidence")
+    if isinstance(evidence, list) and evidence and len(evidence) != len(sections):
+        warnings.append(
+            {
+                "code": "evidence_mapping_length_mismatch",
+                "index": index,
+                "id": entry_id,
+                "evidence_count": len(evidence),
+                "expected_sections_count": len(sections),
+            }
+        )
+
+
+def validate_questions(
+    questions: list, *, duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD
+) -> dict:
     """Validate the dataset and return a stable, report-ready summary."""
     errors = []
     warnings = []
@@ -210,6 +473,14 @@ def validate_questions(questions: list) -> dict:
     category_counts = {}
     answerable_count = 0
     unanswerable_count = 0
+
+    if not questions:
+        errors.append(
+            {
+                "code": "empty_question_set",
+                "reason": "问题集至少需要一条问题；空数组视为校验失败",
+            }
+        )
 
     for index, entry in enumerate(questions):
         if not isinstance(entry, dict):
@@ -259,6 +530,7 @@ def validate_questions(questions: list) -> dict:
             _validate_evidence(entry, entry_id, index, errors)
         if "exact_terms" in entry or entry.get("category") == EXACT_TERM_CATEGORY:
             _validate_exact_terms(entry, entry_id, index, errors, missing_fields)
+        _validate_expected_evidence(entry, entry_id, index, errors, warnings)
 
         category = entry.get("category")
         if _is_nonempty_str(category):
@@ -295,6 +567,17 @@ def validate_questions(questions: list) -> dict:
     for category in missing_required_categories:
         warnings.append({"code": "missing_required_category", "category": category})
 
+    near_duplicates = _find_near_duplicates(questions, duplicate_threshold)
+    for duplicate in near_duplicates:
+        warnings.append(
+            {
+                "code": f"near_duplicate_{duplicate['kind']}",
+                "ids": duplicate["ids"],
+                "question_similarity": duplicate["question_similarity"],
+                "answer_similarity": duplicate["answer_similarity"],
+            }
+        )
+
     return {
         "ok": not errors,
         "question_count": len(questions),
@@ -302,6 +585,8 @@ def validate_questions(questions: list) -> dict:
         "warnings": warnings,
         "missing_fields": missing_fields,
         "duplicate_ids": duplicates,
+        "near_duplicates": near_duplicates,
+        "duplicate_threshold": duplicate_threshold,
         "category_counts": dict(sorted(category_counts.items())),
         "missing_required_categories": missing_required_categories,
         "answerable": answerable_count,
@@ -314,66 +599,87 @@ def question_set_sha256(questions: list) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _chunk_matches_evidence(chunk: dict, expected_label: str) -> bool:
-    normalized_expected = _normalize_label(expected_label)
-    if not normalized_expected:
-        return False
-    labels = chunk.get("evidence")
-    if isinstance(labels, str):
-        labels = [labels]
-    elif not isinstance(labels, list):
-        labels = []
-    if any(_normalize_label(label) == normalized_expected for label in labels or []):
-        return True
-    # Fallback for callers that only expose chunk text: the clause label appears in it.
-    return normalized_expected in _normalize_label(chunk.get("content"))
+def compute_retrieval_metrics(
+    questions: list, retrieval_results: dict, k_values=(5, 20), mrr_k: int = 5
+) -> dict:
+    """Compute Recall@k, MRR@k and unmatched evidence from retrieval results.
 
-
-def compute_retrieval_metrics(questions: list, retrieval_results: dict, k_values=(5, 20)) -> dict:
-    """Compute Recall@k from per-question retrieval results.
-
-    ``retrieval_results`` maps a question id to an ordered list of chunks. A chunk is
-    relevant when its ``evidence`` metadata equals one of the question's labels, or when
-    the label appears in its ``content``. Only answerable questions with at least one
-    expected label and a supplied result row are evaluated.
+    ``retrieval_results`` maps a question id to an ordered list of production-shaped
+    chunks (``file_name``/``chunk_id``/``content``). Relevance is decided by
+    :func:`_chunk_matches_evidence_unit`: ``file_name`` plus section heading/text for
+    structured fixtures, with a content-only fallback. Only answerable questions with at
+    least one expected evidence unit and a supplied result row are evaluated.
     """
     answerable = [q for q in questions if isinstance(q, dict) and q.get("answerable") is True]
     per_question = {}
     recall_rows = {k: [] for k in k_values}
+    reciprocal_ranks = []
+    unmatched_total = 0
 
     for question in answerable:
         question_id = question.get("id")
         if not _is_nonempty_str(question_id) or question_id not in retrieval_results:
             continue
-        expected = [label for label in question.get("evidence") or [] if _is_nonempty_str(label)]
-        if not expected:
+        units = expected_evidence_units(question)
+        if not units:
             continue
 
         chunks = retrieval_results.get(question_id) or []
         if not isinstance(chunks, list):
             chunks = []
+        chunks = [chunk for chunk in chunks if isinstance(chunk, dict)]
 
-        row = {"expected_evidence": len(expected)}
+        row = {
+            "expected_evidence": len(units),
+            "evidence_units": [unit["label"] for unit in units],
+        }
         for k in k_values:
-            top_k = [chunk for chunk in chunks[:k] if isinstance(chunk, dict)]
+            top_k = chunks[:k]
             matched = sum(
                 1
-                for label in expected
-                if any(_chunk_matches_evidence(chunk, label) for chunk in top_k)
+                for unit in units
+                if any(_chunk_matches_evidence_unit(chunk, unit) for chunk in top_k)
             )
-            ratio = matched / len(expected)
+            ratio = matched / len(units)
             recall_rows[k].append(ratio)
             row[f"recall_at_{k}"] = round(ratio, 6)
+
+        first_relevant_rank = None
+        for rank, chunk in enumerate(chunks, start=1):
+            if any(_chunk_matches_evidence_unit(chunk, unit) for unit in units):
+                first_relevant_rank = rank
+                break
+        reciprocal_rank = (
+            1.0 / first_relevant_rank
+            if first_relevant_rank is not None and first_relevant_rank <= mrr_k
+            else 0.0
+        )
+        reciprocal_ranks.append(reciprocal_rank)
+        row["first_relevant_rank"] = first_relevant_rank
+        row[f"reciprocal_rank_at_{mrr_k}"] = round(reciprocal_rank, 6)
+
+        unmatched = [
+            unit["label"]
+            for unit in units
+            if not any(_chunk_matches_evidence_unit(chunk, unit) for chunk in chunks)
+        ]
+        row["unmatched_evidence"] = unmatched
+        unmatched_total += len(unmatched)
         per_question[question_id] = row
 
-    evaluated = len(recall_rows[k_values[0]]) if k_values else 0
     values = {
         f"recall_at_{k}": (round(sum(rows) / len(rows), 6) if rows else None)
         for k, rows in recall_rows.items()
     }
+    values["mrr_at_5"] = (
+        round(sum(reciprocal_ranks) / len(reciprocal_ranks), 6)
+        if reciprocal_ranks
+        else None
+    )
     return {
         "answerable_questions": len(answerable),
-        "evaluated_questions": evaluated,
+        "evaluated_questions": len(per_question),
+        "unmatched_evidence_count": unmatched_total,
         "values": values,
         "per_question": per_question,
     }
@@ -386,8 +692,9 @@ def build_report(
     mode: str = "dry-run",
     retrieval_results: dict | None = None,
     generated_at: str | None = None,
+    duplicate_threshold: float = DEFAULT_DUPLICATE_THRESHOLD,
 ) -> dict:
-    validation = validate_questions(questions)
+    validation = validate_questions(questions, duplicate_threshold=duplicate_threshold)
     values = {key: None for key in METRIC_KEYS}
     per_question = {}
     retrieval_summary = None
@@ -396,13 +703,15 @@ def build_report(
         computed = compute_retrieval_metrics(questions, retrieval_results)
         values["recall_at_5"] = computed["values"]["recall_at_5"]
         values["recall_at_20"] = computed["values"]["recall_at_20"]
+        values["mrr_at_5"] = computed["values"]["mrr_at_5"]
         per_question = computed["per_question"]
         retrieval_summary = {
             "answerable_questions": computed["answerable_questions"],
             "evaluated_questions": computed["evaluated_questions"],
+            "unmatched_evidence_count": computed["unmatched_evidence_count"],
         }
         metric_status = "partial_offline_retrieval"
-        metric_reason = "仅由调用方提供的离线检索结果计算 Recall@5/20；其余指标未运行。"
+        metric_reason = "仅由调用方提供的离线检索结果计算 Recall@5/20 与 MRR@5；其余指标未运行。"
     else:
         metric_status = "not_run"
         metric_reason = "dry-run 不调用 embedding/LLM，也不伪造检索、答案或拒答分数。"
@@ -491,14 +800,35 @@ def render_markdown(report: dict) -> str:
         lines.append("- 重复 ID：无")
     if validation["warnings"]:
         for warning in validation["warnings"]:
-            if warning["code"] == "missing_required_category":
+            code = warning["code"]
+            if code == "missing_required_category":
                 lines.append(f"- 警告：缺少必备分类 `{warning['category']}`")
-            else:
+            elif code == "answerable_category_mismatch":
                 lines.append(
                     "- 警告：`{}` 的 category={} 与 answerable={} 不一致".format(
                         warning.get("id"), warning.get("category"), warning.get("answerable")
                     )
                 )
+            elif code == "missing_evidence_mapping":
+                lines.append(
+                    f"- 警告：`{warning.get('id')}` 缺少 expected_doc/expected_sections，"
+                    "Recall 将回退到 evidence 标签文本匹配"
+                )
+            elif code == "evidence_mapping_length_mismatch":
+                lines.append(
+                    f"- 警告：`{warning.get('id')}` 的 evidence 数量 "
+                    f"({warning['evidence_count']}) 与 expected_sections 数量 "
+                    f"({warning['expected_sections_count']}) 不一致"
+                )
+            elif code in ("near_duplicate_question", "near_duplicate_answer"):
+                kind = "问题" if code == "near_duplicate_question" else "答案"
+                lines.append(
+                    f"- 警告：`{warning['ids'][0]}` 与 `{warning['ids'][1]}` 的{kind}近似重复"
+                    f"（问题相似度 {warning['question_similarity']:.3f}，"
+                    f"答案相似度 {warning['answer_similarity']:.3f}）"
+                )
+            else:
+                lines.append(f"- 警告：`{warning.get('id')}` {warning.get('reason', code)}")
     else:
         lines.append("- 警告：无")
     if validation["errors"]:
@@ -512,6 +842,13 @@ def render_markdown(report: dict) -> str:
                 lines.append(f"- 重复 ID：`{error['id']}`")
             elif error["code"] == "invalid_entry":
                 lines.append(f"- 第 {error['index']} 条：{error['reason']}")
+            elif error["code"] == "empty_question_set":
+                lines.append(f"- {error['reason']}")
+            elif error["code"] == "exact_term_not_in_question":
+                terms = "、".join(error.get("terms") or [])
+                lines.append(
+                    f"- `{error.get('id')}` 的问题未包含 exact_terms 字面词项：{terms}"
+                )
             else:
                 lines.append(
                     f"- `{error.get('id')}` 的 {error.get('field')}：{error.get('reason')}"
@@ -536,8 +873,11 @@ def render_markdown(report: dict) -> str:
     if metrics.get("retrieval") is not None:
         lines.append("")
         lines.append(
-            "- 参与离线 Recall 计算：可答题 {answerable_questions} 道，实际评估 "
+            "- 参与离线 Recall/MRR 计算：可答题 {answerable_questions} 道，实际评估 "
             "{evaluated_questions} 道".format(**metrics["retrieval"])
+        )
+        lines.append(
+            "- 未匹配标准依据：{unmatched_evidence_count} 条".format(**metrics["retrieval"])
         )
 
     baseline = report["baseline"]
@@ -583,10 +923,18 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--out", required=True, help="JSON 报告输出路径")
     parser.add_argument("--md-out", default=None, help="Markdown 报告路径（默认为 --out 同名 .md）")
+    parser.add_argument(
+        "--duplicate-threshold",
+        type=float,
+        default=DEFAULT_DUPLICATE_THRESHOLD,
+        help=f"difflib 近似重复阈值（0-1，默认 {DEFAULT_DUPLICATE_THRESHOLD}）",
+    )
     args = parser.parse_args(argv)
 
     if not args.dry_run:
         parser.error("一阶段只支持 --dry-run；真实 embedding/LLM 评测尚未接入")
+    if not 0.0 < args.duplicate_threshold <= 1.0:
+        parser.error("--duplicate-threshold 必须在 (0, 1] 范围内")
 
     questions_path = Path(args.questions)
     try:
@@ -595,7 +943,11 @@ def main(argv=None) -> int:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
 
-    report = build_report(questions, questions_path=questions_path)
+    report = build_report(
+        questions,
+        questions_path=questions_path,
+        duplicate_threshold=args.duplicate_threshold,
+    )
     out_path = Path(args.out)
     md_path = Path(args.md_out) if args.md_out else out_path.with_suffix(".md")
     try:
