@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import secrets
 from pathlib import Path
@@ -311,10 +312,49 @@ RETRIEVAL_RERANK_TOP_N = _env_int("RETRIEVAL_RERANK_TOP_N", 5)
 # window of the knowledge base, so it can be large: BM25_MAX_DOCS caps how many
 # windows may be indexed. Exceeding the cap degrades to the legacy ordering and is
 # recorded in the retrieval trace; it never quietly uses the candidate-set DF.
+
+
+def normalize_bm25_k1(value: float, default: float = 1.5) -> float:
+    """Keep ``BM25_K1`` finite and strictly positive.
+
+    ``nan``/``inf`` propagate into every score (and ``nan`` compares false against
+    everything, so ranking silently becomes insertion order); ``k1 <= 0`` removes
+    term-frequency saturation. Both are configuration mistakes, so warn and use the
+    documented default rather than rank with a degenerate parameter.
+    """
+    if not math.isfinite(value) or value <= 0:
+        _logger.warning("BM25_K1 value %r must be finite and > 0; using default %s", value, default)
+        return default
+    return value
+
+
+def normalize_bm25_b(value: float, default: float = 0.75) -> float:
+    """Keep ``BM25_B`` finite and inside ``[0, 1]``."""
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        _logger.warning("BM25_B value %r must be finite and in [0, 1]; using default %s", value, default)
+        return default
+    return value
+
+
+# When enabled, the keyword route is ordered by BM25 instead of the legacy hit-count
+# score; the legacy score is still returned in every candidate for final-selection
+# compatibility.
 BM25_ENABLED = _env_bool("BM25_ENABLED", True)
-BM25_K1 = _env_float("BM25_K1", 1.5)
-BM25_B = _env_float("BM25_B", 0.75)
+BM25_K1 = normalize_bm25_k1(_env_float("BM25_K1", 1.5))
+BM25_B = normalize_bm25_b(_env_float("BM25_B", 0.75))
+# Window cap. 0 means uncapped (kept for compatibility). At KEYWORD_CHUNK_SIZE=900
+# with KEYWORD_CHUNK_OVERLAP=180 the stride is 720, so 20,000 windows cover about
+# 14.4M distinct characters ((20000-1)*720 + 900) of a knowledge base.
 BM25_MAX_DOCS = _env_int("BM25_MAX_DOCS", 20000)
+# Distinct-term cap. Measured on CPython 3.10: the DF Counter costs ~126 bytes per
+# distinct term (2,000 windows / 450 random CJK chars each -> 877k terms -> 105MB).
+# 200,000 terms therefore bounds the vocabulary at roughly 25MB.
+BM25_MAX_TERMS = max(1, _env_int("BM25_MAX_TERMS", 200000))
+# Only this many LIKE-matched windows get a full BM25 score per query. Each full
+# score re-tokenises a ~900-character window; the rest are pre-ranked by a cheap
+# IDF-presence proxy. Once the budget is hit the remaining windows are truncated,
+# so top-k is approximate and the trace records scoring_budget_exceeded=True.
+BM25_MAX_SCORED_CANDIDATES = max(1, _env_int("BM25_MAX_SCORED_CANDIDATES", 512))
 
 # Conversation memory.
 MEMORY_WINDOW_TURNS = _env_int("MEMORY_WINDOW_TURNS", 4)

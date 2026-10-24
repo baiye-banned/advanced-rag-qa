@@ -14,6 +14,7 @@ from config import (
 )
 from database.session import init_db
 from rag.milvus_client import prewarm_token_encoding
+from rag.retrieval import schedule_bm25_prewarm
 from router.auth import router as auth_router
 from router.chat import router as chat_router
 from router.knowledge import router as knowledge_router
@@ -62,6 +63,9 @@ async def lifespan(_app: FastAPI):
         # 重建按文件数逐个跑，没有「一份文档」的预算语义，逐文件的失败隔离已由
         # rebuild_existing_knowledge_index 自己保证。
         await run_ingest_step(rebuild_existing_knowledge_index)
+    # BM25 语料预热（issue #288 返工轮 medium-1）：整库扫描放在后台守护线程上，启动不等它，
+    # 第一问也不必在请求路径里首次扫描。上传/删除路径也会按知识库单独排一次。
+    schedule_bm25_prewarm()
     # 回收「上传了但从未被发送」的聊天附件（issue #142）：上传即登记一条待确认行，发送成功
     # 时被消费，超过保留窗口还没被消费的由清扫删掉对应对象。挂后台守护线程而不是 await：
     # DELETE 是串行外呼，积压一批能把就绪时间拖成分钟级；清扫只碰超过保留窗口的登记行，

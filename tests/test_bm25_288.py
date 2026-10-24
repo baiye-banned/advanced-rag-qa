@@ -10,7 +10,12 @@ hand-tuned hit count. These tests pin the BM25 behaviour on top of that route:
   candidate set;
 * ``BM25_ENABLED=false`` and every BM25 failure path fall back to the legacy order
   without raising into the chat chain;
-* the 20-question precise-term fixture reports MRR@5 / Recall@5 for both rankings.
+* full BM25 scoring is bounded by ``BM25_MAX_SCORED_CANDIDATES``: thousands of LIKE
+  matches still trigger at most ``budget`` ``score_text`` calls, and the trace records
+  that the budget was exceeded instead of dropping candidates silently;
+* the vocabulary cap, stable cache keys, single-flight rebuilds and prewarm;
+* the 20-question precise-term fixture reports MRR@5 / Recall@5 for both rankings,
+  now over realistic paragraphs plus near-miss negatives.
 """
 
 from __future__ import annotations
@@ -18,6 +23,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -168,12 +175,13 @@ def test_df_comes_from_every_kb_window_not_the_like_candidates(tmp_path):
         + [(f"其他{index}.txt", "TS 部门公告。") for index in range(10)],
     )
 
-    index, cache_hit, reason, observed = retrieval._bm25_index_for(db, KB)
+    index, cache_hit, reason, observed, observed_terms = retrieval._bm25_index_for(db, KB)
 
     assert index is not None
     assert reason == ""
     assert cache_hit is False
     assert observed == 11
+    assert observed_terms == index.term_count
     assert index.doc_count == 11
     assert index.df["ts"] == 11
     assert index.df["ts-999"] == 1
@@ -202,12 +210,12 @@ def test_index_cache_is_reused_and_invalidated_by_kb_changes(tmp_path):
     _, db = _new_db(tmp_path, "cache.db")
     _add_files(db, [("考勤.txt", "迟到30分钟以内罚款50元。")])
 
-    first, cache_hit, _reason, observed = retrieval._bm25_index_for(db, KB)
+    first, cache_hit, _reason, observed, _terms = retrieval._bm25_index_for(db, KB)
     assert first is not None
     assert cache_hit is False
     assert observed == 1
 
-    second, cache_hit, _reason, observed = retrieval._bm25_index_for(db, KB)
+    second, cache_hit, _reason, observed, _terms = retrieval._bm25_index_for(db, KB)
     assert second is first
     assert cache_hit is True
     assert observed == 1
@@ -215,10 +223,226 @@ def test_index_cache_is_reused_and_invalidated_by_kb_changes(tmp_path):
     # Adding a file changes the ``(file_id, size)`` signature, so the next lookup
     # rebuilds from the new full corpus.
     _add_files(db, [("报销.txt", "报销流程：发票需要在30天内提交。")])
-    rebuilt, cache_hit, _reason, observed = retrieval._bm25_index_for(db, KB)
+    rebuilt, cache_hit, _reason, observed, _terms = retrieval._bm25_index_for(db, KB)
     assert rebuilt is not first
     assert cache_hit is False
     assert observed == 2
+
+
+def test_delete_and_same_size_replace_each_rebuild_the_corpus(tmp_path):
+    _, db = _new_db(tmp_path, "invalidate.db")
+    _add_files(db, [("考勤.txt", "迟到30分钟以内罚款50元。")])
+    first, *_ = retrieval._bm25_index_for(db, KB)
+    assert first.doc_count == 1
+
+    db.query(KnowledgeFile).delete()
+    db.commit()
+    emptied, cache_hit, reason, observed, terms = retrieval._bm25_index_for(db, KB)
+    assert emptied is not first
+    assert cache_hit is False and reason == ""
+    assert observed == 0 and terms == 0
+
+    # Same size, new id: add/delete/replace always changes the id set, which is
+    # exactly what the cache signature records.
+    _add_files(db, [("早退.txt", "早退30分钟以内罚款50元。")])
+    replaced, cache_hit, _reason, observed, _terms = retrieval._bm25_index_for(db, KB)
+    assert replaced is not first and replaced is not emptied
+    assert cache_hit is False and observed == 1
+    assert replaced.doc_count == 1
+
+
+def test_cache_key_covers_every_scoring_parameter_and_k1_change_rebuilds(tmp_path, monkeypatch):
+    _, db = _new_db(tmp_path, "cache-params.db")
+    _add_files(db, [("考勤.txt", "迟到30分钟以内罚款50元。")])
+
+    key = retrieval._bm25_cache_key("db", KB)
+    assert key[2:] == (
+        float(retrieval.BM25_K1),
+        float(retrieval.BM25_B),
+        int(retrieval.BM25_MAX_DOCS),
+        int(retrieval.BM25_MAX_TERMS),
+    )
+
+    first, cache_hit, *_ = retrieval._bm25_index_for(db, KB)
+    assert cache_hit is False
+    monkeypatch.setattr(retrieval, "BM25_K1", retrieval.BM25_K1 + 1.0)
+    second, cache_hit, *_ = retrieval._bm25_index_for(db, KB)
+    assert second is not first
+    assert cache_hit is False
+    assert second.k1 == pytest.approx(retrieval.BM25_K1)
+
+
+def test_single_flight_builds_a_cache_key_once_for_concurrent_first_queries(monkeypatch):
+    monkeypatch.setattr(retrieval, "_bm25_cache_scope", lambda _db: "single-flight-db")
+    monkeypatch.setattr(retrieval, "_bm25_signature", lambda _db, _kb: ())
+    builds = []
+
+    def slow_build(_db, _kb):
+        builds.append(threading.get_ident())
+        time.sleep(0.05)
+        return bm25.BM25Index(["迟到30分钟以内罚款50元。"]), "", 1, 1
+
+    monkeypatch.setattr(retrieval, "_build_bm25_index", slow_build)
+
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait()
+            index, cache_hit, *_ = retrieval._bm25_index_for(object(), KB)
+            assert index is not None
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert errors == []
+    assert len(builds) == 1
+
+
+def test_prewarm_populates_the_cache_so_the_first_query_is_a_hit(tmp_path, monkeypatch):
+    engine, db = _new_db(tmp_path, "prewarm.db")
+    _add_files(db, [("考勤.txt", "迟到30分钟以内罚款50元。")])
+    maker = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+    monkeypatch.setattr(retrieval, "SessionLocal", maker)
+
+    retrieval._prewarm_bm25(KB)
+
+    index, cache_hit, *_ = retrieval._bm25_index_for(db, KB)
+    assert index is not None
+    assert cache_hit is True
+
+
+# ---------------------------------------------------------------------------
+# Cost bounds
+# ---------------------------------------------------------------------------
+
+
+def _window_noise(blocks: int) -> str:
+    """~one keyword window per 720 chars, each containing 「制度」.
+
+    718 chars per block keeps tokenisation tiny (one CJK run + one ASCII run), so the
+    test is about the scoring budget, not about how fast the tokenizer is.
+    """
+    return ("制度" + "x" * 716) * blocks
+
+
+def test_full_bm25_scoring_is_bounded_by_the_candidate_budget(tmp_path, monkeypatch):
+    _, db = _new_db(tmp_path, "bounded.db")
+    _add_files(
+        db,
+        [
+            ("目标.txt", "精确凭据：TS-999。仅此一处。"),
+            ("大文件.txt", _window_noise(3000)),
+        ],
+    )
+    monkeypatch.setattr(retrieval, "BM25_MAX_SCORED_CANDIDATES", 32)
+    scored_windows = []
+    original = retrieval.BM25Index.score_text
+
+    def counting_score_text(self, text, terms):
+        scored_windows.append(text)
+        return original(self, text, terms)
+
+    monkeypatch.setattr(retrieval.BM25Index, "score_text", counting_score_text)
+
+    chunks, diagnostics = _recall_with_diagnostics(db, ["TS-999", "制度"], 5)
+
+    # Thousands of windows match; exactly the budget is fully scored. This is a
+    # count assertion, not a wall-clock threshold, so it cannot go flaky on CI.
+    assert diagnostics["candidates"] >= 2000
+    assert diagnostics["candidate_budget"] == 32
+    assert diagnostics["scored_candidates"] == 32
+    assert diagnostics["scoring_budget_exceeded"] is True
+    assert len(scored_windows) == 32
+    # The rare exact term still wins: the cheap proxy is IDF-weighted, so a wall of
+    # high-frequency 制度 does not crowd it out of the scoring budget. This is the
+    # intended behaviour of the proxy, not a guarantee for every corpus.
+    assert chunks[0]["bm25_rank"] == 1
+    assert "TS-999" in chunks[0]["content"]
+
+
+def test_bm25_disabled_never_builds_an_index(tmp_path, monkeypatch):
+    _, db = _new_db(tmp_path, "disabled.db")
+    _add_files(db, [("考勤.txt", "迟到30分钟以内罚款50元。")])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("BM25 index must not be built while BM25_ENABLED is false")
+
+    monkeypatch.setattr(retrieval, "BM25_ENABLED", False)
+    monkeypatch.setattr(retrieval, "_bm25_index_for", forbidden)
+
+    chunks, diagnostics = _recall_with_diagnostics(db, ["迟到"], 5)
+
+    assert chunks
+    assert diagnostics["status"] == "disabled"
+    assert all("bm25_score" not in chunk for chunk in chunks)
+
+
+def test_no_matching_candidates_skip_the_index_build(tmp_path, monkeypatch):
+    _, db = _new_db(tmp_path, "no-candidates.db")
+    _add_files(db, [("无关.txt", "制度员工制度员工。")])
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("no LIKE candidate => the full-corpus index is not needed")
+
+    monkeypatch.setattr(retrieval, "_bm25_index_for", forbidden)
+
+    chunks, diagnostics = _recall_with_diagnostics(db, ["TS-999"], 5)
+
+    assert chunks == []
+    assert diagnostics["status"] == "skipped"
+    assert diagnostics["reason"] == "no_candidates"
+    assert diagnostics["candidates"] == 0
+
+
+def test_vocabulary_cap_degrades_with_trace_and_operator_warning(tmp_path, monkeypatch, caplog):
+    _, db = _new_db(tmp_path, "vocabulary.db")
+    # 200 distinct CJK characters plus the query term: unigrams and bigrams blow past
+    # the lowered cap immediately.
+    content = "制度" + "".join(chr(0x4E00 + index) for index in range(200))
+    _add_files(db, [("大词表.txt", content)])
+    monkeypatch.setattr(retrieval, "BM25_MAX_TERMS", 40)
+
+    with caplog.at_level(logging.WARNING, logger="rag.retrieval"):
+        chunks, diagnostics = _recall_with_diagnostics(db, ["制度"], 5)
+
+    assert chunks
+    assert diagnostics["status"] == "degraded"
+    assert diagnostics["degraded"] is True
+    assert diagnostics["reason"] == "vocabulary_too_large"
+    assert diagnostics["corpus_terms"] > 40
+    assert all("bm25_score" not in chunk for chunk in chunks)
+    assert any("BM25 corpus degraded" in record.message for record in caplog.records)
+
+
+def test_bm25_index_raises_when_the_vocabulary_cap_is_exceeded():
+    with pytest.raises(bm25.BM25VocabularyTooLarge):
+        bm25.BM25Index(
+            ["晚" + "".join(chr(0x4E00 + index) for index in range(100))],
+            max_terms=10,
+        )
+
+
+def test_fullwidth_digits_tokenise_like_ascii():
+    assert bm25.tokenize("ＴＳ－９９９") == bm25.tokenize("TS-999")
+
+
+def test_bm25_parameters_are_validated():
+    from config import normalize_bm25_b, normalize_bm25_k1
+
+    assert normalize_bm25_k1(float("nan")) == pytest.approx(1.5)
+    assert normalize_bm25_k1(float("inf")) == pytest.approx(1.5)
+    assert normalize_bm25_k1(0) == pytest.approx(1.5)
+    assert normalize_bm25_k1(2.0) == pytest.approx(2.0)
+    assert normalize_bm25_b(float("nan")) == pytest.approx(0.75)
+    assert normalize_bm25_b(1.5) == pytest.approx(0.75)
+    assert normalize_bm25_b(0.5) == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +608,17 @@ def _load_fixture():
 
 
 def _fixture_corpus(cases):
-    rows = [
-        (f"目标-{case['id']}.txt", f"精确凭据：{case['exact_terms'][0]}。仅此一处。")
-        for case in cases
-    ]
+    """Real paragraphs for the targets plus a near-miss paragraph per case.
+
+    The near misses share the surrounding wording (「第 … 条」, 「… 元」, the same
+    error-code prefix) but differ in the exact number/code, so a ranker that only
+    counts generic words cannot tell them apart from the target. The generic-noise
+    files remain: they are what the legacy hit-count score prefers.
+    """
+    rows = []
+    for case in cases:
+        rows.append((f"目标-{case['id']}.txt", case["document"]))
+        rows.append((f"近似-{case['id']}.txt", case["near_miss"]))
     rows.extend(
         (f"噪声{index}.txt", "制度" * 40 + "员工" * 40) for index in range(8)
     )

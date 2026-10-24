@@ -17,6 +17,10 @@ tokenises documents and accumulates corpus statistics.
 
 Tokenisation rules (kept dependency-free on purpose):
 
+* text is NFKC-normalised first, so full-width digits and ``ＴＳ－９９９`` fold to the
+  same tokens as their ASCII spellings (this is token-level only: the keyword route's
+  substring matching and SQL pre-filter deliberately keep their original characters,
+  because a normalised pattern would not find the un-normalised text in the database);
 * whitespace is ignored and text is lower-cased first;
 * consecutive Chinese characters become every unigram and every adjacent bigram of
   the run, so two-character words work without a dictionary;
@@ -31,6 +35,7 @@ from __future__ import annotations
 
 import math
 import re
+import unicodedata
 from collections import Counter
 from typing import Iterable, Mapping
 
@@ -49,6 +54,7 @@ _WHITESPACE_RE = re.compile(r"\s+")
 __all__ = [
     "BM25CorpusTooLarge",
     "BM25Index",
+    "BM25VocabularyTooLarge",
     "DEFAULT_B",
     "DEFAULT_K1",
     "query_terms",
@@ -69,9 +75,27 @@ class BM25CorpusTooLarge(ValueError):
         self.max_docs = max_docs
 
 
+class BM25VocabularyTooLarge(ValueError):
+    """Raised when the distinct-term dictionary exceeds ``max_terms``.
+
+    The window cap alone does not bound memory: a corpus of 20,000 windows can still
+    contain millions of distinct bigrams. Measured on CPython 3.10, the ``Counter``
+    costs about 126 bytes per distinct term (2,000 windows of 450 random CJK chars,
+    877k terms, 105MB traced); ``BM25_MAX_TERMS`` is the cap that turns that into a
+    bounded number instead of a function of the input.
+    """
+
+    def __init__(self, term_count: int, max_terms: int):
+        super().__init__(
+            f"BM25 vocabulary exceeds {max_terms} distinct terms (saw at least {term_count})"
+        )
+        self.term_count = term_count
+        self.max_terms = max_terms
+
+
 def tokenize(text) -> list[str]:
     """Return BM25 tokens for ``text`` (see the module docstring for the rules)."""
-    value = "" if text is None else str(text).lower()
+    value = unicodedata.normalize("NFKC", "" if text is None else str(text)).lower()
     tokens: list[str] = []
 
     for match in _ASCII_WORD_RE.finditer(value):
@@ -110,10 +134,17 @@ class BM25Index:
         k1: float = DEFAULT_K1,
         b: float = DEFAULT_B,
         max_docs: int = 0,
+        max_terms: int = 0,
     ):
-        self.k1 = max(0.0, float(k1))
-        self.b = min(1.0, max(0.0, float(b)))
+        # NaN/inf would poison every score (``nan < anything`` is false), and k1 <= 0
+        # removes term-frequency saturation entirely. Fall back to the documented
+        # defaults instead of ranking on a degenerate parameter.
+        k1_value = float(k1)
+        self.k1 = k1_value if math.isfinite(k1_value) and k1_value > 0 else DEFAULT_K1
+        b_value = float(b)
+        self.b = min(1.0, max(0.0, b_value)) if math.isfinite(b_value) else DEFAULT_B
         self.max_docs = max(0, int(max_docs or 0))
+        self.max_terms = max(0, int(max_terms or 0))
         self._df: Counter[str] = Counter()
         self._doc_count = 0
         self._total_length = 0
@@ -123,6 +154,8 @@ class BM25Index:
                 raise BM25CorpusTooLarge(self._doc_count + 1, self.max_docs)
             counts = Counter(tokenize(text))
             self._df.update(counts)
+            if self.max_terms and len(self._df) > self.max_terms:
+                raise BM25VocabularyTooLarge(len(self._df), self.max_terms)
             self._doc_count += 1
             self._total_length += sum(counts.values())
 
@@ -135,6 +168,11 @@ class BM25Index:
     @property
     def avgdl(self) -> float:
         return self._avgdl
+
+    @property
+    def term_count(self) -> int:
+        """Distinct terms retained; this is what ``BM25_MAX_TERMS`` caps."""
+        return len(self._df)
 
     @property
     def df(self) -> Mapping[str, int]:
