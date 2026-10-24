@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -12,6 +13,7 @@ from config import (
     ensure_secret_key_configured,
 )
 from database.session import init_db
+from rag.milvus_client import prewarm_token_encoding
 from router.auth import router as auth_router
 from router.chat import router as chat_router
 from router.knowledge import router as knowledge_router
@@ -26,11 +28,32 @@ logger = logging.getLogger(__name__)
 
 INTEGRITY_CONFLICT_MESSAGE = "数据冲突：本次操作与当前数据状态不一致，请重试。"
 
+# 分词表预热最多等这么久：离线环境里 tiktoken 的下载连接可能长时间挂起，
+# 预热本身是锦上添花，不能把服务就绪时间绑在它的网络超时上。
+PREWARM_TIMEOUT_SECONDS = 10.0
+
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ensure_secret_key_configured()
     ensure_mysql_password_configured()
+    # 分词表预热是非致命的：tiktoken 首次使用会下载 cl100k_base 的 BPE 文件，干净或
+    # 受限网络部署会在用户第一次上传时才暴露失败。这里提前检查并把实际缓存目录写进
+    # 日志；失败只记 WARNING，不阻止启动（见 rag.milvus_client.prewarm_token_encoding）。
+    # 放线程里执行：离线环境下载失败前的连接等待不应卡住启动时的其它协程。
+    # 再加一道显式超时：线程里的阻塞不会因为 wait_for 取消而结束，但启动流程不必
+    # 等它——超时只记 WARNING，后续初始化照常进行，首次上传时再暴露/重试即可。
+    try:
+        await asyncio.wait_for(
+            asyncio.to_thread(prewarm_token_encoding),
+            timeout=PREWARM_TIMEOUT_SECONDS,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        logger.warning(
+            "Embedding tokenizer prewarm timed out after %.0fs; continuing startup. "
+            "The first ingest may block on tokenizer initialization.",
+            PREWARM_TIMEOUT_SECONDS,
+        )
     init_db()
     seed_default_users()
     if REBUILD_KNOWLEDGE_INDEX_ON_STARTUP:

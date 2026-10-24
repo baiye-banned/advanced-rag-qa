@@ -49,14 +49,17 @@ def _read_names_with_defaults():
 
 
 def _parse_env_example():
-    """Map documented key -> raw value, ignoring blank lines and comments."""
+    """Map documented key -> raw value, ignoring blank lines, comments and inline comments."""
     documented = {}
     for line in ENV_EXAMPLE.read_text(encoding="utf-8").splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
         key, _, value = stripped.partition("=")
-        documented[key.strip()] = value.strip()
+        # `KEY=value  # comment` is standard .env syntax; the comment is not part of
+        # the value (issue #286 uses an inline scan-secrets:allow marker here).
+        value = value.split(" #", 1)[0].strip()
+        documented[key.strip()] = value
     return documented
 
 

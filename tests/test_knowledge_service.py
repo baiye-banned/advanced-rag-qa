@@ -100,6 +100,61 @@ def test_upload_knowledge_embedding_failure_returns_500_with_reason_and_cleans_u
     assert calls == [("vectors", 11), ("mysql", 11)]
 
 
+def test_upload_shares_one_ingest_deadline_with_the_embedding_step(monkeypatch):
+    """解析/切片/向量化必须使用同一个整篇文档截止时刻。
+
+    `add_chunks` 的 deadline 是显式经 partial 传进线程池的；线程池不复制调用方的
+    预算上下文。把这个参数删掉后，这里的 kwargs 会读到 None，用例随即失败。
+    """
+    step_deadlines = []
+    captured = {}
+    original_run_ingest_step = knowledge_service.run_ingest_step
+
+    async def recording_run_ingest_step(step, /, *args, deadline=None):
+        step_deadlines.append(deadline)
+        return await original_run_ingest_step(step, *args, deadline=deadline)
+
+    def fake_add_chunks(chunks, file_id, file_name, knowledge_base_id, **kwargs):
+        captured["deadline"] = kwargs.get("deadline")
+
+    monkeypatch.setattr(knowledge_service, "KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS", 300)
+    monkeypatch.setattr(knowledge_service, "run_ingest_step", recording_run_ingest_step)
+    monkeypatch.setattr(
+        knowledge_service,
+        "resolve_knowledge_base",
+        lambda db, kid, user_id: type("Base", (), {"id": 2})(),
+    )
+    monkeypatch.setattr(knowledge_service.crud_knowledge_file, "extract_file_text", lambda name, content: "第一段")
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "create_knowledge_file",
+        lambda db, **kwargs: type("Entry", (), {"id": 11, "name": "考勤制度.txt"})(),
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "chunk_text",
+        lambda text, file_id: [{"id": "0", "text": text}],
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "serialize_knowledge_file",
+        lambda entry: {"id": entry.id},
+    )
+    monkeypatch.setattr(knowledge_service, "add_chunks", fake_add_chunks)
+
+    started_at = time.monotonic()
+    result = _upload()
+    finished_at = time.monotonic()
+
+    assert result == {"id": 11}
+    # 解析、切片、向量化三步各一次。
+    assert len(step_deadlines) == 3
+    assert captured["deadline"] is not None
+    assert captured["deadline"] == step_deadlines[0] == step_deadlines[1] == step_deadlines[2]
+    # 截止时刻 = 入库起点 + 总预算；上传读取文件也在 started_at 之后，所以区间成立。
+    assert started_at + 300 <= captured["deadline"] <= finished_at + 300
+
+
 def test_upload_knowledge_other_index_failure_keeps_generic_500(monkeypatch):
     calls = []
     _patch_upload(monkeypatch, calls, RuntimeError("milvus unavailable"))
@@ -183,7 +238,7 @@ def test_rebuild_existing_knowledge_index_continues_after_single_file_failure(mo
         def close(self):
             closed.append(True)
 
-    def fake_add_chunks(chunks, file_id, file_name, knowledge_base_id):
+    def fake_add_chunks(chunks, file_id, file_name, knowledge_base_id, **_kwargs):
         calls.append(file_id)
         if file_id == 1:
             raise milvus_client.EmbeddingBackendError("向量化接口调用失败：429 Too Many Requests")
@@ -317,7 +372,7 @@ def test_upload_knowledge_indexes_off_the_event_loop_thread_and_keeps_heartbeats
     )()
     monkeypatch.setattr(knowledge_service.crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: entry)
 
-    def slow_add_chunks(chunks, file_id, file_name, knowledge_base_id):
+    def slow_add_chunks(chunks, file_id, file_name, knowledge_base_id, **_kwargs):
         calls.append({"thread": threading.get_ident(), "chunk_count": len(chunks), "file_id": file_id})
         time.sleep(delay)
 
@@ -534,7 +589,7 @@ def test_upload_knowledge_times_out_when_ingest_exceeds_the_document_budget(monk
     monkeypatch.setattr(crud_knowledge_file, "create_knowledge_file", lambda db, **kwargs: entry)
     monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _CleanupSession(calls))
 
-    def stuck_add_chunks(chunks, file_id, *_args):
+    def stuck_add_chunks(chunks, file_id, *_args, **_kwargs):
         calls.append(("indexing-start", file_id))
         release.wait(10)
         # 模拟「请求已放弃、写入线程仍把这一批写进向量库」。
@@ -618,6 +673,46 @@ def test_startup_rebuild_runs_off_the_event_loop(monkeypatch):
     assert calls
     assert elapsed >= delay
     assert calls[0] != threading.get_ident()
+
+
+def test_startup_prewarm_timeout_logs_warning_and_keeps_booting(monkeypatch, caplog):
+    """预热线程卡在下载上时，启动流程只等 PREWARM_TIMEOUT_SECONDS 就继续。"""
+    import main
+
+    calls = []
+    release = threading.Event()
+
+    # 配置门禁与后续初始化都打桩：本用例只测预热超时，不连数据库。
+    monkeypatch.setattr(main, "ensure_secret_key_configured", lambda: None)
+    monkeypatch.setattr(main, "ensure_mysql_password_configured", lambda: None)
+    monkeypatch.setattr(main, "init_db", lambda: calls.append("init_db"))
+    monkeypatch.setattr(main, "seed_default_users", lambda: calls.append("seed"))
+    monkeypatch.setattr(main, "REBUILD_KNOWLEDGE_INDEX_ON_STARTUP", False)
+    monkeypatch.setattr(main, "schedule_orphan_attachment_sweep", lambda: calls.append("sweep"))
+    monkeypatch.setattr(main, "PREWARM_TIMEOUT_SECONDS", 0.05)
+
+    def blocking_prewarm():
+        # 模拟受限网络下 tiktoken 下载连接长时间不返回；用例结束前释放线程，
+        # 免得 asyncio.run 关闭默认线程池时还要等它。
+        release.wait(5)
+
+    monkeypatch.setattr(main, "prewarm_token_encoding", blocking_prewarm)
+
+    async def scenario():
+        started_at = time.perf_counter()
+        with caplog.at_level(logging.WARNING, logger="main"):
+            async with main.lifespan(main.app):
+                pass
+        elapsed = time.perf_counter() - started_at
+        release.set()
+        return elapsed
+
+    elapsed = asyncio.run(scenario())
+
+    # 未加超时时这里会等满 blocking_prewarm 的 5s；加超时后应接近 0.05s。
+    assert elapsed < 2.0
+    assert calls == ["init_db", "seed", "sweep"]
+    assert "prewarm timed out" in caplog.text
 
 
 def _wait_for_cleanup(cleanup_threads, file_id, timeout=5.0):

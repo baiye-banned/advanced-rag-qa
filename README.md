@@ -99,6 +99,13 @@ SECRET_KEY=change-this-secret-key-in-production
 - 使用 Aiven MySQL 这类要求 SSL 的云数据库时，在部署平台（如 Render）的环境变量里加 `MYSQL_SSL_MODE=required`；服务商要求指定 CA 证书时，把证书文件随部署环境挂载后设置 `MYSQL_SSL_CA=/path/to/ca.pem`。
 - 本地 Milvus Lite：`MILVUS_LITE_URI=./milvus.db`。
 - 远程 Milvus：`MILVUS_URI=http://your-milvus-host:19530`，按需补充 `MILVUS_TOKEN`、`MILVUS_USER`、`MILVUS_PASSWORD`、`MILVUS_DB_NAME`。
+- 离线/受限网络部署：入库分批用 tiktoken 的 `cl100k_base` 估算 token，首次使用会尝试下载 BPE 文件。请先在一台可联网的机器上生成缓存目录，再随部署环境挂载，并把目录路径写进 `TIKTOKEN_CACHE_DIR`：
+
+  ```bash
+  TIKTOKEN_CACHE_DIR=/path/to/tiktoken-cache python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"  # scan-secrets:allow a cache path, not a credential
+  ```
+
+  启动日志会打印实际生效的缓存目录与缓存文件名（`9b5ad71b2ce5302211f9c61530b329a4922fc6a4`，即 `cl100k_base.tiktoken`）。该检查失败不会阻止服务启动，但上传入库会因 token 估算失败而报错并写明缓存目录。仓库不提交 BPE 文件。
 
 默认账号播种由 `SEED_DEFAULT_USERS` / `SEED_ADMIN_PASSWORD` / `SEED_DEMO_PASSWORD` 控制：
 

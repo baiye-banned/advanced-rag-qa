@@ -1,6 +1,7 @@
 
 import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Annotated, Any, Callable
@@ -64,8 +65,12 @@ class KnowledgeIngestTimeout(Exception):
 
 
 def ingest_deadline() -> float:
-    """一次上传的入库截止时刻（事件循环时钟）。整份文档只算一次，各步骤共享。"""
-    return asyncio.get_running_loop().time() + KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
+    """一次上传的入库截止时刻（time.monotonic 时钟）。整份文档只算一次，各步骤共享。
+
+    用 time.monotonic 而不是事件循环时钟：入库步骤跑在 ThreadPoolExecutor 的工作线程里，
+    该线程需要拿同一个截止时刻去限制 Retry-After 退避（见 milvus_client._embed_documents）。
+    """
+    return time.monotonic() + KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
 
 
 def _submit_on(executor: ThreadPoolExecutor, step: Callable[..., Any], args: tuple) -> tuple:
@@ -95,12 +100,11 @@ async def _run_step_on(
 
     入库与清理共用这一份超时语义：两条路径各写一遍，迟早会漂移成两种行为。
     """
-    loop = asyncio.get_running_loop()
     work, future = _submit_on(executor, step, args)
     if deadline is None:
         return await future
 
-    remaining = deadline - loop.time()
+    remaining = deadline - time.monotonic()
     if remaining <= 0:
         # 还没轮到执行：可以真的取消掉这个工作项（cancel 只对未开始的任务生效）。
         work.cancel()
@@ -538,9 +542,16 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
     _warn_on_low_chunk_coverage(entry, text, chunks, scope="Knowledge file upload")
     try:
         # 向量化外呼与 Milvus 写入都是同步的，放进入库专用线程池执行：既不让事件循环
-        # 被独占，也不与检索侧抢 asyncio 默认池。deadline 是整份文档的总预算，
-        # 多批外呼加起来也超不过它。
-        await run_ingest_step(add_chunks, chunks, entry.id, entry.name, knowledge_base.id, deadline=deadline)
+        # 被独占，也不与检索侧抢 asyncio 默认池。deadline 同时传给 add_chunks：它不只是
+        # 等待上限，还限制重试退避——上游 Retry-After 再大也不能让线程睡过整份文档预算。
+        await run_ingest_step(
+            partial(add_chunks, deadline=deadline),
+            chunks,
+            entry.id,
+            entry.name,
+            knowledge_base.id,
+            deadline=deadline,
+        )
     except KnowledgeIngestTimeout as exc:
         # 写入线程还在跑，不能在这里清理：此时删掉的向量会被它重新写回来，
         # 留下「列表里没有、检索却命中」的孤儿向量。客户端先拿到 500，
