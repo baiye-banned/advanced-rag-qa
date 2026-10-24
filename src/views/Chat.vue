@@ -822,6 +822,9 @@ function askSuggestion(text) {
 
 function createNewConversation() {
   chatStore.clearMessages()
+  // 与侧栏「新建对话」同一条语义（#251 后续）：新会话不属于上一次的检索结果，
+  // 不退出检索上下文的话，首轮回答结束后的刷新会把它从侧栏滤掉。
+  chatStore.resetConversationSearch().catch(() => {})
   router.push('/chat')
   syncSelectedKnowledgeBase()
 }

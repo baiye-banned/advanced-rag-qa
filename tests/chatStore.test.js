@@ -632,6 +632,36 @@ test('流式期间点了「新对话」，迟到的会话事件不得登记待�
 })
 
 // ---------------------------------------------------------------------------
+// issue #251 后续：收尾认领会话必须以「本次流带回的会话 id」为准。
+// 检索上下文里刷新回来的首条只是命中排序最靠前的一条，先取 [0] 会把当前会话
+// 认领到别的会话上 —— 用户刚问完的新会话反而从侧栏消失。
+// ---------------------------------------------------------------------------
+
+test('收尾认领会话：列表里有本次会话时以它为准，不退而认领列表首条', async () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  stream.onMessage('', { type: 'conversation', conversation: conversation('new') })
+  // 模拟「视图还没认领会话」：收尾时 currentId 为空，但本次流的归属 id 已经拿到。
+  store.setCurrentId(null)
+
+  stream.onMessage('回答')
+  stream.onDone()
+
+  // 收尾刷新返回的列表里，别的会话排在前面（带 q 的搜索结果就是这样）。
+  respondConversations([conversation('other'), conversation('new')])
+  await flush()
+
+  assert.equal(store.currentId, 'new', '应当认领本次流的会话，而不是列表首条')
+
+  // 收尾还会刷新该会话的消息，消费掉避免留下未决 Promise。
+  respond('new', [])
+  await flush()
+})
+
+// ---------------------------------------------------------------------------
 // issue #262：清空会话（新建对话 / 登出）必须中止在途流。
 // 只中止而不作废回调，或只清视图而不复位 streaming，都会让新对话的首条消息发不出去，
 // 或者让旧流把迟到的增量 / 停止标记写回已清空的视图。

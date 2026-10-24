@@ -49,6 +49,7 @@
             class="conversation-search"
             size="small"
             placeholder="搜索对话标题"
+            maxlength="200"
             clearable
             :prefix-icon="Search"
             @input="scheduleConversationSearch"
@@ -205,7 +206,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ArrowDown,
@@ -279,6 +280,17 @@ function handleConversationSearchEnter(event) {
   applyConversationQueryNow(conversationQueryInput.value)
 }
 
+// 检索词也可能由别处清掉（Chat.vue 的「新建对话」按钮），输入框必须跟着 store 走，
+// 否则侧栏已经回到全部会话、框里却还留着旧词，看起来像结果丢了。
+// 同时收掉待触发的防抖：它握着的是清空前的输入，晚一步会把旧词又搜回去。
+watch(
+  () => chatStore.conversationQuery,
+  (query) => {
+    cancelPendingConversationSearch()
+    conversationQueryInput.value = query
+  }
+)
+
 onMounted(() => {
   userStore.fetchProfile().catch(() => {})
   chatStore.fetchConversations()
@@ -331,8 +343,14 @@ function cancelRename() {
 
 function newConversation() {
   cancelRename()
+  // 防抖计时器里握着旧检索词，先收掉再清，否则 300ms 后它会把搜索上下文又装回去。
+  cancelPendingConversationSearch()
   chatStore.exitHistoryManageMode()
   chatStore.clearMessages()
+  // 退出检索上下文（#251 后续）：新会话不在旧搜索结果里，留着 q 会让首轮回答结束后
+  // 的列表刷新把它过滤掉，侧栏上刚出现的会话随即消失。
+  chatStore.resetConversationSearch().catch(() => {})
+  conversationQueryInput.value = ''
   router.push('/chat')
 }
 

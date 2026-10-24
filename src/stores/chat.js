@@ -157,6 +157,13 @@ export const useChatStore = defineStore('chat', () => {
     return fetchConversations()
   }
 
+  // 新建对话时退出检索上下文（issue #251 后续）：新会话的标题通常是首个问题的前
+  // 30 个字，几乎不可能命中上一次的检索词；不收尾的话，首轮回答结束后 handleStreamDone
+  // 会带着旧 q 刷新列表，刚出现的会话当场从侧栏消失。
+  function resetConversationSearch() {
+    return setConversationQuery('')
+  }
+
   // 向后翻页：以已加载区间的最后一条作游标，把更早的一页接在列表末尾。
   // 后端按同一游标返回，翻页不会重复也不会漏；取不满一页即说明已经到最早一条。
   // 翻页必须带上发起时的检索词，否则第二页会混进未被搜索命中的会话。
@@ -441,11 +448,11 @@ export const useChatStore = defineStore('chat', () => {
     // 改写「当前会话」属于归属写入：收尾期间可能已经又发起了新的提问、或用户已经开了新对话，
     // 只有仍是当前请求、且视图没有被显式清空过，才允许改写。
     if (!currentId.value && isLatestStream(requestSeq) && viewEpochAtSend === viewEpoch) {
-      if (nextConversations?.[0]?.id) {
-        setCurrentId(nextConversations[0].id)
-      } else if (targetConversationId) {
-        setCurrentId(targetConversationId)
-      }
+      // 认领会话：流里已经带回本次会话的 id 时以它为准。退而取列表首条只适用于
+      // 「拿不到 id 的新会话」——检索上下文里首条只是命中最靠前的一条，未必是这次提问
+      // 新建的会话，先取 [0] 会把当前会话认领到别人身上。
+      const nextId = targetConversationId || nextConversations?.[0]?.id
+      if (nextId) setCurrentId(nextId)
     }
     // 消息刷新与评测轮询按「会话归属」判定：只要用户仍停留在该会话就要刷新。若这里改按请求序号判定，
     // 「回答刚结束又立刻追问」时收尾会被新请求作废，刚生成的回答会一直停在「评测中」且没有轮询。
@@ -866,6 +873,7 @@ export const useChatStore = defineStore('chat', () => {
     currentConversation,
     fetchConversations,
     setConversationQuery,
+    resetConversationSearch,
     loadMoreConversations,
     selectConversation,
     cancelConversationLoad,
