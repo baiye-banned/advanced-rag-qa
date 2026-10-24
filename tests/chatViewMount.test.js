@@ -1627,13 +1627,21 @@ test('编辑的流式保护：入口禁用、提交被拒，取消不发请求',
     store.streaming = true
     await view.flush(3)
 
-    // 提交按钮本身不靠 disabled 挡（它只防重复提交），必须由 submitEdit 的 streaming 守卫拦下。
-    view.query('[data-testid="submit-edit-message"]').dispatchEvent(
-      new MouseEvent('click', { bubbles: true })
-    )
+    // 按钮在流式期间禁用；即便从键盘（或绕过 disabled 的路径）走到 submitEdit，
+    // 也必须被 streaming 守卫拦下，并且明确告诉用户为什么没提交（不能静默）。
+    const submitButton = view.query('[data-testid="submit-edit-message"]')
+    assert.equal(submitButton.disabled, true, '流式期间提交按钮应当禁用')
+
+    const event = pressEditEnter(view)
     await settle(view)
+    assert.equal(event.defaultPrevented, true, '非合成态的 Enter 仍应被编辑框消费（不换行）')
     assert.equal(callsOf('delete').length, 0, '流式期间提交不得发出删除请求')
     assert.equal(streamCalls.length, 0, '流式期间提交不得发出流式请求')
+    assert.deepEqual(
+      view.messages.filter((message) => message.level === 'warning').map((message) => message.message),
+      ['正在生成回答，暂不能编辑'],
+      '流式期间提交应当明确提示此刻不能编辑'
+    )
     assert.ok(editTextarea(view), '提交被拒时编辑框和草稿应当保留')
 
     // 取消始终可用，而且不产生任何请求。
@@ -1708,6 +1716,132 @@ test('编辑提交：删除请求失败时不重发，编辑框和草稿保留',
     const store = await viewStore(view)
     assert.deepEqual(store.messages.map((message) => message.id), [1, 2], '失败时消息不变')
   } finally {
+    await close(view)
+  }
+})
+
+test('编辑取消：DELETE 在途按 Esc 不再重发，并明确提示原消息已截断', async () => {
+  const pending = deferredResponse()
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    respond('delete', () => pending.promise)
+
+    await openEditor(view)
+    await typeEdit(view, '修改后的问题')
+    pressEditEnter(view)
+    assert.equal(
+      await until(view, () => callsOf('delete').length === 1),
+      true,
+      '提交后应当发出唯一的 DELETE'
+    )
+    await view.flush(3)
+
+    // DELETE 还没回来，编辑框仍在；此时用户按 Esc 取消。
+    const textarea = editTextarea(view)
+    assert.ok(textarea, 'DELETE 在途时编辑框应当仍在')
+    const event = new KeyboardEvent('keydown', {
+      key: 'Escape', code: 'Escape', bubbles: true, cancelable: true,
+    })
+    textarea.dispatchEvent(event)
+    await view.flush(3)
+
+    assert.equal(event.defaultPrevented, true, '非合成态的 Esc 应当被编辑框消费')
+    assert.equal(view.query('[data-testid="edit-message-editor"]'), null, 'Esc 后应当退出编辑态')
+
+    // 放行删除响应：服务端已经截断，但这次提交已被取消，绝不能再发新问题。
+    pending.resolve({})
+    await settle(view)
+
+    assert.equal(callsOf('delete').length, 1, 'DELETE 只应发出一次')
+    assert.equal(streamCalls.length, 0, '取消后不得重发新问题')
+    assert.doesNotMatch(view.text(), /你好，世界/, '不得出现新回答')
+    assert.deepEqual(
+      view.messages.filter((message) => message.level === 'warning').map((message) => message.message),
+      ['编辑已提交，原消息已截断；新内容未发送'],
+      '服务端可能已截断时必须明确告知用户新内容未发送'
+    )
+  } finally {
+    pending.resolve({})
+    await close(view)
+  }
+})
+
+test('编辑取消：Esc 在输入法组字中不取消、不丢草稿', async () => {
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    await openEditor(view)
+    await typeEdit(view, '输入法里的草稿')
+
+    // isComposing=true（现代引擎）与仅 keyCode=229（旧引擎）都只是关候选窗。
+    for (const init of [{ isComposing: true }, { keyCode: 229 }]) {
+      const textarea = editTextarea(view)
+      assert.ok(textarea, '组字取消后编辑框应当保留')
+      const event = new KeyboardEvent('keydown', {
+        key: 'Escape', code: 'Escape', bubbles: true, cancelable: true, ...init,
+      })
+      textarea.dispatchEvent(event)
+      await settle(view)
+
+      assert.equal(event.defaultPrevented, false, '组字中的 Esc 不得被编辑框吃掉')
+      assert.ok(editTextarea(view), '组字中的 Esc 后编辑框应当保留')
+      assert.equal(editTextarea(view).value, '输入法里的草稿', '组字中的 Esc 不得丢弃草稿')
+      assert.equal(callsOf('delete').length, 0, '组字中的 Esc 不得触发删除')
+      assert.equal(streamCalls.length, 0, '组字中的 Esc 不得触发重发')
+    }
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑提交在途：重新生成与其它消息删除都被拒绝，不发第二个 DELETE', async () => {
+  const pending = deferredResponse()
+  const messages = [
+    ...EDIT_MESSAGES,
+    { id: 3, role: 'user', content: '另一条提问' },
+    { id: 4, role: 'assistant', content: '另一条回答' },
+  ]
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    respond('delete', () => pending.promise)
+
+    await openEditor(view)
+    await typeEdit(view, '修改后的问题')
+    pressEditEnter(view)
+    assert.equal(
+      await until(view, () => callsOf('delete').length === 1),
+      true,
+      '提交后应当发出唯一的 DELETE'
+    )
+    await view.flush(3)
+
+    // 提交在途：重新生成与其它消息的删除都必须被入口守卫拦下。
+    view.query('[data-testid="regenerate-message"]').click()
+    const otherDeletes = view.queryAll('[data-testid="delete-message"][data-message-role="user"]')
+    assert.equal(otherDeletes.length, 1, '编辑中的消息不显示删除入口，另一条用户消息仍有一个')
+    otherDeletes[0].click()
+    await settle(view)
+
+    assert.equal(confirmations.length, 0, '提交在途时其它删除不应弹出确认框')
+    assert.equal(callsOf('delete').length, 1, '提交在途时不得发出第二个 DELETE')
+    assert.equal(streamCalls.length, 0, '提交在途时不得额外发送消息')
+
+    // 放行后这次编辑照常完成：恰好一次 DELETE、一次重发。
+    pending.resolve({})
+    assert.equal(await until(view, () => streamCalls.length === 1), true, '原提交应当正常重发一次')
+    await settle(view)
+
+    assert.equal(callsOf('delete').length, 1, '整个流程只应有一次 DELETE')
+    assert.equal(streamCalls.length, 1, '整个流程只应有一次重发')
+    const body = JSON.parse(streamCalls[0].options.body)
+    assert.equal(body.question, '修改后的问题', '重发的应当是被编辑后的新问题')
+  } finally {
+    pending.resolve({})
     await close(view)
   }
 })
