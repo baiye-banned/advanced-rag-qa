@@ -672,6 +672,43 @@ for (const { headers, filename } of [
   })
 }
 
+// ---------------------------------------------------------------------------
+// g. 会话切换失败（issue #261）：路由回滚，且不留下「标识换了、内容没换」的错位
+// ---------------------------------------------------------------------------
+
+test('切换会话加载失败：提示错误并把路由回滚到原会话，消息保持原样', async () => {
+  const { view, router } = await mountChat({ route: '/chat/c1' })
+  // 挂载后再换 handler：c2 的消息请求失败，其余接口照常。
+  respond('get', (url) => {
+    if (url === '/knowledge-bases') return [KB1, KB2]
+    if (url === '/chat/conversations') return [CONV1, { ...CONV1, id: 'c2', title: '对话二' }]
+    if (url === '/chat/conversations/c1') return PERSISTED
+    if (url === '/chat/conversations/c2') throw new Error('network down')
+    return {}
+  })
+
+  try {
+    const store = await viewStore(view)
+    const initialMessages = JSON.stringify(store.messages)
+    assert.equal(store.currentId, 'c1', '前置：原会话已经加载')
+    assert.deepEqual(store.messages.map((item) => item.content), ['这是一个问题', '你好，世界'])
+
+    await router.push('/chat/c2')
+    await settle(view)
+
+    // 视图只提示一次，并把地址退回发起切换前的会话。
+    assert.deepEqual(view.messages, [{ level: 'error', message: '对话加载失败' }])
+    assert.equal(router.currentRoute.value.path, '/chat/c1', '失败后路由应当回滚到原会话')
+    // store 里的标识与内容都没有动：不会出现「标题是对话二、消息还是对话一」。
+    assert.equal(store.currentId, 'c1', '失败后仍指向原会话')
+    assert.equal(JSON.stringify(store.messages), initialMessages, '原会话消息不得被清空或替换')
+    assert.equal(store.loading, false, '失败后不应一直停在加载态')
+    assert.match(view.text(), /你好，世界/, '屏幕上仍是原会话的内容')
+  } finally {
+    await close(view)
+  }
+})
+
 test('导出按钮：HTTP 失败只提示一次，不保存文件且恢复可重试', async (t) => {
   const { downloads, urls } = recordExportDownloads(t)
   const { view } = await mountChat({ route: '/chat/c1' })

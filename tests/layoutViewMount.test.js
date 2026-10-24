@@ -496,6 +496,34 @@ test('重命名 R12：改名之后当即行序不变（重排发生在下次拉�
   }
 })
 
+test('点击历史对话只做导航，消息加载交给 Chat.vue 的路由 watcher', async () => {
+  const { view, router } = await mountLayout({ route: '/chat' })
+  const { useChatStore } = await import(
+    new URL('../src/stores/chat.js', import.meta.url).href
+  )
+
+  try {
+    const chatStore = useChatStore(view.pinia)
+    assert.equal(chatStore.currentId, null, '前置：还没有任何会话被加载')
+
+    conversationRows(view)[0].click()
+    await until(view, () => router.currentRoute.value.path === '/chat/c1')
+    await settle(view)
+
+    assert.equal(router.currentRoute.value.path, '/chat/c1', '点击会话行应当导航到该会话')
+    // 侧栏不再自己调 selectConversation：加载失败时要由路由层统一回滚，
+    // 两处各发一次请求会让回滚拿到两份互相追逐的结果。
+    assert.equal(chatStore.currentId, null, '侧栏不应当自行选中/加载会话')
+    assert.equal(
+      calls.filter((entry) => entry.method === 'get' && entry.args[0] === '/chat/conversations/c1').length,
+      0,
+      '侧栏点击不应当自己发消息请求'
+    )
+  } finally {
+    await close(view)
+  }
+})
+
 test('重命名 R13：IME 组字中的回车不提交', async () => {
   const { view } = await mountLayout()
 

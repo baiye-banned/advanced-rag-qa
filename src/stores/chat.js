@@ -49,6 +49,9 @@ function conversationCursorOf(page) {
 export const useChatStore = defineStore('chat', () => {
   const conversations = ref([])
   const currentId = ref(null)
+  // 正在加载的会话 id（不是「已选中」）：currentId 只在加载成功后才提交，
+  // 请求在途期间它仍指向上一个成功加载的会话，视图不会出现「标题是 B、内容是 A」。
+  const loadingConversationId = ref(null)
   const messages = ref([])
   const loading = ref(false)
   const hasMoreConversations = ref(false)
@@ -149,21 +152,35 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  // 只有「最新一次加载」且「仍停留在该会话」的响应才允许写入状态。
-  function isLatestLoad(seq, id) {
-    return seq === loadSeq && currentId.value === id
+  // 只有最新一次加载的响应才允许写入状态。这里不再比对 currentId：
+  // currentId 要等加载成功后才提交，加载期间它仍然是上一个会话的 id。
+  function isLatestLoad(seq) {
+    return seq === loadSeq
+  }
+
+  // 作废在途的会话消息加载。正在加载时顺带复位 loading，
+  // 但不动「会话列表」自己的 loading —— 两者共用一个标记。
+  function cancelConversationLoad() {
+    loadSeq += 1
+    if (loadingConversationId.value === null) return
+    loadingConversationId.value = null
+    loading.value = false
   }
 
   async function selectConversation(id) {
     const seq = ++loadSeq
-    currentId.value = id
+    // 先只记录加载目标：请求成功且仍是最新一次加载时，才把 currentId / messages 一起提交。
+    // 失败时旧会话的 id 与内容原样保留，调用方据 reject 决定回滚路由。
+    loadingConversationId.value = id
     loading.value = true
     try {
       // 只取最新一页：历史由 loadOlderMessages 按需向前翻，避免一次拉回整段会话。
       const response = await chatAPI.getMessages(id, { limit: MESSAGE_FETCH_LIMIT })
-      if (!isLatestLoad(seq, id)) return
+      if (!isLatestLoad(seq)) return
       const rows = Array.isArray(response) ? response.map(normalizeMessage) : []
       const { page, hasMore } = splitPage(rows)
+      // 标识与内容在同一处提交，不会出现「标识已改、内容未改」的中间态。
+      currentId.value = id
       messages.value = page
       hasMoreMessages.value = hasMore
       windowTruncated = false
@@ -177,7 +194,10 @@ export const useChatStore = defineStore('chat', () => {
         stopEvaluationPolling()
       }
     } finally {
-      if (seq === loadSeq) loading.value = false
+      if (seq === loadSeq) {
+        loadingConversationId.value = null
+        loading.value = false
+      }
     }
   }
 
@@ -651,6 +671,8 @@ export const useChatStore = defineStore('chat', () => {
     abortAndDiscardStream()
     // 用户显式离开当前视图：在途流的「认领会话」「改写知识库」写入随之失效。
     viewEpoch += 1
+    // 在途的会话消息加载同样作废：清空之后它再返回，不能把旧消息写回当前视图。
+    cancelConversationLoad()
     currentId.value = null
     messages.value = []
     hasMoreMessages.value = false
@@ -691,6 +713,7 @@ export const useChatStore = defineStore('chat', () => {
   return {
     conversations,
     currentId,
+    loadingConversationId,
     messages,
     loading,
     hasMoreConversations,
@@ -711,6 +734,7 @@ export const useChatStore = defineStore('chat', () => {
     fetchConversations,
     loadMoreConversations,
     selectConversation,
+    cancelConversationLoad,
     loadOlderMessages,
     addMessage,
     replaceMessages,

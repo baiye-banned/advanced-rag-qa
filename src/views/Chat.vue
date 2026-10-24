@@ -464,7 +464,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Bottom,
@@ -585,34 +585,72 @@ const ragasEvents = computed(() =>
 
 const prettyTrace = computed(() => formatJson(activeTrace.value))
 
-onMounted(async () => {
-  await refreshKnowledgeBases()
-  await chatStore.fetchConversations().catch(() => {})
-  if (route.params.id && route.params.id !== chatStore.currentId) {
-    await chatStore.selectConversation(route.params.id).catch(() => router.replace('/chat'))
-    syncSelectedKnowledgeBase()
+// 路由 watcher 是会话加载的唯一入口（侧栏点击只负责导航）。这次加载的世代号
+// 用来丢弃「已经切到别的会话之后才失败」的旧加载，避免它把路由回滚到错误的会话。
+let routeLoadSeq = 0
+let conversationsBootstrap = null
+let conversationsLoaded = false
+
+// 加载会话前先确保会话列表就绪：selectConversation 成功后要按列表里的
+// knowledge_base_id 选中知识库。失败时下次导航重试。
+function ensureConversationsLoaded() {
+  if (conversationsLoaded) return Promise.resolve()
+  if (!conversationsBootstrap) {
+    conversationsBootstrap = chatStore
+      .fetchConversations()
+      .then(() => {
+        conversationsLoaded = true
+      })
+      .catch(() => {})
+      .finally(() => {
+        conversationsBootstrap = null
+      })
   }
-})
+  return conversationsBootstrap
+}
 
 watch(
   () => route.params.id,
   async (id) => {
+    const seq = ++routeLoadSeq
     await refreshKnowledgeBases()
+    if (seq !== routeLoadSeq) return
+    await ensureConversationsLoaded()
+    if (seq !== routeLoadSeq) return
+
     if (!id) {
       if (!chatStore.streaming) {
         chatStore.clearMessages()
+      } else {
+        // 流式回答期间回到空白页不清视图，但同样要放弃在途的会话加载，
+        // 否则它晚到的响应会写进这个已经没有会话的页面。
+        chatStore.cancelConversationLoad()
       }
       syncSelectedKnowledgeBase()
       return
     }
-    if (id !== chatStore.currentId) {
-      await chatStore.selectConversation(id).catch(() => {
-        ElMessage.error('对话加载失败')
-        router.replace('/chat')
-      })
+    // 路由指向的正是已加载的会话：不再重复加载，只需作废在途的其它加载。
+    if (id === chatStore.currentId) {
+      chatStore.cancelConversationLoad()
       syncSelectedKnowledgeBase()
+      return
     }
-  }
+
+    // 失败时回滚到发起这次切换前仍完整显示着的会话。
+    const previousId = chatStore.currentId
+    try {
+      await chatStore.selectConversation(id)
+    } catch {
+      // 快速切换时旧加载可能晚失败：新的那次已经接管，不要回滚它的路由。
+      if (seq !== routeLoadSeq) return
+      ElMessage.error('对话加载失败')
+      router.replace(previousId ? `/chat/${previousId}` : '/chat')
+      return
+    }
+    if (seq !== routeLoadSeq) return
+    syncSelectedKnowledgeBase()
+  },
+  { immediate: true }
 )
 
 watch(
