@@ -152,8 +152,9 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
-  // 只有最新一次加载的响应才允许写入状态。这里不再比对 currentId：
-  // currentId 要等加载成功后才提交，加载期间它仍然是上一个会话的 id。
+  // 只有最新一次加载的响应才允许写入状态。
+  // currentId 要等加载成功后才提交，加载期间它仍然是上一个会话的 id，
+  // 所以除序号外还要在提交点比对发起时捕获的 currentId（见 selectConversation）。
   function isLatestLoad(seq) {
     return seq === loadSeq
   }
@@ -169,6 +170,10 @@ export const useChatStore = defineStore('chat', () => {
 
   async function selectConversation(id) {
     const seq = ++loadSeq
+    // 加载发起时的已选中会话：提交前要确认期间没有别的写入者改动 currentId
+    // （流式的 conversation 事件会在 currentId 为空时认领新会话、clearMessages 会清空）。
+    // 只比 seq 不够：这些写入不走 loadSeq，迟到的加载仍会把它们覆盖掉。
+    const claimedAtStart = currentId.value
     // 先只记录加载目标：请求成功且仍是最新一次加载时，才把 currentId / messages 一起提交。
     // 失败时旧会话的 id 与内容原样保留，调用方据 reject 决定回滚路由。
     loadingConversationId.value = id
@@ -176,7 +181,7 @@ export const useChatStore = defineStore('chat', () => {
     try {
       // 只取最新一页：历史由 loadOlderMessages 按需向前翻，避免一次拉回整段会话。
       const response = await chatAPI.getMessages(id, { limit: MESSAGE_FETCH_LIMIT })
-      if (!isLatestLoad(seq)) return
+      if (!isLatestLoad(seq) || currentId.value !== claimedAtStart) return
       const rows = Array.isArray(response) ? response.map(normalizeMessage) : []
       const { page, hasMore } = splitPage(rows)
       // 标识与内容在同一处提交，不会出现「标识已改、内容未改」的中间态。

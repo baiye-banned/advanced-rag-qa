@@ -324,6 +324,31 @@ test('加载在飞时清空会话，返回后不得把旧消息写回当前视�
   assert.equal(store.loading, false)
 })
 
+test('加载在飞时流认领了新会话，迟到的加载不得覆盖它和刚发出的提问', async () => {
+  const store = createStore([conversation('a')])
+  assert.equal(store.currentId, null)
+
+  // 深链进入 /chat/a：消息加载在飞，currentId 仍为空。
+  const requestA = store.selectConversation('a')
+  assert.equal(store.loadingConversationId, 'a')
+  assert.equal(store.currentId, null)
+
+  // 加载还没返回，用户就发起了提问：流为新会话 c9 投递 conversation 事件并认领它。
+  store.sendMessage('在途时提问')
+  const stream = streams.at(-1)
+  stream.onMessage('', { type: 'conversation', conversation: conversation('c9') })
+  assert.equal(store.currentId, 'c9')
+
+  // 旧加载这时才返回：只比 seq 的实现会把 currentId 改回 a，并用 a 的历史覆盖新提问。
+  respond('a', [message(1, 'A 的历史回答')])
+  await requestA
+
+  assert.equal(store.currentId, 'c9')
+  assert.deepEqual(contents(store), ['在途时提问'])
+  assert.equal(store.loading, false)
+  assert.equal(store.loadingConversationId, null)
+})
+
 test('被新流式请求取代的旧回调不再写入状态', async () => {
   const store = createStore([conversation('a')])
   store.setCurrentId('a')
