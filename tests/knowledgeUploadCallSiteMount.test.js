@@ -28,6 +28,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mountSfc } from './helpers/vueMount.js'
+import { createTestRouter } from './helpers/testRouter.js'
 import { calls, resetRequestStub, respond } from './helpers/stubApiRequest.js'
 
 const MODULES = {
@@ -92,7 +93,8 @@ async function mountKnowledge({ refreshFailsOn = null, upload } = {}) {
   })
   respond('post', upload || (() => UPLOADED))
 
-  const view = await mountSfc('views/Knowledge.vue', { modules: MODULES })
+  const router = await createTestRouter()
+  const view = await mountSfc('views/Knowledge.vue', { modules: MODULES, plugins: [router] })
   await settle(view)
   await until(view, () => calls.filter((entry) => entry.method === 'get').length >= 2)
 

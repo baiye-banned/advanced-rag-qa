@@ -17,8 +17,9 @@ export const knowledgeAPI = {
   deleteBase(id, config = {}) {
     return request.delete(`/knowledge-bases/${id}`, config)
   },
-  getDetail(id) {
-    return request.get(`/knowledge/${id}`)
+  getDetail(id, config = {}) {
+    // config 透传：来源卡片跳转用 { silent: true }，不存在/失败由调用方给文案。
+    return request.get(`/knowledge/${id}`, config)
   },
   getContent(id, config = {}) {
     // config 透传：详情预览用 { silent: true } 抑制拦截器的顶部提示，

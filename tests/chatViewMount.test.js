@@ -999,3 +999,137 @@ test('切到的会话返回消息：加载完成后正常渲染该会话', async
     await close(view)
   }
 })
+
+// ---------------------------------------------------------------------------
+// j. 参考资料卡片跳知识库详情（issue #255）
+//
+// 参考抽屉里的卡片不是永远可点：`file_id` 是跨页跳转的唯一凭据，只有正整数
+// 才存在一个可寻址的 `/knowledge?file=<id>` 目标。缺失 / 0 / 非数字时必须保持
+// 原来的静态展示，否则用户会点到一个注定「不存在」的详情页。
+//
+// 抽屉由 element-plus append 到 body（append-to-body），因此断言面在 document 上，
+// 不在 view.host 里。关闭抽屉时 overlay 走 v-show，过渡结束后 display:none。
+// ---------------------------------------------------------------------------
+
+const SOURCED_MESSAGES = [
+  { id: 1, role: 'user', content: '问题', created_at: '2024-01-01T00:00:01Z' },
+  {
+    id: 2,
+    role: 'assistant',
+    content: '回答',
+    created_at: '2024-01-01T00:00:02Z',
+    sources: [{ index: 1, file_id: 7, file_name: '员工手册.md', content: '片段内容' }],
+  },
+]
+
+const INVALID_ID_MESSAGES = [
+  { id: 1, role: 'user', content: '问题', created_at: '2024-01-01T00:00:01Z' },
+  {
+    id: 2,
+    role: 'assistant',
+    content: '回答',
+    created_at: '2024-01-01T00:00:02Z',
+    sources: [
+      { index: 1, file_id: 0, file_name: '零号资料.md', content: '片段一' },
+      { index: 2, file_name: '没有 id 的资料.md', content: '片段二' },
+      { index: 3, file_id: 'abc', file_name: '非数字 id.md', content: '片段三' },
+    ],
+  },
+]
+
+function sourceDrawer() {
+  return [...globalThis.document.querySelectorAll('.el-drawer')].find((node) =>
+    node.textContent.includes('参考资料')
+  )
+}
+
+function sourceCards() {
+  const drawer = sourceDrawer()
+  return drawer ? [...drawer.querySelectorAll('article')] : []
+}
+
+function drawerHidden(drawer) {
+  const overlay = drawer?.closest('.el-overlay')
+  return !overlay || overlay.style.display === 'none'
+}
+
+test('参考资料卡片：file_id 有效时点击跳转 /knowledge?file=<id> 并收起抽屉', async () => {
+  const { view, router } = await mountChat({ route: '/chat/c1', messages: SOURCED_MESSAGES })
+
+  try {
+    const trigger = view.buttonByText('参考 1 篇资料')
+    assert.ok(trigger, '助手消息应当渲染参考资料入口')
+    trigger.click()
+    assert.equal(await until(view, () => sourceCards().length === 1), true, '点击入口后应当打开参考资料抽屉')
+
+    const [card] = sourceCards()
+    assert.equal(card.getAttribute('role'), 'button', '有效 file_id 的卡片应当有按钮语义')
+    assert.equal(card.getAttribute('tabindex'), '0', '有效 file_id 的卡片应当能通过键盘聚焦')
+    assert.equal(card.getAttribute('aria-label'), '查看资料详情：员工手册.md')
+
+    card.click()
+    assert.equal(
+      await until(view, () => router.currentRoute.value.fullPath === '/knowledge?file=7'),
+      true,
+      '点击卡片应当按地址契约跳到 /knowledge?file=7'
+    )
+    assert.equal(router.currentRoute.value.query.file, '7', '目标文件 id 应当体现在可刷新/可分享的 query 上')
+    assert.equal(await until(view, () => drawerHidden(sourceDrawer())), true, '跳转后参考资料抽屉应当收起')
+  } finally {
+    await close(view)
+  }
+})
+
+test('参考资料卡片：键盘 Enter 与点击等价，空格同样可触发', async () => {
+  const { view, router } = await mountChat({ route: '/chat/c1', messages: SOURCED_MESSAGES })
+
+  try {
+    view.buttonByText('参考 1 篇资料').click()
+    assert.equal(await until(view, () => sourceCards().length === 1), true)
+
+    // 先测空格：卡片是 role=button 的自定义元素，浏览器不会替它把 Space 转成 click，
+    // 必须由视图自己接住；只测 Enter 会漏掉这个分支。
+    const [card] = sourceCards()
+    const space = new KeyboardEvent('keydown', {
+      key: ' ', code: 'Space', bubbles: true, cancelable: true,
+    })
+    card.dispatchEvent(space)
+    assert.equal(space.defaultPrevented, true, '空格被卡片处理时应当 preventDefault（避免页面滚动）')
+    assert.equal(
+      await until(view, () => router.currentRoute.value.fullPath === '/knowledge?file=7'),
+      true,
+      '空格应当与点击一样跳到详情地址'
+    )
+  } finally {
+    await close(view)
+  }
+})
+
+test('参考资料卡片：file_id 为 0/缺失/非数字时不可点击，也不跳转', async () => {
+  const { view, router } = await mountChat({ route: '/chat/c1', messages: INVALID_ID_MESSAGES })
+
+  try {
+    const trigger = view.buttonByText('参考 3 篇资料')
+    assert.ok(trigger, '三条来源应当渲染为一个参考资料入口')
+    trigger.click()
+    assert.equal(await until(view, () => sourceCards().length === 3), true, '抽屉里应当渲染三张卡片')
+
+    for (const card of sourceCards()) {
+      assert.equal(card.getAttribute('role'), null, '无效 file_id 的卡片不应有按钮语义')
+      assert.equal(card.getAttribute('tabindex'), null, '无效 file_id 的卡片不应进入键盘 Tab 序列')
+      assert.equal(card.getAttribute('aria-label'), null, '无效 file_id 的卡片不应声称可以查看详情')
+      assert.doesNotMatch(card.className, /cursor-pointer/, '无效 file_id 的卡片不应看起来可点击')
+
+      card.click()
+      card.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true })
+      )
+    }
+    await settle(view)
+
+    assert.equal(router.currentRoute.value.fullPath, '/chat/c1', '无效 file_id 不应发生任何跳转')
+    assert.equal(drawerHidden(sourceDrawer()), false, '点击无效卡片不应收起抽屉（它本来就没有行为）')
+  } finally {
+    await close(view)
+  }
+})

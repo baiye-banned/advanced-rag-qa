@@ -246,6 +246,7 @@
 
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import {
   CopyDocument,
   Delete,
@@ -343,6 +344,99 @@ watch(
 
 // 卸载时同样要作废：离开页面后在飞的响应不得再写进已经卸载组件的状态对象（issue #83 第 9 项）。
 onBeforeUnmount(() => closeDetail())
+
+// ---------------------------------------------------------------------------
+// 来源卡片跳转 / 刷新恢复的地址契约：/knowledge?file=<正整数文件 id>
+// ---------------------------------------------------------------------------
+// Chat 的参考资料卡片跳过来，以及用户直接访问 / 刷新这个地址，都从 query 恢复详情预览。
+// 不能只靠跨页的内存状态：地址必须自解释，否则刷新或复制链接就丢目标。
+const route = useRoute()
+const router = useRouter()
+const FILE_NOT_FOUND_TEXT = '文件不存在或已删除'
+const FILE_DETAIL_ERROR_TEXT = '文件详情加载失败，请稍后重试'
+// 与详情预览、文件列表同款的请求时序守卫：query 每次变化都作废上一笔在飞请求，
+// 只有最后一次变化发起的请求才能打开预览（快速连点 / 前进后退时尤其需要）。
+let routeFileToken = 0
+
+function parseRouteFileId(value) {
+  const raw = Array.isArray(value) ? value[0] : value
+  const text = typeof raw === 'number' ? String(raw) : raw
+  if (typeof text !== 'string' || !/^\d+$/.test(text)) return null
+  const fileId = Number(text)
+  return Number.isSafeInteger(fileId) && fileId > 0 ? fileId : null
+}
+
+// 只移除 file，其余 query（筛选等）原样保留；replace 不制造一条无意义的返回历史。
+function clearFileQuery() {
+  if (route.query.file === undefined) return
+  const rest = { ...route.query }
+  delete rest.file
+  router.replace({ path: route.path, query: rest }).catch(() => {})
+}
+
+// 网络失败不能说成「文件不存在」：只有 404 才确定是缺失/已删除。
+function isFileNotFoundError(error) {
+  return error?.response?.status === 404
+}
+
+// 接口成功却没有这个文件（空响应、id 对不上）同样按缺失处理；
+// 这与 getContent 失败不同，后者由预览区自己的 detail.error 呈现。
+function isMissingFileResponse(file, fileId) {
+  return !file || Number(file.id) !== fileId
+}
+
+async function openFileFromRoute(value) {
+  const token = (routeFileToken += 1)
+  const fileId = parseRouteFileId(value)
+  if (!fileId) {
+    // query 里确实写了非法值：清掉它，避免地址一直停在无法恢复的状态。
+    if (value !== undefined && value !== null) clearFileQuery()
+    return
+  }
+
+  // 目标已经在当前列表里时直接用列表行（不必再打一次元数据请求）。
+  const cached = allFiles.value.find((file) => Number(file.id) === fileId)
+  if (cached) {
+    showDetail(cached)
+    return
+  }
+
+  try {
+    const file = await knowledgeAPI.getDetail(fileId, { silent: true })
+    // 请求期间路由已经切走（或组件卸载）：迟到的响应不得打开错误的文件。
+    if (token !== routeFileToken) return
+    if (parseRouteFileId(route.query.file) !== fileId) return
+    if (isMissingFileResponse(file, fileId)) {
+      ElMessage.warning(FILE_NOT_FOUND_TEXT)
+      clearFileQuery()
+      return
+    }
+    showDetail(file)
+  } catch (error) {
+    if (token !== routeFileToken) return
+    if (parseRouteFileId(route.query.file) !== fileId) return
+    if (isFileNotFoundError(error)) {
+      ElMessage.warning(FILE_NOT_FOUND_TEXT)
+      clearFileQuery()
+      return
+    }
+    // 网络 / 服务端错误：保留 file 让用户刷新重试，提示沿用统一的错误文案。
+    ElMessage.error(getApiErrorMessage(error, FILE_DETAIL_ERROR_TEXT))
+  }
+}
+
+watch(
+  () => route.query.file,
+  (value) => {
+    openFileFromRoute(value)
+  },
+  { immediate: true }
+)
+
+// 卸载时作废在飞的元数据请求：不得再对已卸载的组件弹提示或改 query。
+onBeforeUnmount(() => {
+  routeFileToken += 1
+})
 
 const knowledgeStore = useKnowledgeStore()
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)

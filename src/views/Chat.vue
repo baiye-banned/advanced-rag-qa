@@ -322,6 +322,17 @@
           v-for="source in activeSources"
           :key="`${source.file_id}-${source.index}`"
           class="rounded-lg border border-slate-200 bg-white p-3"
+          :class="
+            sourceFileId(source)
+              ? 'cursor-pointer transition-colors hover:border-brand-400 hover:bg-brand-50/40 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-500'
+              : ''
+          "
+          :role="sourceFileId(source) ? 'button' : undefined"
+          :tabindex="sourceFileId(source) ? 0 : undefined"
+          :aria-label="sourceFileId(source) ? `查看资料详情：${source.file_name || '未命名资料'}` : undefined"
+          @click="openSourceFile(source)"
+          @keydown.enter.prevent="openSourceFile(source)"
+          @keydown.space.prevent="openSourceFile(source)"
         >
           <div class="flex items-start gap-2">
             <span class="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-brand-50 text-xs font-medium text-brand-700">
@@ -839,6 +850,24 @@ function sourceText(source) {
   if (hasDisplayValue(source?.content)) return source.content
   if (hasDisplayValue(source?.excerpt)) return source.excerpt
   return ''
+}
+
+// 来源卡片的 file_id 是跨页跳转的唯一凭据：只有正整数才是可寻址的文件 id。
+// 缺失、0、非数字一律返回 null —— 卡片保持原来的静态展示，不给出可点击的样子（#255）。
+function sourceFileId(source) {
+  const raw = source?.file_id
+  const text = typeof raw === 'number' ? String(raw) : raw
+  if (typeof text !== 'string' || !/^\d+$/.test(text)) return null
+  const fileId = Number(text)
+  return Number.isSafeInteger(fileId) && fileId > 0 ? fileId : null
+}
+
+function openSourceFile(source) {
+  const fileId = sourceFileId(source)
+  if (!fileId) return
+  // 先收起抽屉再跳转：离开会话页之后参考资料不应残留为“还开着”的状态。
+  sourcesVisible.value = false
+  router.push({ path: '/knowledge', query: { file: String(fileId) } })
 }
 
 function hasTrace(message) {
