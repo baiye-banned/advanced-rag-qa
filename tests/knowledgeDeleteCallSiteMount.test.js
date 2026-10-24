@@ -35,6 +35,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { mountSfc } from './helpers/vueMount.js'
+import { createTestRouter } from './helpers/testRouter.js'
 import { calls, resetRequestStub, respond } from './helpers/stubApiRequest.js'
 
 const MODULES = {
@@ -67,7 +68,8 @@ async function mountKnowledge({ world = createWorld(), remove } = {}) {
   })
   if (remove) respond('delete', remove)
 
-  const view = await mountSfc('views/Knowledge.vue', { modules: MODULES })
+  const router = await createTestRouter()
+  const view = await mountSfc('views/Knowledge.vue', { modules: MODULES, plugins: [router] })
   await settle(view)
   // 挂载期有两次 GET（知识库列表 + 文件列表）。等它们都落地再让调用方划水位线，
   // 否则迟到的挂载请求会混进「点击之后发了什么」里。

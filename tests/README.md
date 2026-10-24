@@ -91,6 +91,7 @@ Current files:
 - `knowledgeStore.test.js`
 - `knowledgeUploadCallSiteMount.test.js`
 - `knowledgeUploadTypes.test.js`
+- `knowledgeViewMount.test.js`
 - `knowledgeViewWiring.test.js`
 - `layoutViewMount.test.js`
 - `loginViewMount.test.js`
@@ -222,7 +223,14 @@ the stale one. Conversation Markdown export (#252) preserves the full Axios resp
 download request, parses UTF-8 filenames, rejects non-Markdown payloads, releases object URLs, and
 keeps ordinary JSON requests and login expiry handling unchanged. Mounted Chat.vue tests cover the
 real export button, unavailable states, duplicate clicks, errors and conversation changes while a
-download is pending.
+download is pending. `knowledgeViewMount.test.js` mounts the real `Knowledge.vue` behind a real
+memory router and pins the address contract added for issue #255: `/knowledge?file=<positive id>`
+opens that file's detail both when the file is already in the list (without refetching its metadata)
+and when it has to be fetched first, a metadata 404 warns that the file does not exist or was
+deleted and clears only the `file` query while keeping the other parameters, a network or
+content-read failure keeps the query and is never misreported as a missing file, a late metadata
+response for a superseded id cannot open the wrong file, and clicking a row's own detail button
+still writes no `file` query.
 
 ## Python Tests
 
