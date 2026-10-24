@@ -723,7 +723,8 @@ def _attachment_keys(raw_attachments) -> list[str]:
     return keys
 
 
-def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | None:
+def delete_message(db: Session, message_id: int, user_id: int,
+                   keep_attachments: bool = False) -> list[int] | None:
     """删除一条消息，返回实际删掉的消息 id（按 id 升序）；查无此消息或不属于该用户返回 None。
 
     语义（issue #256）：
@@ -744,6 +745,16 @@ def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | No
     到期后领取执行；失败时 `clear_attachment_claim` 会把行放回队列。不能只给「还没有行」
     的键插 pending 行——真实链路上传时一定已登记、发送时盖了 `consumed_at`，那样写会让
     所有实际用过的附件都漏出回收视野（对象桶是 public-read，泄漏即长期可读）。
+
+    `keep_attachments=True`（issue #253）：编辑/重新生成会在删除后**立即**重发**目标
+    消息自身**的附件，此时若照常登记墓碑，发送路径会把这些键判死而丢掉附件。该分支因此
+    只保留目标消息（`message.attachments`）引用的键：完全不改这些 `ChatAttachmentUpload`
+    行（保持 consumed 状态与归属）。同一截断范围里**其它被删消息**的附件键不在重发列表
+    里，仍走默认路径（存活引用检查 → 墓碑登记），否则它们会永久泄漏。消息删除、
+    `updated_at` 推进、记忆摘要作废等其余语义与默认路径完全一致。调用方承诺「删完马上
+    重发」；若重发失败，目标消息的附件行会停在 consumed 且不再被任何消息引用——属已知
+    泄漏（对象仍在桶里，但清扫不可见），不在本函数内补偿，由 PR 后续计划跟踪。默认
+    `False` 时行为与 #311 完全一致。
     """
     message = get_message_by_user(db, message_id, user_id)
     if message is None:
@@ -773,11 +784,20 @@ def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | No
     deleted_ids = [row_id for row_id, _raw in rows]
 
     # 附件键必须在删行之前收集；删完就再也读不到这些消息引用过什么。
+    #
+    # `keep_attachments=True` 只保留**目标消息自身**的附件键：调用方马上重发的是这一条
+    # 消息的 attachments，只有这些键被墓碑登记才会让重发被拒签。截断范围里其它消息的
+    # 附件不在重发列表里，若一并跳过墓碑，它们会既不在墓碑、也不在 pending、也没有任何
+    # 存活消息引用——对象永久泄漏（#253 返修）。因此这些键仍走默认路径：存活引用检查后
+    # 登记墓碑。目标消息不是 user（例如未来助手单删带 keep）时同样只保留它自己的附件。
+    kept_keys = (
+        set(_attachment_keys(message.attachments)) if keep_attachments else set()
+    )
     candidate_keys = {
         object_key
         for _row_id, raw_attachments in rows
         for object_key in _attachment_keys(raw_attachments)
-    }
+    } - kept_keys
     orphan_keys: list[str] = []
     if candidate_keys:
         surviving_keys: set[str] = set()

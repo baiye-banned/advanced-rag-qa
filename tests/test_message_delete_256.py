@@ -8,6 +8,9 @@
 - **联动状态**：会话 `updated_at` 前进（侧栏排序）；记忆摘要覆盖到被删区间时作废；
   附件键写进 #238 的墓碑状态，**不在请求路径碰 OSS**。
 - **事务**：一次提交；提交失败时消息、摘要、附件行全部回滚。
+- **保留附件**（issue #253）：`keep_attachments=true` 只保留**目标消息自身**的附件（供
+  编辑/重新生成紧接着重发）；同一截断范围里其它消息的附件仍按默认路径登记墓碑。消息删除、
+  `updated_at`、记忆摘要与归属语义不变。
 
 夹具骨架取自 `tests/test_message_feedback_250.py`（HTTP 归属）与
 `tests/test_conversation_activity_bump_239.py`（内存 SQLite + 时间戳断言）。
@@ -43,6 +46,7 @@ def _compile_longtext_as_text(_type, _compiler, **_kwargs):
 # 播种时间落在过去：删除时写入的是 func.now()，若播种值在未来，断言会假绿。
 T0 = datetime(2020, 1, 1)
 ATTACHMENT_KEY = "rag-chat/2026/10/message-delete-256.png"
+LATER_ATTACHMENT_KEY = "rag-chat/2026/10/message-delete-256-later.png"
 
 
 @pytest.fixture()
@@ -111,8 +115,8 @@ def _add_message(api, cid, role, content, *, attachments=None):
     return message.id
 
 
-def _delete(api, message_id):
-    return api.client.delete(f"/api/chat/messages/{message_id}")
+def _delete(api, message_id, **params):
+    return api.client.delete(f"/api/chat/messages/{message_id}", params=params)
 
 
 def _history(api, cid):
@@ -474,6 +478,224 @@ def test_attachment_still_referenced_by_another_message_is_not_tombstoned(api):
     assert upload.consumed_at is not None
     assert upload.claimed_at is None
     assert upload.reclaimed_at is None
+
+
+# --- 保留附件（issue #253）：编辑/重新生成后立即重发 ---------------------------------
+
+
+def test_keep_attachments_preserves_consumed_upload_for_immediate_resend(api, monkeypatch):
+    _add_conversation(api, "conv-keep-attachments", updated_at=T0)
+    target = _add_message(
+        api,
+        "conv-keep-attachments",
+        "user",
+        "带图提问",
+        attachments=[{"object_key": ATTACHMENT_KEY, "name": "photo.png"}],
+    )
+    answer = _add_message(api, "conv-keep-attachments", "assistant", "带图回答")
+    _register_consumed_upload(api)
+
+    consumed_before = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    consumed_at = consumed_before.consumed_at
+    created_at = consumed_before.created_at
+    assert consumed_at is not None
+
+    before_updated_at = _stored_updated_at(api, "conv-keep-attachments")
+    assert before_updated_at == T0, "前置：除本次删除外没有别的写操作推进 updated_at"
+
+    calls = _forbid_oss_path(monkeypatch)
+    response = _delete(api, target, keep_attachments="true")
+
+    assert response.status_code == 200
+    assert response.json()["deleted_message_ids"] == [target, answer]
+    assert calls == [], "请求路径调用了 OSS 删除"
+    assert _history(api, "conv-keep-attachments") == []
+    assert _stored_updated_at(api, "conv-keep-attachments") > before_updated_at
+
+    api.db.expunge_all()
+    upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    # 行完全不动：仍是 consumed、无租约/墓碑，归属与创建时间也不变。
+    assert upload.user_id == api.alice.id
+    assert upload.created_at == created_at
+    assert upload.consumed_at == consumed_at
+    assert upload.claimed_at is None
+    assert upload.reclaimed_at is None
+
+    # 发送路径（`_save_user_message`）的判据：再次消费命中 0 行是正常的——行已经是
+    # consumed，不再是 pending；关键是墓碑分类为空，因此按「老键」形态照常放行，
+    # 同一批 object_key 可以立即随重发消息落库，不会被判死。
+    assert crud_chat.confirm_attachment_uploads(api.db, [ATTACHMENT_KEY], api.alice.id) == 0
+    assert crud_chat.list_blocked_attachment_uploads(api.db, [ATTACHMENT_KEY]) == []
+
+
+def test_keep_attachments_tombstones_other_messages_in_the_truncated_tail(api, monkeypatch):
+    """保留目标消息的附件，不等于保留同一截断范围里其它消息的附件。
+
+    编辑 A 只重发 A 的 img-A；尾巴里的 B 及其 img-B 永远不会被重发，若也跳过墓碑，
+    img-B 会既不在墓碑、也不在 pending、也没有消息引用——永久泄漏（#253 返修）。
+    """
+    _add_conversation(api, "conv-keep-tail-attachments")
+    first_user = _add_message(
+        api,
+        "conv-keep-tail-attachments",
+        "user",
+        "第一问（被编辑）",
+        attachments=[{"object_key": ATTACHMENT_KEY, "name": "a.png"}],
+    )
+    first_answer = _add_message(api, "conv-keep-tail-attachments", "assistant", "第一答")
+    second_user = _add_message(
+        api,
+        "conv-keep-tail-attachments",
+        "user",
+        "第二问（随截断删除）",
+        attachments=[{"object_key": LATER_ATTACHMENT_KEY, "name": "b.png"}],
+    )
+    second_answer = _add_message(api, "conv-keep-tail-attachments", "assistant", "第二答")
+
+    _register_consumed_upload(api, ATTACHMENT_KEY)
+    _register_consumed_upload(api, LATER_ATTACHMENT_KEY)
+    api.db.expunge_all()
+    kept_before = (
+        api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    )
+    consumed_at = kept_before.consumed_at
+    created_at = kept_before.created_at
+    assert consumed_at is not None
+
+    calls = _forbid_oss_path(monkeypatch)
+    response = _delete(api, first_user, keep_attachments="true")
+
+    assert response.status_code == 200
+    assert response.json()["deleted_message_ids"] == [
+        first_user,
+        first_answer,
+        second_user,
+        second_answer,
+    ]
+    assert calls == [], "请求路径调用了 OSS 删除"
+
+    api.db.expunge_all()
+    kept = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    # 目标消息的附件行完全不动，重发不会被拒签。
+    assert kept.user_id == api.alice.id
+    assert kept.created_at == created_at
+    assert kept.consumed_at == consumed_at
+    assert kept.claimed_at is None
+    assert kept.reclaimed_at is None
+    assert crud_chat.confirm_attachment_uploads(api.db, [ATTACHMENT_KEY], api.alice.id) == 0
+    assert crud_chat.list_blocked_attachment_uploads(api.db, [ATTACHMENT_KEY]) == []
+
+    later = api.db.query(ChatAttachmentUpload).filter_by(object_key=LATER_ATTACHMENT_KEY).one()
+    # 截断尾巴里其它消息的附件：按默认路径转成墓碑，交给既有清扫回收。
+    assert later.user_id == api.alice.id
+    assert later.consumed_at is None
+    assert later.claimed_at is not None
+    assert later.reclaimed_at is not None
+    assert later.claimed_at == later.reclaimed_at
+    assert crud_chat.list_blocked_attachment_uploads(api.db, [LATER_ATTACHMENT_KEY]) == [
+        LATER_ATTACHMENT_KEY
+    ]
+
+
+def test_keep_attachments_tombstones_tail_attachments_when_target_has_none(api):
+    _add_conversation(api, "conv-keep-no-target-attachments")
+    target = _add_message(api, "conv-keep-no-target-attachments", "user", "无附件提问")
+    _add_message(api, "conv-keep-no-target-attachments", "assistant", "回答")
+    _add_message(
+        api,
+        "conv-keep-no-target-attachments",
+        "user",
+        "后续带图提问",
+        attachments=[{"object_key": LATER_ATTACHMENT_KEY}],
+    )
+    _register_consumed_upload(api, LATER_ATTACHMENT_KEY)
+
+    assert _delete(api, target, keep_attachments="true").status_code == 200
+
+    api.db.expunge_all()
+    later = api.db.query(ChatAttachmentUpload).filter_by(object_key=LATER_ATTACHMENT_KEY).one()
+    # 目标消息没有附件可保留，不代表尾部消息的附件也可以漏出回收视野。
+    assert later.consumed_at is None
+    assert later.claimed_at is not None
+    assert later.reclaimed_at is not None
+
+
+def test_keep_attachments_preserves_an_assistant_targets_own_attachment(api):
+    _add_conversation(api, "conv-keep-assistant")
+    _add_message(api, "conv-keep-assistant", "user", "提问")
+    target = _add_message(
+        api,
+        "conv-keep-assistant",
+        "assistant",
+        "带图回答",
+        attachments=[{"object_key": ATTACHMENT_KEY}],
+    )
+    _register_consumed_upload(api, ATTACHMENT_KEY)
+    consumed_at = api.db.query(ChatAttachmentUpload).filter_by(
+        object_key=ATTACHMENT_KEY
+    ).one().consumed_at
+
+    assert _delete(api, target, keep_attachments="true").status_code == 200
+
+    api.db.expunge_all()
+    upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    # 目标不是 user 也保留目标自身的附件；单删不会波及任何其它消息。
+    assert upload.consumed_at == consumed_at
+    assert upload.claimed_at is None
+    assert upload.reclaimed_at is None
+
+
+def test_keep_attachments_applies_existing_memory_summary_rules(api):
+    _add_conversation(api, "conv-keep-memory")
+    _add_message(api, "conv-keep-memory", "user", "问题")
+    target = _add_message(api, "conv-keep-memory", "assistant", "回答")
+    conversation = _reload_conversation(api, "conv-keep-memory")
+    conversation.memory_summary = "这段摘要里含有已删回答"
+    conversation.memory_summary_upto_message_id = target
+    conversation.memory_updated_at = T0
+    api.db.commit()
+
+    assert _delete(api, target, keep_attachments="true").status_code == 200
+
+    conversation = _reload_conversation(api, "conv-keep-memory")
+    # 保留附件不影响记忆规则：覆盖被删区间时照样作废。
+    assert conversation.memory_summary == ""
+    assert conversation.memory_summary_upto_message_id == 0
+    assert conversation.memory_updated_at is None
+
+
+def test_keep_attachments_still_requires_ownership(api):
+    _add_conversation(api, "conv-keep-ownership")
+    target = _add_message(
+        api,
+        "conv-keep-ownership",
+        "user",
+        "别人的带图提问",
+        attachments=[{"object_key": ATTACHMENT_KEY}],
+    )
+    _register_consumed_upload(api)
+
+    api.act_as(api.bob)
+    response = _delete(api, target, keep_attachments="true")
+
+    assert response.status_code == 404
+    assert "别人的带图提问" not in response.text
+
+    api.act_as(api.alice)
+    assert [row["id"] for row in _history(api, "conv-keep-ownership")] == [target]
+    api.db.expunge_all()
+    upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    assert upload.consumed_at is not None
+    assert upload.reclaimed_at is None
+
+
+def test_keep_attachments_only_accepts_boolean(api):
+    _add_conversation(api, "conv-keep-invalid")
+    target = _add_message(api, "conv-keep-invalid", "assistant", "回答")
+
+    assert _delete(api, target, keep_attachments="not-a-bool").status_code == 422
+    # 参数校验失败时消息不能被删。
+    assert [row["id"] for row in _history(api, "conv-keep-invalid")] == [target]
 
 
 # --- 事务失败回滚 -------------------------------------------------------------------
