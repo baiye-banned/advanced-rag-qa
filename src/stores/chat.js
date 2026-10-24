@@ -608,6 +608,8 @@ export const useChatStore = defineStore('chat', () => {
     // 请求期间用户可能切换会话。记住发起时的会话：响应落地后只有「仍停在同一会话」
     // 才能改 messages——否则旧会话的 index 会把新会话的尾部截掉。
     const conversationId = currentId.value
+    // 删之前窗口是否只加载了后段：本地空列表不等于会话为空，服务端前面可能还有历史。
+    const hadMoreMessages = hasMoreMessages.value
 
     await chatAPI.deleteMessage(messageId, options)
 
@@ -631,8 +633,27 @@ export const useChatStore = defineStore('chat', () => {
       }
     }
     if (!messages.value.length) {
-      // 会话被删空时保留当前会话（空态）：清 currentId 会让视图回到「新对话」。
-      hasMoreMessages.value = false
+      if (!hadMoreMessages) {
+        // 删除前就没有更早的消息：现在确实空了。保留当前会话（空态），
+        // 清 currentId 会让视图回到「新对话」。
+        hasMoreMessages.value = false
+      } else {
+        // 本地只加载了后段窗口，被删的是窗口最旧一条：后端会截断到窗口之前，
+        // 那些消息只是没加载、并不是不存在。不要立刻置空态，重新取最新一页——
+        // 此时它正好是截断后的末尾，能看出前面是否还有历史。
+        let refreshed = false
+        try {
+          await refreshMessages(conversationId, { updateHasMore: true })
+          refreshed = true
+        } catch {
+          // 刷新失败：保留 hasMoreMessages（提示由 request.js 拦截器给出），
+          // 不把「加载失败」误判成「会话已空」。
+        }
+        if (refreshed && currentId.value === conversationId && !messages.value.length) {
+          // 服务端也确认没有更早的消息了，才进入真正的空态。
+          hasMoreMessages.value = false
+        }
+      }
     }
     if (!messages.value.some((message) => isPendingRagasStatus(message.ragas_status))) {
       stopEvaluationPolling()
@@ -645,8 +666,10 @@ export const useChatStore = defineStore('chat', () => {
 
   // options.shouldWrite：可选的额外写入条件，用于「收尾刷新」这类需要按请求归属判定的调用方；
   // 默认只按会话归属判定（用户还在该会话就写入），保持既有调用行为不变。
+  // options.updateHasMore：调用方明确知道当前窗口没有本地保留的更早历史时，允许按本次取回的
+  // 行数重算 hasMoreMessages。普通轮询/刷新不传：只取一页，判断不出窗口外还剩多少。
   async function refreshMessages(id = currentId.value, options = {}) {
-    const { shouldWrite = null } = options
+    const { shouldWrite = null, updateHasMore = false } = options
     if (!id) return []
     // 刷新只取最新一页：已翻出的更早历史按 id 拼回列表头部，否则轮询刷新会把用户
     // 翻过的历史截断。取页大小固定为一页，避免每次轮询都把已加载的整段历史搬回来。
@@ -686,8 +709,9 @@ export const useChatStore = defineStore('chat', () => {
     }
     if (currentId.value === id && (!shouldWrite || shouldWrite())) {
       messages.value = mergedMessages
-      if (isCurrent && windowTruncated) {
-        // 窗口刚被重建（视图之前被截断过），从这一页重新开始向前翻。
+      if (isCurrent && (windowTruncated || (updateHasMore && !loadedOlder.length))) {
+        // 窗口刚被重建（视图之前被截断过），或调用方确认本地没有保留更早历史
+        // （如删掉了窗口最旧一条后的重载），从这一页重新开始向前翻。
         hasMoreMessages.value = rows.length > MESSAGE_PAGE_SIZE
       }
       // 其余情况不动 hasMoreMessages：刷新只取固定的一页，判断不出「还有没有更早的」，

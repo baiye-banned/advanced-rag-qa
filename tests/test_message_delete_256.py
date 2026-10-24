@@ -17,6 +17,7 @@
 """
 
 import json
+import logging
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -422,6 +423,51 @@ def test_attachment_owned_by_another_user_is_left_untouched(api):
     assert upload.consumed_at == consumed_at
     assert upload.claimed_at is None
     assert upload.reclaimed_at is None
+
+
+def test_attachment_without_registration_row_is_skipped_not_fabricated(api, monkeypatch, caplog):
+    """没有登记行 = 归属未知：不能替客户端给的键插墓碑。
+
+    `object_key` 来自客户端消息的 attachments（仅形状校验）。若替无行的键插一条墓碑，
+    等于把「删除者」写成上传者，任何合法形状的键都能被自己的消息引用后借服务凭据回收
+    （#233 返修）。代价是历史老对象可能漏回收——宁可泄漏也不伪造归属。
+    """
+    _add_conversation(api, "conv-unknown-attachment")
+    target = _add_message(
+        api,
+        "conv-unknown-attachment",
+        "assistant",
+        "引用了没有登记行的键",
+        attachments=[{"object_key": ATTACHMENT_KEY}],
+    )
+
+    calls = _forbid_oss_path(monkeypatch)
+    with caplog.at_level(logging.WARNING, logger="crud.chat"):
+        response = _delete(api, target)
+
+    assert response.status_code == 200
+    assert response.json()["deleted_message_ids"] == [target]
+    assert calls == [], "请求路径调用了 OSS 删除/回收"
+
+    api.db.expunge_all()
+    # 不插入任何行：既不伪造归属，也不把它塞进 pending/墓碑队列。
+    assert api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).count() == 0
+    assert crud_chat.list_pending_attachment_uploads(
+        api.db, older_than=datetime.now() + timedelta(seconds=1)
+    ) == []
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.name == "crud.chat"
+        and record.levelno == logging.WARNING
+        and ATTACHMENT_KEY in record.getMessage()
+    ]
+    assert warnings, "无登记行的键至少要留下一条 warning"
+    rendered = warnings[0].getMessage()
+    assert "[scope=delete_message_missing_upload_row]" in rendered
+    # 日志只带 scope/object_key，不输出消息正文。
+    assert "引用了没有登记行的键" not in rendered
 
 
 def test_already_reclaimed_attachment_row_is_left_untouched(api):

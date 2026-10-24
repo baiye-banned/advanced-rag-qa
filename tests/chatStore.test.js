@@ -1418,6 +1418,85 @@ test('deleteMessage：删空消息后保留当前会话，进入空态而不是�
   assert.equal(store.hasMoreMessages, false)
 })
 
+test('deleteMessage：删掉窗口最旧一条后重载更早历史，而不是直接进入空态', async () => {
+  const store = createStore([conversation('a')])
+  const all = Array.from({ length: 120 }, (_, index) => {
+    const id = index + 1
+    return roleMessage(id, id % 2 === 1 ? 'user' : 'assistant', `消息 ${id}`)
+  })
+  // 只加载最新一页：窗口是 71..120，前面 1..70 还没取。
+  await openConversation(store, 'a', all)
+  assert.deepEqual([store.messages[0].id, store.messages.at(-1).id], [71, 120])
+  assert.equal(store.hasMoreMessages, true)
+
+  // 删除窗口最旧的一条（user）：后端截断 71..120，但 1..70 仍存在、只是没加载。
+  const deletion = store.deleteMessage(71)
+  await flush()
+  respondDelete(71)
+  await flush()
+
+  // 本地窗口删空不等于会话为空，必须重新取最新一页确认服务端还剩什么。
+  assert.deepEqual(getMessagesCalls, ['a', 'a'], '删空本地窗口后要重载而不是直接进空态')
+  respond('a', all.slice(0, 70))
+  await flush()
+  respondConversations([conversation('a')])
+
+  assert.equal(await deletion, true)
+  // 重载后展示 21..70；1..20 仍在更早历史里，翻页标记必须与后端一致。
+  assert.deepEqual(ids(store), Array.from({ length: 50 }, (_, index) => index + 21))
+  assert.equal(store.hasMoreMessages, true)
+  assert.equal(store.currentId, 'a')
+})
+
+test('deleteMessage：重载后服务端确实没有更早消息时才进入空态', async () => {
+  const store = createStore([conversation('a')])
+  const all = Array.from({ length: 60 }, (_, index) => {
+    const id = index + 1
+    return roleMessage(id, id % 2 === 1 ? 'user' : 'assistant', `消息 ${id}`)
+  })
+  // 窗口是 11..60，标记「还有更早」。
+  await openConversation(store, 'a', all)
+  assert.equal(store.hasMoreMessages, true)
+
+  const deletion = store.deleteMessage(11)
+  await flush()
+  respondDelete(11)
+  await flush()
+
+  // 服务端确认 1..10 也不在了（例如另一个客户端删掉了）。
+  respond('a', [])
+  await flush()
+  respondConversations([conversation('a')])
+
+  assert.equal(await deletion, true)
+  assert.deepEqual(store.messages, [])
+  assert.equal(store.hasMoreMessages, false)
+  assert.equal(store.currentId, 'a', '空态保留当前会话，不回到新对话')
+})
+
+test('deleteMessage：重载失败时保留翻页标记，不把加载失败误判为空会话', async () => {
+  const store = createStore([conversation('a')])
+  const all = Array.from({ length: 60 }, (_, index) => {
+    const id = index + 1
+    return roleMessage(id, id % 2 === 1 ? 'user' : 'assistant', `消息 ${id}`)
+  })
+  await openConversation(store, 'a', all)
+
+  const deletion = store.deleteMessage(11)
+  await flush()
+  respondDelete(11)
+  await flush()
+  respondError('a', new Error('刷新失败'))
+  await flush()
+  respondConversations([conversation('a')])
+
+  assert.equal(await deletion, true)
+  // 删除本身已成功；重载失败时保留「还有更早历史」，由错误提示告知用户，
+  // 不能把一次网络失败当成「会话已空」。
+  assert.deepEqual(store.messages, [])
+  assert.equal(store.hasMoreMessages, true)
+})
+
 test('deleteMessage：没有本地 id 的消息不可删除', async () => {
   const store = createStore([conversation('a')])
   store.setCurrentId('a')
