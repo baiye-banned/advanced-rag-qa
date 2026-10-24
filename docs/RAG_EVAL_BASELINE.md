@@ -166,6 +166,27 @@ python scripts/eval_rag.py --dry-run \
 默认值，逐项与 `current-token` 基线比对，任一处漂移都会失败。二阶段再把 token 切片与
 父子切片、BM25 一起跑同一问题集。
 
+### 4.1 父子切片的启用条件（issue #289）
+
+`PARENT_CHILD_ENABLED` **默认关闭**。当前 #293 只有 phase-1 dry-run，报告里的
+Recall@5 / Recall@20 / MRR@5 / 引用命中全部是 `not_run`，因此没有任何「单层 vs 父子」
+的实测证据。默认开启等于让未验证的检索形态进入生产回答链路。
+
+开启前必须满足：
+
+1. phase 2 接入真实检索与引用输出，用同一问题集、同一 embedding/rerank 配置跑两套
+   切片（`PARENT_CHILD_ENABLED=false` / `true`）；
+2. 父子的 Recall@5、Recall@20、MRR@5、引用命中不劣于单层；任一指标回退则保持关闭；
+3. 报告归档到 `RAG_ops/reports/`，作为开关决策的依据。
+
+关闭时上传与检索完全回到 #287 的单层行为，不产生 parent 行、不做 parent 聚合。
+开启后 `PARENT_CONTEXT_MAX_TOKENS`（默认 6000）是聚合上下文的绝对上限：超限按 parent
+边界从尾部整块丢弃，`trace.parent_child.expanded_tokens` / `truncated` 记录实际用量。
+
+**存量数据**：开启/关闭切换不会自动改变已入库文件的粒度。存量单层文件需要设置
+`REBUILD_KNOWLEDGE_INDEX_ON_STARTUP=true` 重启，或手动重建知识索引，才能统一成父子
+粒度；否则旧文件没有 `parent_id`，检索时按 child 内容降级，新旧粒度会混用。
+
 ## 5. 报告结构
 
 JSON 报告的稳定字段：

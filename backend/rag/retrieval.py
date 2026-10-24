@@ -23,9 +23,10 @@ from config import (
     BM25_MAX_SCORED_CANDIDATES,
     BM25_MAX_TERMS,
     PARENT_CHILD_ENABLED,
+    PARENT_CONTEXT_MAX_TOKENS,
     RETRIEVAL_ROUTE_TOP_K,
 )
-from crud.knowledge_file import strip_extraction_markers
+from crud.knowledge_file import count_chunk_tokens, strip_extraction_markers
 from database.session import SessionLocal
 from model.models import KnowledgeChunkMetadata, KnowledgeFile
 from rag.bm25 import (
@@ -1507,14 +1508,49 @@ def _expand_parent_chunks_sync(
             session.close()
 
 
+def _apply_parent_context_budget(
+    chunks: list[dict], max_tokens: int
+) -> tuple[list[dict], int, int]:
+    """按 parent 边界把聚合后的上下文压到绝对 token 上限以内。
+
+    返回 ``(保留的切片, 保留后的 token 数, 丢弃的切片数)``。只在超限时从尾部整块丢弃：
+    把 parent 从中间截断会丢掉但书/例外，正是父子聚合要保留的内容。至少保留第一个
+    槽位——单个 parent 本身超限时没有更细的边界可退，保留它并在 trace 里标记 truncated。
+    """
+    tokens = [count_chunk_tokens(str(chunk.get("content") or "")) for chunk in chunks]
+    total = sum(tokens)
+    if total <= max_tokens:
+        return chunks, total, 0
+    kept = list(chunks)
+    kept_tokens = total
+    dropped = 0
+    while len(kept) > 1 and kept_tokens > max_tokens:
+        kept_tokens -= tokens[len(kept) - 1]
+        kept.pop()
+        dropped += 1
+    return kept, kept_tokens, dropped
+
+
 async def expand_parent_chunks(
     chunks: list[dict], db: Session | None = None
 ) -> tuple[list[dict], dict]:
     """检索侧父子聚合入口：任何失败都退回 child 内容并写 trace，不抛给聊天链路。"""
     if not PARENT_CHILD_ENABLED:
-        return chunks, {"enabled": False, "status": "disabled", "children": len(chunks)}
+        return chunks, {
+            "enabled": False,
+            "status": "disabled",
+            "children": len(chunks),
+            "expanded_tokens": 0,
+            "truncated": False,
+        }
     if not chunks:
-        return chunks, {"enabled": True, "status": "empty", "children": 0}
+        return chunks, {
+            "enabled": True,
+            "status": "empty",
+            "children": 0,
+            "expanded_tokens": 0,
+            "truncated": False,
+        }
     try:
         expanded, stats = await asyncio.to_thread(_expand_parent_chunks_sync, db, chunks)
     except Exception as exc:
@@ -1529,12 +1565,28 @@ async def expand_parent_chunks(
             "status": "fallback",
             "reason": "metadata_unavailable",
             "children": len(chunks),
+            "expanded_tokens": 0,
+            "truncated": False,
         }
 
     if stats["expanded"]:
         status = "done" if stats["fallback"] == 0 and stats["keyword_unmapped"] == 0 else "partial"
     else:
         status = "fallback"
+
+    if stats["expanded"]:
+        # 只有真的聚合出 parent 时才施加父级上下文上限；纯 child 回退必须保持 #287
+        # 的单层行为，不能因为打开开关而悄悄丢掉候选。
+        expanded, expanded_tokens, dropped = _apply_parent_context_budget(
+            expanded, PARENT_CONTEXT_MAX_TOKENS
+        )
+        stats["truncated"] = dropped > 0
+        stats["dropped"] = dropped
+    else:
+        expanded_tokens = 0
+        stats["truncated"] = False
+    stats["expanded_tokens"] = expanded_tokens
+
     trace = {"enabled": True, "status": status, **stats}
     if status == "fallback":
         if not stats["candidates"]:

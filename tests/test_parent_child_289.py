@@ -10,6 +10,8 @@
 """
 
 import asyncio
+import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +24,8 @@ from sqlalchemy.pool import StaticPool
 from config import CHUNK_TOKEN_LIMIT, CHUNK_TOKEN_SAFETY_RATIO
 from crud import knowledge_file as crud_knowledge_file
 from crud.knowledge_file import (
+    MIN_CHILD_TOKEN_COUNT,
+    _context_prefix,
     build_parent_child_chunks,
     chunk_text,
     count_chunk_tokens,
@@ -31,6 +35,7 @@ from database.session import Base
 from model.models import KnowledgeChunkMetadata, KnowledgeFile, User
 from rag import retrieval
 from service import knowledge_service
+from service.utils_service import _build_sources
 
 
 INSTITUTION_TEXT = """第一章 总则
@@ -56,6 +61,13 @@ LONG_ARTICLE_TEXT = "第五条\n" + "".join(
 @compiles(LONGTEXT, "sqlite")
 def _compile_longtext_as_text(_type, _compiler, **_kwargs):
     return "TEXT"
+
+
+@pytest.fixture(autouse=True)
+def _enable_parent_child(monkeypatch):
+    """本文件验证父子切片本身；#289 的开关默认关闭由 config/部署决定。"""
+    monkeypatch.setattr(retrieval, "PARENT_CHILD_ENABLED", True)
+    monkeypatch.setattr(knowledge_service, "PARENT_CHILD_ENABLED", True)
 
 
 @pytest.fixture()
@@ -336,8 +348,8 @@ def test_context_prefix_is_deterministic_and_budgeted():
         assert prefix.startswith("【文档：考勤制度.txt")
         assert child["text"].startswith(prefix)
         assert count_chunk_tokens(prefix) > 0
-        # 前缀与正文一起受 #287 的同一 token 口径约束。
-        assert count_chunk_tokens(child["text"]) <= target
+        # 前缀与正文一起受 #287 的同一硬上限约束（不是目标值）。
+        assert count_chunk_tokens(child["text"]) <= hard_limit
         assert child["metadata"]["token_count"] == count_chunk_tokens(child["text"])
 
     # 病态超长文件名不能让前缀吃掉正文预算。
@@ -346,6 +358,118 @@ def test_context_prefix_is_deterministic_and_budgeted():
     assert long_children
     assert max(count_chunk_tokens(child["text"]) for child in long_children) <= _hard_limit()
     assert all(child["text"].strip() for child in long_children)
+
+
+def test_base_chunk_near_target_with_prefix_stays_one_child():
+    """接近 target 的切片加上前缀后仍在硬上限内，不能被误切成两片。"""
+    target, hard_limit, _overlap = resolve_chunk_token_budget()
+    metadata = {
+        "section_path": "第一章 总则 > 第一条",
+        "article_no": "第一条",
+    }
+    prefix = _context_prefix("考勤制度.txt", metadata, max_tokens=hard_limit // 4)
+    prefix_tokens = count_chunk_tokens(prefix)
+    # 短句让正文能贴近上限，覆盖「旧 target 预算会切、新硬上限不切」的区间。
+    sentence = "员工应当遵守考勤要求。"
+    body_lines: list[str] = []
+    # 留出前缀和换行后仍不超过硬上限，但已经超过「target - 前缀」的旧预算。
+    while count_chunk_tokens("\n".join([*body_lines, sentence])) <= hard_limit - prefix_tokens - 8:
+        body_lines.append(sentence)
+    body = "\n".join(body_lines)
+    assert count_chunk_tokens(body) > target - prefix_tokens
+    metadata["token_count"] = count_chunk_tokens(body)
+    base = {
+        "id": "0",
+        "text": f"第一章 总则\n第一条\n{body}",
+        "metadata": metadata,
+    }
+
+    children, _ = build_parent_child_chunks([base], file_name="考勤制度.txt")
+
+    assert len(children) == 1
+    assert children[0]["id"] == "0"
+    assert count_chunk_tokens(children[0]["text"]) <= hard_limit
+    # 旧实现用 target 做正文预算，正文超过 target - 前缀 就会被切成两片；现在保持
+    # 1 个 child，因为完整文本仍在硬上限内。
+    assert count_chunk_tokens(body) > target - prefix_tokens
+    # 正文开头的重复章节/条款标题已被剥掉，只剩前缀里那一份。
+    assert children[0]["text"].count("第一章 总则") == 1
+    body_after_prefix = children[0]["text"][len(prefix):].lstrip("\n")
+    assert not body_after_prefix.startswith("第一章 总则")
+    assert not body_after_prefix.startswith("第一条")
+    assert children[0]["metadata"]["context_prefix"].endswith("】")
+
+
+def test_prefix_deduplication_does_not_double_child_count():
+    base_chunks = chunk_text(INSTITUTION_TEXT, 1)
+    children, parents = build_parent_child_chunks(
+        base_chunks, file_name="考勤制度.txt"
+    )
+
+    assert len(children) == len(base_chunks)
+    assert len(parents) >= 1
+    for base, child in zip(base_chunks, children):
+        assert child["id"] == base["id"]
+        prefix = child["metadata"]["context_prefix"]
+        body_after_prefix = child["text"][len(prefix):].lstrip("\n")
+        section = str(base["metadata"].get("section_path") or "")
+        for heading in section.split(" > "):
+            if heading.strip():
+                assert not body_after_prefix.startswith(heading.strip())
+
+
+def test_split_children_never_produce_tiny_fragments():
+    target, hard_limit, _overlap = resolve_chunk_token_budget()
+    sentence = "员工应当遵守考勤、请假和信息安全要求，由人事部负责解释。"
+    # 刚好超过硬上限：按行/句贪心切分很容易留下十几 token 的尾巴。
+    body_lines: list[str] = []
+    while count_chunk_tokens("\n".join(body_lines)) <= hard_limit + 20:
+        body_lines.append(sentence)
+    body = "\n".join(body_lines)
+    assert count_chunk_tokens(body) > hard_limit
+
+    base = {
+        "id": "0",
+        "text": body,
+        "metadata": {"section_path": "", "article_no": "", "token_count": count_chunk_tokens(body)},
+    }
+    children, _ = build_parent_child_chunks([base], file_name="制度.txt")
+
+    assert len(children) > 1
+    assert all(
+        count_chunk_tokens(child["text"]) >= MIN_CHILD_TOKEN_COUNT for child in children
+    )
+    assert all(count_chunk_tokens(child["text"]) <= hard_limit for child in children)
+
+    # 更长的正文同样不允许出现碎片。
+    long_base = {
+        "id": "1",
+        "text": "\n".join([sentence] * 120),
+        "metadata": {"section_path": "", "article_no": "", "token_count": 0},
+    }
+    long_children, _ = build_parent_child_chunks([long_base], file_name="制度.txt")
+    assert len(long_children) > 1
+    assert all(
+        count_chunk_tokens(child["text"]) >= MIN_CHILD_TOKEN_COUNT
+        for child in long_children
+    )
+
+
+def test_parent_text_strips_chunk_overlap_and_keeps_sentence_count():
+    children, parents = build_parent_child_chunks(
+        chunk_text(LONG_ARTICLE_TEXT, 1), file_name="长条款.txt"
+    )
+
+    assert len(parents) == 1
+    parent_text = parents[0]["text"]
+    sentences = [item for item in re.split(r"(?<=。)", parent_text) if item.strip()]
+    assert len(sentences) == 60
+    # 每项规定在 parent 里恰好出现一次；#287 的重叠若未剥掉，切片边界会重复。
+    for index in range(1, 61):
+        assert parent_text.count(f"第{index}项规定") == 1
+    # parent 仍保留一次标题，且 child 数量大于 parent（长条款被切成多片）。
+    assert parent_text.count("第五条") == 1
+    assert len(children) > len(parents)
 
 
 # ---------------------------------------------------------------------------
@@ -474,3 +598,136 @@ def test_rebuild_indexes_children_and_refreshes_parent_metadata(monkeypatch):
     }
     assert any(chunk["id"].startswith("p:") for chunk in metadata)
     assert all(chunk["metadata"]["parent_id"] for chunk in embedded)
+
+
+# ---------------------------------------------------------------------------
+# 上下文总量预算、关键字窗口隔离与 sources 可选字段
+# ---------------------------------------------------------------------------
+
+
+def _text_with_at_least_tokens(min_tokens: int) -> str:
+    sentence = "该条款规定员工应当遵守考勤、请假和信息安全要求，由人事部负责解释。"
+    text = ""
+    while count_chunk_tokens(text) < min_tokens:
+        text += sentence
+    return text
+
+
+def test_parent_context_is_truncated_at_parent_boundaries(metadata_db, monkeypatch):
+    db = metadata_db.db
+    entry = _create_file(db, name="五个长条款.txt")
+    parent_texts = [_text_with_at_least_tokens(2000) for _ in range(5)]
+    candidates = []
+    for index, parent_text in enumerate(parent_texts):
+        child_id = f"c{index}"
+        parent_id = f"p:{index}"
+        db.add(
+            KnowledgeChunkMetadata(
+                file_id=entry.id,
+                knowledge_base_id=5,
+                chunk_id=child_id,
+                parent_id=parent_id,
+                section_path=f"第{index}条",
+                article_no=f"第{index}条",
+                token_count=count_chunk_tokens(parent_text),
+                metadata_json="{}",
+            )
+        )
+        db.add(
+            KnowledgeChunkMetadata(
+                file_id=entry.id,
+                knowledge_base_id=5,
+                chunk_id=parent_id,
+                section_path=f"第{index}条",
+                article_no=f"第{index}条",
+                token_count=count_chunk_tokens(parent_text),
+                parent_text=parent_text,
+                metadata_json="{}",
+            )
+        )
+        candidates.append(
+            {
+                "id": child_id,
+                "chunk_id": child_id,
+                "file_id": entry.id,
+                "file_name": entry.name,
+                "content": f"child {index}",
+                "route": "planned",
+            }
+        )
+    db.commit()
+
+    monkeypatch.setattr(retrieval, "PARENT_CONTEXT_MAX_TOKENS", 6000)
+    expanded, trace = asyncio.run(retrieval.expand_parent_chunks(candidates, db=db))
+
+    assert trace["status"] == "done"
+    assert trace["truncated"] is True
+    assert trace["expanded_tokens"] <= 6000
+    assert 0 < len(expanded) < 5
+    # 被保留的是前 N 个完整 parent，不是被截成半条的文本。
+    assert [chunk["content"] for chunk in expanded] == parent_texts[: len(expanded)]
+    assert trace["expanded_tokens"] == sum(
+        count_chunk_tokens(chunk["content"]) for chunk in expanded
+    )
+    assert trace["dropped"] == 5 - len(expanded)
+
+
+def test_keyword_window_candidate_is_not_mapped_or_aggregated(metadata_db):
+    db = metadata_db.db
+    entry = _create_file(db, name="长条款.txt", content=LONG_ARTICLE_TEXT)
+    children, parents = build_parent_child_chunks(
+        chunk_text(LONG_ARTICLE_TEXT, entry.id), file_name=entry.name
+    )
+    crud_knowledge_file.replace_chunk_metadata(db, entry.id, 5, [*children, *parents])
+    child_payload = _chunk_payload(children[0], file_id=entry.id)
+    keyword_content = "关键词窗口的正文，绝不进入 trace，也不能被聚合成 parent。"
+    keyword_payload = {
+        "id": children[0]["id"],
+        "chunk_id": children[0]["id"],
+        "file_id": entry.id,
+        "file_name": entry.name,
+        "content": keyword_content,
+        "route": "keyword",
+    }
+
+    expanded, trace = asyncio.run(
+        retrieval.expand_parent_chunks([child_payload, keyword_payload], db=db)
+    )
+
+    assert trace["keyword_unmapped"] == 1
+    assert trace["status"] == "partial"
+    assert trace["expanded"] == 1
+    assert len(expanded) == 2
+    returned_keyword = next(chunk for chunk in expanded if chunk["route"] == "keyword")
+    assert returned_keyword == keyword_payload
+    serialized_trace = json.dumps(trace, ensure_ascii=False)
+    assert keyword_content not in serialized_trace
+    assert parents[0]["text"] not in serialized_trace
+
+
+def test_build_sources_parent_fields_are_optional():
+    plain = {
+        "file_id": 3,
+        "file_name": "制度.txt",
+        "chunk_id": "0",
+        "route": "planned",
+        "content": "普通单层切片正文。",
+    }
+    plain_source = _build_sources([plain])[0]
+    assert "parent_id" not in plain_source
+    assert "parent_section_path" not in plain_source
+    assert "parent_article_no" not in plain_source
+    assert "parent_expanded" not in plain_source
+
+    expanded = {
+        **plain,
+        "parent_id": "p:0",
+        "parent_section_path": "第一章 总则 > 第一条",
+        "parent_article_no": "第一条",
+        "parent_expanded": True,
+    }
+    expanded_source = _build_sources([expanded])[0]
+    assert expanded_source["parent_id"] == "p:0"
+    assert expanded_source["parent_section_path"] == "第一章 总则 > 第一条"
+    assert expanded_source["parent_article_no"] == "第一条"
+    assert expanded_source["parent_expanded"] is True
