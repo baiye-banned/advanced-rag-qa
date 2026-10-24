@@ -186,7 +186,7 @@
                     resize="none"
                     data-testid="edit-message-input"
                     @keydown.enter="handleEditEnter($event, message)"
-                    @keydown.esc.prevent="cancelEdit"
+                    @keydown.esc="handleEditEsc"
                     @blur="handleEditBlur"
                   />
                   <div class="flex items-center justify-end gap-2">
@@ -203,7 +203,7 @@
                       type="button"
                       class="rounded bg-white px-2 py-0.5 text-xs font-medium text-brand-700 transition-colors hover:bg-brand-50 disabled:cursor-not-allowed disabled:opacity-60"
                       data-testid="submit-edit-message"
-                      :disabled="editSubmitting"
+                      :disabled="editSubmitting || chatStore.streaming"
                       @mousedown.prevent
                       @click="submitEdit(message)"
                     >
@@ -640,6 +640,9 @@ const editingMessageId = ref(null)
 const editingContent = ref('')
 const editInputRef = ref(null)
 const editSubmitting = ref(false)
+// 提交代际：DELETE 在途时用户可能取消或开始编辑另一条消息。
+// 每次进入/退出编辑都递增，响应落地后据此判断这次提交是否还属于当前编辑。
+let editSubmitToken = 0
 
 const isCurrentConversationStreaming = computed(() => {
   if (!chatStore.streaming) return false
@@ -874,6 +877,7 @@ function isEditingMessage(message) {
 function startEdit(message) {
   if (!message?.id || chatStore.streaming || editSubmitting.value) return
 
+  editSubmitToken += 1
   editingMessageId.value = message.id
   editingContent.value = message.content || ''
   nextTick(() => {
@@ -883,9 +887,17 @@ function startEdit(message) {
 }
 
 function cancelEdit() {
+  editSubmitToken += 1
   editingMessageId.value = null
   editingContent.value = ''
   editInputRef.value = null
+}
+
+function handleEditEsc(event) {
+  // 输入法用 Esc 关闭候选窗时不能当成取消编辑，也不能吃掉这次按键。
+  if (isImeComposing(event)) return
+  event.preventDefault()
+  cancelEdit()
 }
 
 function handleEditBlur() {
@@ -902,7 +914,12 @@ function handleEditEnter(event, message) {
 }
 
 async function submitEdit(message) {
-  if (editSubmitting.value || chatStore.streaming) return
+  if (editSubmitting.value) return
+  if (chatStore.streaming) {
+    // 不能静默返回：按钮此时也处于禁用态，用户需要知道为什么提交没生效。
+    ElMessage.warning('正在生成回答，暂不能编辑')
+    return
+  }
   if (!message?.id || !isEditingMessage(message)) return
 
   const nextContent = editingContent.value.trim()
@@ -916,6 +933,8 @@ async function submitEdit(message) {
   const conversationId = chatStore.currentId
   const originalAttachments = [...(message.attachments || [])]
   editSubmitting.value = true
+  // 发起 DELETE 前记下代际：等待期间取消/转去编辑别的消息都会让它失效。
+  const token = ++editSubmitToken
   try {
     // 先由后端截断这条提问及其后的回答，再重发，刷新后才不会把旧回答带回来。
     // 保留附件登记：紧接着重发的是同一批 object_key，不能被当成回收候选。
@@ -924,9 +943,16 @@ async function submitEdit(message) {
       ElMessage.warning('正在生成回答，暂不能编辑')
       return
     }
+    // 服务端可能已经截断了，此时用户却取消了这次编辑：不能静默丢下这个结果，
+    // 否则用户既没收到新问题，也不知道旧问答已经没了。
+    if (token !== editSubmitToken) {
+      ElMessage.warning('编辑已提交，原消息已截断；新内容未发送')
+      return
+    }
     // 删除在途时用户可能切走了：别把新问题发进另一个会话。
     if (chatStore.currentId !== conversationId) {
       cancelEdit()
+      ElMessage.warning('编辑已提交，原消息已截断；新内容未发送')
       return
     }
     cancelEdit()
@@ -955,7 +981,8 @@ function onFeedback(message, value) {
 }
 
 async function onDeleteMessage(message) {
-  if (!message.id || chatStore.streaming) return
+  // 编辑提交在途时复用同一条截断 DELETE：再发一次会 404，或把列表截断两次。
+  if (!message.id || chatStore.streaming || editSubmitting.value) return
 
   const isQuestion = message.role === 'user'
   try {
@@ -987,7 +1014,7 @@ async function onDeleteMessage(message) {
 }
 
 async function regenerate(index) {
-  if (chatStore.streaming) return
+  if (chatStore.streaming || editSubmitting.value) return
 
   const messages = chatStore.messages
   const previousUserMessage = [...messages]
