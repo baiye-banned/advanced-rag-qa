@@ -90,6 +90,16 @@ def _chunk_finish_reason(chunk: Any) -> str:
     return ""
 
 
+def _message_finish_reason(message: Any) -> str | None:
+    """从非流式响应里取 finish_reason；没有该元数据时返回 None。"""
+    metadata = getattr(message, "response_metadata", None)
+    if isinstance(metadata, dict):
+        reason = metadata.get("finish_reason")
+        if reason:
+            return str(reason)
+    return None
+
+
 def _is_content_filter_chunk(chunk: Any) -> bool:
     """流式 chunk 的终态是否由内容过滤触发。
 
@@ -181,13 +191,23 @@ def get_text_fallback_model(*, streaming: bool = False, temperature: float = 0.1
     return ChatOpenAI(**kwargs)
 
 
-async def call_chat_text(system_prompt: str, user_prompt: str, *, max_tokens: int = 900) -> str:
+async def call_chat_text_with_metadata(
+    system_prompt: str, user_prompt: str, *, max_tokens: int = 900
+) -> tuple[str, str | None]:
+    """返回文本与 finish_reason，供调用方识别被 token 上限截断的输出。"""
     model = get_deepseek_model(streaming=False, temperature=0.1, max_tokens=max_tokens)
     message = await model.ainvoke([
         ("system", system_prompt),
         ("user", user_prompt),
     ])
-    return _message_text(message.content)
+    return _message_text(message.content), _message_finish_reason(message)
+
+
+async def call_chat_text(system_prompt: str, user_prompt: str, *, max_tokens: int = 900) -> str:
+    content, _ = await call_chat_text_with_metadata(
+        system_prompt, user_prompt, max_tokens=max_tokens
+    )
+    return content
 
 
 async def call_chat_json(system_prompt: str, user_prompt: str, *, max_tokens: int = 800) -> dict:
