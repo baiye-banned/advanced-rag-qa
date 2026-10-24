@@ -5,14 +5,17 @@ from typing import TYPE_CHECKING
 
 from config import (
     DEEPSEEK_API_KEY,
+    DEEPSEEK_MODEL,
     MEMORY_RECENT_MAX_CHARS,
+    MEMORY_RECENT_MAX_TOKENS,
     MEMORY_SUMMARY_MAX_CHARS,
+    MEMORY_SUMMARY_MAX_TOKENS,
     MEMORY_WINDOW_TURNS,
 )
 from database.session import SessionLocal
 from model.models import Conversation, Message
 from rag.learning_trace import append_trace_event
-from rag.llm import call_chat_text
+from rag.llm import call_chat_text_with_metadata
 from service.utils_service import _clip_text
 
 if TYPE_CHECKING:
@@ -124,7 +127,7 @@ async def _format_recent_memory_messages(messages: list[Message], trace_id: str 
         creates={"transcript": joined_text},
         note="短期记忆超过上限，系统将最近窗口压缩为一条近期记忆。",
     )
-    summary = await _summarize_recent_memory(joined_text)
+    summary = await _summarize_recent_memory(joined_text, trace_id=trace_id)
     if summary:
         compacted = f"近期记忆压缩：\n{summary}"
         await asyncio.to_thread(
@@ -292,7 +295,9 @@ async def _update_memory_summary_from_sliding_window(conversation_id: str, trace
             note="最近窗口发生滑动，系统将滑出窗口的完整问答轮次合并进长期记忆。",
         )
 
-        next_summary = await _summarize_conversation_memory(previous_summary, transcript)
+        next_summary = await _summarize_conversation_memory(
+            previous_summary, transcript, trace_id=trace_id
+        )
         if not next_summary:
             next_summary = _fallback_merge_summary(previous_summary, transcript)
             await asyncio.to_thread(
@@ -373,7 +378,7 @@ async def _compact_summary_if_needed(conversation_id: str, trace_id: str | None 
         creates={"transcript": summary},
         note="长期记忆超过上限，系统将对已有摘要再做一次压缩。",
     )
-    next_summary = await _summarize_conversation_memory("", summary)
+    next_summary = await _summarize_conversation_memory("", summary, trace_id=trace_id)
     if not next_summary:
         trimmed = _clip_text(summary, MEMORY_SUMMARY_MAX_CHARS)
         await asyncio.to_thread(_write_memory_summary_text, conversation_id, trimmed)
@@ -467,7 +472,7 @@ def _fallback_compact_recent_memory(rendered_turns: list[str]) -> str:
     return _clip_text(prefix + "\n".join(compacted_turns), MEMORY_RECENT_MAX_CHARS)
 
 
-async def _summarize_recent_memory(transcript: str) -> str:
+async def _summarize_recent_memory(transcript: str, trace_id: str | None = None) -> str:
     if not DEEPSEEK_API_KEY:
         logger.warning("Skip recent memory compaction because DeepSeek API Key is not configured")
         return ""
@@ -478,19 +483,42 @@ async def _summarize_recent_memory(transcript: str) -> str:
         "不要逐字复述长文本，不要编造未确认事实，不要输出 Markdown 标题。"
     )
     user_prompt = (
-        f"压缩长度上限：{MEMORY_RECENT_MAX_CHARS} 字。\n\n"
+        f"压缩长度上限：{MEMORY_RECENT_MAX_TOKENS} token。\n\n"
         f"最近窗口原文：\n{transcript}\n\n"
         "请输出一条压缩后的近期记忆："
     )
     try:
-        content = await call_chat_text(system_prompt, user_prompt, max_tokens=900)
+        content, finish_reason = await call_chat_text_with_metadata(
+            system_prompt, user_prompt, max_tokens=MEMORY_RECENT_MAX_TOKENS
+        )
+        if finish_reason == "length":
+            logger.warning(
+                "Recent memory compaction truncated: model=%s max_tokens=%s",
+                DEEPSEEK_MODEL,
+                MEMORY_RECENT_MAX_TOKENS,
+            )
+            await asyncio.to_thread(
+                append_trace_event,
+                trace_id,
+                "recent_memory_compaction_truncated",
+                "_summarize_recent_memory",
+                result={
+                    "finish_reason": finish_reason,
+                    "max_tokens": MEMORY_RECENT_MAX_TOKENS,
+                    "output_length": len(content),
+                },
+                note="近期记忆压缩被 token 上限截断，系统拒绝该结果并改用确定性兜底。",
+            )
+            return ""
         return _clip_text(content.strip(), MEMORY_RECENT_MAX_CHARS)
     except Exception as exc:
         logger.warning("Recent memory compaction request failed: %s", exc, exc_info=True)
         return ""
 
 
-async def _summarize_conversation_memory(previous_summary: str, transcript: str) -> str:
+async def _summarize_conversation_memory(
+    previous_summary: str, transcript: str, trace_id: str | None = None
+) -> str:
     if not DEEPSEEK_API_KEY:
         logger.warning("Skip memory summary update because DeepSeek API Key is not configured")
         return ""
@@ -502,13 +530,34 @@ async def _summarize_conversation_memory(previous_summary: str, transcript: str)
         "不要保存知识库原文大段内容，不要编造未确认事实，不要输出 Markdown 标题。"
     )
     user_prompt = (
-        f"摘要长度上限：{MEMORY_SUMMARY_MAX_CHARS} 字。\n\n"
+        f"摘要长度上限：{MEMORY_SUMMARY_MAX_TOKENS} token。\n\n"
         f"已有摘要：\n{previous_summary or '（无）'}\n\n"
         f"待合并记忆：\n{transcript}\n\n"
         "请输出合并后的长期记忆："
     )
     try:
-        content = await call_chat_text(system_prompt, user_prompt, max_tokens=900)
+        content, finish_reason = await call_chat_text_with_metadata(
+            system_prompt, user_prompt, max_tokens=MEMORY_SUMMARY_MAX_TOKENS
+        )
+        if finish_reason == "length":
+            logger.warning(
+                "Memory summary truncated: model=%s max_tokens=%s",
+                DEEPSEEK_MODEL,
+                MEMORY_SUMMARY_MAX_TOKENS,
+            )
+            await asyncio.to_thread(
+                append_trace_event,
+                trace_id,
+                "memory_summary_truncated",
+                "_summarize_conversation_memory",
+                result={
+                    "finish_reason": finish_reason,
+                    "max_tokens": MEMORY_SUMMARY_MAX_TOKENS,
+                    "output_length": len(content),
+                },
+                note="长期记忆摘要被 token 上限截断，系统拒绝该结果并改用确定性兜底。",
+            )
+            return ""
         return _clip_text(content.strip(), MEMORY_SUMMARY_MAX_CHARS)
     except Exception as exc:
         logger.warning("Memory summary network request failed: %s", exc, exc_info=True)
