@@ -731,3 +731,163 @@ test('标题检索 S3：加载在途时全选与行选择禁用，结果落地�
     await close(view)
   }
 })
+
+// ---------------------------------------------------------------------------
+// f. 检索上下文与「新建对话」（issue #251 后续）
+// ---------------------------------------------------------------------------
+//
+// 新会话的标题通常是首个问题的前 30 个字，几乎不可能命中上一次的检索词。如果
+// 「新建对话」不退出检索上下文，首轮回答结束后 handleStreamDone 会带着旧 q 刷新
+// 列表（src/stores/chat.js），刚出现在侧栏里的新会话当场被滤掉。
+//
+// 这里不跑真实 SSE：收尾刷新那条语句就是 `await fetchConversations()`，用例直接
+// 调同一个 store 方法，断言请求不再带 q、新会话仍留在列表与界面上。
+
+// 「历史对话」标题行里的圆圈按钮：第一个管理模式开关、第二个新建对话。
+function newConversationButton(view) {
+  const buttons = view
+    .queryAll('button')
+    .filter((node) => node.classList.contains('is-circle'))
+  assert.ok(buttons.length >= 2, '标题行应当渲染管理对话与新建对话两个按钮')
+  return buttons[1]
+}
+
+test('标题检索 S4：检索中新建对话退出检索上下文，输入框与后续请求都不再带 q', async () => {
+  const { view, router } = await mountLayout({ conversations: [CONV1, CONV2] })
+
+  try {
+    const { useChatStore } = await import(
+      new URL('../src/stores/chat.js', import.meta.url).href
+    )
+    const chatStore = useChatStore(view.pinia)
+    const searchInput = () => view.query('.conversation-search input')
+
+    // 带 q 只命中 c1；默认列表仍是两条。
+    respond('get', (url, config) => {
+      if (url === '/chat/conversations') {
+        return config?.params?.q ? [CONV1] : [CONV1, CONV2]
+      }
+      if (url === '/user/profile') return PROFILE
+      return {}
+    })
+
+    typeInto(searchInput(), '第一段')
+    const entered = await until(
+      view,
+      () => chatStore.conversationQuery === '第一段' && !chatStore.loading,
+      2000
+    )
+    assert.ok(entered, '前置：输入经过防抖后应当进入检索上下文')
+    assert.doesNotMatch(view.text(), /第二段对话/, '前置：检索结果里不应当有未命中的会话')
+
+    const before = conversationListCalls().length
+    newConversationButton(view).click()
+
+    const cleared = await until(
+      view,
+      () => chatStore.conversationQuery === '' && searchInput()?.value === '',
+      2000
+    )
+    assert.ok(cleared, '新建对话后检索词与输入框都应当清空')
+    await until(view, () => !chatStore.loading, 2000)
+
+    const afterClick = conversationListCalls().slice(before)
+    assert.ok(afterClick.length > 0, '退出检索之后应当重新拉取默认列表')
+    assert.ok(
+      afterClick.every((entry) => entry.args[1].params.q === undefined),
+      '新建对话之后的列表请求不应当再携带检索词'
+    )
+    assert.equal(searchInput().value, '', '搜索框应当随 store 一起清空')
+    assert.equal(router.currentRoute.value.path, '/chat', '新建对话应当回到 /chat')
+
+    const restored = await until(view, () => view.text().includes('第二段对话'), 2000)
+    assert.ok(restored, '退出检索后侧栏应当恢复全部会话')
+    assert.ok(
+      chatStore.conversations.some((conversation) => conversation.id === 'c2'),
+      'store 里的列表也应当恢复默认结果'
+    )
+  } finally {
+    await close(view)
+  }
+})
+
+test('标题检索 S5：新会话首轮回答结束后的列表刷新不带 q，会话仍留在侧栏', async () => {
+  const { view } = await mountLayout({ conversations: [CONV1, CONV2] })
+  const NEW_CONV = {
+    id: 'new',
+    title: '新会话',
+    knowledge_base_id: null,
+    updated_at: '2026-10-24T10:00:00',
+  }
+
+  try {
+    const { useChatStore } = await import(
+      new URL('../src/stores/chat.js', import.meta.url).href
+    )
+    const chatStore = useChatStore(view.pinia)
+    // 服务端是否已经建出这条新会话：流式回答结束时它才会出现在列表里。
+    let created = false
+
+    respond('get', (url, config) => {
+      if (url === '/chat/conversations') {
+        if (config?.params?.q) return [CONV1]
+        return created ? [NEW_CONV, CONV1, CONV2] : [CONV1, CONV2]
+      }
+      if (url === '/user/profile') return PROFILE
+      return {}
+    })
+
+    // 前置：侧栏处于检索上下文。
+    typeInto(view.query('.conversation-search input'), '第一段')
+    const entered = await until(
+      view,
+      () => chatStore.conversationQuery === '第一段' && !chatStore.loading,
+      2000
+    )
+    assert.ok(entered, '前置：检索应当生效')
+
+    newConversationButton(view).click()
+    const exited = await until(
+      view,
+      () => chatStore.conversationQuery === '' && !chatStore.loading,
+      2000
+    )
+    assert.ok(exited, '前置：新建对话应当退出检索上下文')
+
+    // 模拟首轮回答结束：handleStreamDone 的收尾刷新（src/stores/chat.js:447）。
+    created = true
+    const before = conversationListCalls().length
+    await chatStore.fetchConversations()
+    await settle(view)
+
+    const refresh = conversationListCalls().slice(before)
+    assert.equal(refresh.length, 1, '收尾应当刷新一次会话列表')
+    assert.equal(
+      refresh[0].args[1].params.q,
+      undefined,
+      '收尾刷新不应当带旧检索词，否则新会话会被过滤掉'
+    )
+    assert.ok(
+      chatStore.conversations.some((conversation) => conversation.id === 'new'),
+      '新会话应当留在 store 的会话列表里'
+    )
+    const visible = await until(view, () => view.text().includes('新会话'), 2000)
+    assert.ok(visible, '新会话应当留在侧栏上')
+    assert.match(view.text(), /第一段对话/, '默认列表的其余会话同样应当回来')
+  } finally {
+    await close(view)
+  }
+})
+
+test('标题检索 S6：搜索框带 200 字上限，与后端 Query(max_length=200) 对齐', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const input = view.query('.conversation-search input')
+    assert.ok(input, '「历史对话」下方应当渲染标题检索输入框')
+    // jsdom 不实现 maxlength 的截断，只能钉属性本身。
+    assert.equal(input.getAttribute('maxlength'), '200', '搜索框应当带 200 字上限')
+  } finally {
+    await close(view)
+  }
+})
