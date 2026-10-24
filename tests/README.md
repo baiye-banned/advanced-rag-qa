@@ -254,6 +254,7 @@ Current files:
 - `test_empty_extraction_166.py`
 - `test_empty_model_response_259.py`
 - `test_env_example_parity.py`
+- `test_eval_harness_293.py`
 - `test_grounding.py`
 - `test_image_upload_octet_stream_237.py`
 - `test_internal_error_no_echo.py`
@@ -536,7 +537,13 @@ along the real chat-service/chain/LLM path, cover zero chunks and all-empty chun
 empty-prefix success, existing model errors and fallback reset semantics intact. Cancellation,
 direct generator exceptions and pre-generation rejection keep their existing paths; no empty
 assistant is stored, no automatic retry is introduced, and the same conversation accepts the next
-question after the failed stream releases its concurrency slot.
+question after the failed stream releases its concurrency slot. `test_eval_harness_293.py` pins the
+offline RAG evaluation harness (issue #293): the repository fixture loads and validates, the six
+required categories each contribute two cases plus twenty exact-term entries reserved for #288,
+missing fields and duplicate IDs are reported without suppressing the report, external question sets
+stay path-private and warn instead of failing on absent categories, two dry runs are identical apart
+from the timestamp, Recall@5/20 is computed only from explicitly supplied retrieval results, and the
+recorded character-chunk baseline is checked against `chunk_text`'s AST defaults.
 
 `conftest.py` puts `backend/` on `sys.path` so the tests can import application modules, and holds the test doubles shared by more than one test file: the `FakeQuery`/`FakeDb`/`FakeUser`/`FakeKnowledgeBase`/`FakeTraceRecorder` classes, the pytest fixtures built on them (`fake_user`, `fake_db`, `fake_knowledge_base`, `trace_recorder_cls`), and the SSE helpers (`collect_stream`, `parse_sse_frames`, `frames_of_type`, `streamed_content`). Test doubles used by a single file stay in that file.
 

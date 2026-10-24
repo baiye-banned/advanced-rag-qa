@@ -1,0 +1,344 @@
+[
+  {
+    "id": "q001",
+    "question": "员工入职满一年后每年享有几天年假？",
+    "expected_answer": "入职满一年后每年享有 5 天年假。",
+    "evidence": ["《员工休假管理办法》第2章 第1条"],
+    "expected_doc": "员工休假管理办法.md",
+    "expected_sections": ["第2章 第1条"],
+    "category": "single_fact",
+    "answerable": true
+  },
+  {
+    "id": "q002",
+    "question": "公司内部统一使用的审批系统叫什么名称？",
+    "expected_answer": "星桥审批系统。",
+    "evidence": ["《信息化系统使用规范》第1节"],
+    "expected_doc": "信息化系统使用规范.md",
+    "expected_sections": ["第1节"],
+    "category": "single_fact",
+    "answerable": true
+  },
+  {
+    "id": "q003",
+    "question": "报销单据最晚应在费用发生后的多少天内提交？",
+    "expected_answer": "费用发生后 30 个自然日内提交。",
+    "evidence": ["《费用报销管理办法》第4章 第2条"],
+    "expected_doc": "费用报销管理办法.md",
+    "expected_sections": ["第4章 第2条"],
+    "category": "numeric_deadline",
+    "answerable": true
+  },
+  {
+    "id": "q004",
+    "question": "单笔采购金额超过多少元需要提交总经理审批？",
+    "expected_answer": "单笔采购金额超过 50000 元需要提交总经理审批。",
+    "evidence": ["《采购管理办法》第3章 第5条"],
+    "expected_doc": "采购管理办法.md",
+    "expected_sections": ["第3章 第5条"],
+    "category": "numeric_deadline",
+    "answerable": true
+  },
+  {
+    "id": "q005",
+    "question": "员工因公出差期间突发疾病，差旅费用报销与病假认定分别依据哪项制度？",
+    "expected_answer": "差旅费用按《差旅管理办法》报销，病假按《员工休假管理办法》认定。",
+    "evidence": [
+      "《差旅管理办法》第5章 第3条",
+      "《员工休假管理办法》第4章 第2条"
+    ],
+    "expected_doc": ["差旅管理办法.md", "员工休假管理办法.md"],
+    "expected_sections": ["第5章 第3条", "第4章 第2条"],
+    "category": "cross_section",
+    "answerable": true
+  },
+  {
+    "id": "q006",
+    "question": "员工离职时，门禁权限与保密义务分别如何处理？",
+    "expected_answer": "门禁权限在离职当日收回，保密义务在离职后继续有效。",
+    "evidence": [
+      "《门禁与访客管理办法》第3章 第4条",
+      "《商业秘密保护管理办法》第6章 第1条"
+    ],
+    "expected_doc": ["门禁与访客管理办法.md", "商业秘密保护管理办法.md"],
+    "expected_sections": ["第3章 第4条", "第6章 第1条"],
+    "category": "cross_section",
+    "answerable": true
+  },
+  {
+    "id": "q007",
+    "question": "根据住宿标准表，一线城市经理级员工每晚住宿费上限是多少？",
+    "expected_answer": "一线城市经理级员工每晚住宿费上限为 650 元。",
+    "evidence": ["《差旅管理办法》附表1 住宿标准表"],
+    "expected_doc": "差旅管理办法.md",
+    "expected_sections": ["附表1 住宿标准表"],
+    "category": "table",
+    "answerable": true
+  },
+  {
+    "id": "q008",
+    "question": "根据年假天数对照表，工龄满 10 年的员工每年享有多少天年假？",
+    "expected_answer": "工龄满 10 年的员工每年享有 10 天年假。",
+    "evidence": ["《员工休假管理办法》附表2 年假天数对照表"],
+    "expected_doc": "员工休假管理办法.md",
+    "expected_sections": ["附表2 年假天数对照表"],
+    "category": "table",
+    "answerable": true
+  },
+  {
+    "id": "q009",
+    "question": "迟到罚款规定是否适用于因公共交通故障导致的迟到？",
+    "expected_answer": "不适用；经报备并核实后可免除迟到罚款。",
+    "evidence": ["《员工考勤管理办法》第3章 第2条 例外条款"],
+    "expected_doc": "员工考勤管理办法.md",
+    "expected_sections": ["第3章 第2条 例外条款"],
+    "category": "negation_exception",
+    "answerable": true
+  },
+  {
+    "id": "q010",
+    "question": "除经批准的远程办公外，员工能否将涉密文件带回家处理？",
+    "expected_answer": "不可以；涉密文件不得带离办公场所，远程办公也不得处理涉密文件。",
+    "evidence": ["《商业秘密保护管理办法》第4章 第3条 禁止性规定"],
+    "expected_doc": "商业秘密保护管理办法.md",
+    "expected_sections": ["第4章 第3条 禁止性规定"],
+    "category": "negation_exception",
+    "answerable": true
+  },
+  {
+    "id": "q011",
+    "question": "公司 2027 年计划在哪些海外城市设立分公司？",
+    "expected_answer": "知识库中没有相关信息，应明确拒答。",
+    "evidence": [],
+    "category": "unanswerable",
+    "answerable": false
+  },
+  {
+    "id": "q012",
+    "question": "请给出公司生产服务器的 root 登录口令。",
+    "expected_answer": "知识库中没有相关信息，且口令属于敏感凭据，应明确拒答。",
+    "evidence": [],
+    "category": "unanswerable",
+    "answerable": false
+  },
+  {
+    "id": "q101",
+    "question": "制度编号 HR-LEAVE-2024 对应哪项制度？",
+    "expected_answer": "HR-LEAVE-2024 对应《员工休假管理办法》。",
+    "evidence": ["《员工休假管理办法》第1章 第1条"],
+    "expected_doc": "员工休假管理办法.md",
+    "expected_sections": ["第1章 第1条"],
+    "category": "exact_term",
+    "exact_terms": ["HR-LEAVE-2024"],
+    "answerable": true
+  },
+  {
+    "id": "q102",
+    "question": "工单系统报错码 E-4021 表示什么问题？",
+    "expected_answer": "E-4021 表示当前账号权限不足。",
+    "evidence": ["《信息化系统使用规范》第2节 常见错误码"],
+    "expected_doc": "信息化系统使用规范.md",
+    "expected_sections": ["第2节 常见错误码"],
+    "category": "exact_term",
+    "exact_terms": ["E-4021"],
+    "answerable": true
+  },
+  {
+    "id": "q103",
+    "question": "采购申请单模板编号 PUR-FORM-07 的用途是什么？",
+    "expected_answer": "PUR-FORM-07 用于单笔采购申请。",
+    "evidence": ["《采购管理办法》附表1 审批权限表"],
+    "expected_doc": "采购管理办法.md",
+    "expected_sections": ["附表1 审批权限表"],
+    "category": "exact_term",
+    "exact_terms": ["PUR-FORM-07"],
+    "answerable": true
+  },
+  {
+    "id": "q104",
+    "question": "报销时限规则编号 FIN-EXP-30 规定了什么？",
+    "expected_answer": "FIN-EXP-30 规定费用发生后 30 个自然日内提交报销。",
+    "evidence": ["《费用报销管理办法》第4章 第2条"],
+    "expected_doc": "费用报销管理办法.md",
+    "expected_sections": ["第4章 第2条"],
+    "category": "exact_term",
+    "exact_terms": ["FIN-EXP-30"],
+    "answerable": true
+  },
+  {
+    "id": "q105",
+    "question": "固定资产标签前缀 AST-LABEL-03 用于哪类资产？",
+    "expected_answer": "AST-LABEL-03 用于办公电子设备类固定资产。",
+    "evidence": ["《固定资产管理办法》第3章 第2条"],
+    "expected_doc": "固定资产管理办法.md",
+    "expected_sections": ["第3章 第2条"],
+    "category": "exact_term",
+    "exact_terms": ["AST-LABEL-03"],
+    "answerable": true
+  },
+  {
+    "id": "q106",
+    "question": "保密等级代号 SEC-CLASS-B 对应什么级别？",
+    "expected_answer": "SEC-CLASS-B 对应内部受控级别。",
+    "evidence": ["《商业秘密保护管理办法》第2章 第2条"],
+    "expected_doc": "商业秘密保护管理办法.md",
+    "expected_sections": ["第2章 第2条"],
+    "category": "exact_term",
+    "exact_terms": ["SEC-CLASS-B"],
+    "answerable": true
+  },
+  {
+    "id": "q107",
+    "question": "住宿标准代号 TRV-HOTEL-T1 对应哪个城市档位？",
+    "expected_answer": "TRV-HOTEL-T1 对应一线城市档位。",
+    "evidence": ["《差旅管理办法》附表1 住宿标准表"],
+    "expected_doc": "差旅管理办法.md",
+    "expected_sections": ["附表1 住宿标准表"],
+    "category": "exact_term",
+    "exact_terms": ["TRV-HOTEL-T1"],
+    "answerable": true
+  },
+  {
+    "id": "q108",
+    "question": "机房应急处置预案编号 OPS-ICE-05 适用于什么场景？",
+    "expected_answer": "OPS-ICE-05 适用于机房突发断电场景。",
+    "evidence": ["《安全生产管理办法》第5章 第1条"],
+    "expected_doc": "安全生产管理办法.md",
+    "expected_sections": ["第5章 第1条"],
+    "category": "exact_term",
+    "exact_terms": ["OPS-ICE-05"],
+    "answerable": true
+  },
+  {
+    "id": "q109",
+    "question": "使用公司印章时必须在印章使用登记簿上登记哪些事项？",
+    "expected_answer": "必须在印章使用登记簿上登记用印日期、用印人和文件名称。",
+    "evidence": ["《印章管理办法》第2章 第3条"],
+    "expected_doc": "印章管理办法.md",
+    "expected_sections": ["第2章 第3条"],
+    "category": "exact_term",
+    "exact_terms": ["印章使用登记簿"],
+    "answerable": true
+  },
+  {
+    "id": "q110",
+    "question": "员工入职时签署的安全生产责任书包含哪些承诺？",
+    "expected_answer": "安全生产责任书要求员工承诺遵守安全操作规程。",
+    "evidence": ["《安全生产管理办法》第2章 第1条"],
+    "expected_doc": "安全生产管理办法.md",
+    "expected_sections": ["第2章 第1条"],
+    "category": "exact_term",
+    "exact_terms": ["安全生产责任书"],
+    "answerable": true
+  },
+  {
+    "id": "q111",
+    "question": "星桥审批系统的移动端审批权限由哪个部门开通？",
+    "expected_answer": "星桥审批系统的移动端审批权限由信息化部门统一开通。",
+    "evidence": ["《信息化系统使用规范》第1节"],
+    "expected_doc": "信息化系统使用规范.md",
+    "expected_sections": ["第1节"],
+    "category": "exact_term",
+    "exact_terms": ["星桥审批系统"],
+    "answerable": true
+  },
+  {
+    "id": "q112",
+    "question": "临时进入办公区办理的门禁临时通行证有效期是多久？",
+    "expected_answer": "门禁临时通行证仅限当日有效。",
+    "evidence": ["《门禁与访客管理办法》第3章 第4条"],
+    "expected_doc": "门禁与访客管理办法.md",
+    "expected_sections": ["第3章 第4条"],
+    "category": "exact_term",
+    "exact_terms": ["门禁临时通行证"],
+    "answerable": true
+  },
+  {
+    "id": "q113",
+    "question": "中途入职员工的年假折算公式如何计算？",
+    "expected_answer": "按年假折算公式：当年剩余日历天数除以 365 再乘以全年年假天数。",
+    "evidence": ["《员工休假管理办法》第2章 第3条"],
+    "expected_doc": "员工休假管理办法.md",
+    "expected_sections": ["第2章 第3条"],
+    "category": "exact_term",
+    "exact_terms": ["年假折算公式"],
+    "answerable": true
+  },
+  {
+    "id": "q114",
+    "question": "采购前从供应商准入清单中确认合格供应商的要求是什么？",
+    "expected_answer": "采购前必须从供应商准入清单中确认供应商资质在有效期内。",
+    "evidence": ["《采购管理办法》第2章 第4条"],
+    "expected_doc": "采购管理办法.md",
+    "expected_sections": ["第2章 第4条"],
+    "category": "exact_term",
+    "exact_terms": ["供应商准入清单"],
+    "answerable": true
+  },
+  {
+    "id": "q115",
+    "question": "对外合同用印前填写的合同用印申请单需要哪些审批？",
+    "expected_answer": "合同用印申请单需经部门负责人和法务审批。",
+    "evidence": ["《印章管理办法》第3章 第2条"],
+    "expected_doc": "印章管理办法.md",
+    "expected_sections": ["第3章 第2条"],
+    "category": "exact_term",
+    "exact_terms": ["合同用印申请单"],
+    "answerable": true
+  },
+  {
+    "id": "q116",
+    "question": "培训学时认定表由哪个部门负责汇总？",
+    "expected_answer": "培训学时认定表由人力资源部负责汇总。",
+    "evidence": ["《培训管理办法》第4章 第1条"],
+    "expected_doc": "培训管理办法.md",
+    "expected_sections": ["第4章 第1条"],
+    "category": "exact_term",
+    "exact_terms": ["培训学时认定表"],
+    "answerable": true
+  },
+  {
+    "id": "q117",
+    "question": "档案借阅审批单需要注明哪些内容？",
+    "expected_answer": "档案借阅审批单需注明借阅事由、范围和归还日期。",
+    "evidence": ["《档案管理办法》第3章 第2条"],
+    "expected_doc": "档案管理办法.md",
+    "expected_sections": ["第3章 第2条"],
+    "category": "exact_term",
+    "exact_terms": ["档案借阅审批单"],
+    "answerable": true
+  },
+  {
+    "id": "q118",
+    "question": "资产盘点差异表出现盘亏时如何填写？",
+    "expected_answer": "资产盘点差异表需列明盘亏资产编号、原因和处理意见。",
+    "evidence": ["《固定资产管理办法》第4章 第2条"],
+    "expected_doc": "固定资产管理办法.md",
+    "expected_sections": ["第4章 第2条"],
+    "category": "exact_term",
+    "exact_terms": ["资产盘点差异表"],
+    "answerable": true
+  },
+  {
+    "id": "q119",
+    "question": "访客预约二维码在闸机核验失败时如何处理？",
+    "expected_answer": "访客预约二维码核验失败时，由前台人工登记后放行。",
+    "evidence": ["《门禁与访客管理办法》第2章 第2条"],
+    "expected_doc": "门禁与访客管理办法.md",
+    "expected_sections": ["第2章 第2条"],
+    "category": "exact_term",
+    "exact_terms": ["访客预约二维码"],
+    "answerable": true
+  },
+  {
+    "id": "q120",
+    "question": "接触公司商业秘密前签署的保密承诺书有效期多长？",
+    "expected_answer": "保密承诺书在劳动关系存续期间及离职后持续有效。",
+    "evidence": ["《商业秘密保护管理办法》第6章 第2条"],
+    "expected_doc": "商业秘密保护管理办法.md",
+    "expected_sections": ["第6章 第2条"],
+    "category": "exact_term",
+    "exact_terms": ["保密承诺书"],
+    "answerable": true
+  }
+]
