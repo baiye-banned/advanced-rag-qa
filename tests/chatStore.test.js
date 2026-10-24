@@ -196,6 +196,74 @@ test('连续快速切换多个会话，乱序返回后仍只保留最后一个�
   assert.equal(store.loading, false)
 })
 
+test('selectConversation 成功后才提交会话标识与消息', async () => {
+  const store = createStore([conversation('a'), conversation('b')])
+
+  const requestA = store.selectConversation('a')
+  respond('a', [message(1, 'A 的回答')])
+  await requestA
+  assert.equal(store.currentId, 'a')
+
+  const requestB = store.selectConversation('b')
+  // 请求在途期间：加载目标已是 b，但「已选中」的会话仍是 a，
+  // 视图不会出现「标题换了、内容没换」的中间态。
+  assert.equal(store.loadingConversationId, 'b')
+  assert.equal(store.currentId, 'a')
+  assert.deepEqual(contents(store), ['A 的回答'])
+
+  respond('b', [message(2, 'B 的回答')])
+  await requestB
+
+  assert.equal(store.currentId, 'b')
+  assert.deepEqual(contents(store), ['B 的回答'])
+  assert.equal(store.loadingConversationId, null)
+  assert.equal(store.loading, false)
+})
+
+test('selectConversation 失败时保留原会话，并让 Promise 拒绝', async () => {
+  const store = createStore([conversation('a'), conversation('b')])
+
+  const requestA = store.selectConversation('a')
+  respond('a', [message(1, 'A 的回答')])
+  await requestA
+
+  const requestB = store.selectConversation('b')
+  respondError('b', new Error('network down'))
+  await assert.rejects(requestB, /network down/)
+
+  // 失败不得留下「标识是 b、内容是 a」的错位状态：两者都还是 a。
+  assert.equal(store.currentId, 'a')
+  assert.deepEqual(contents(store), ['A 的回答'])
+  assert.equal(store.loadingConversationId, null)
+  assert.equal(store.loading, false)
+})
+
+test('旧加载晚失败时不影响已经接管的新会话', async () => {
+  const store = createStore([conversation('a'), conversation('b'), conversation('c')])
+
+  const requestA = store.selectConversation('a')
+  respond('a', [message(1, 'A 的回答')])
+  await requestA
+
+  const requestB = store.selectConversation('b')
+  const requestC = store.selectConversation('c')
+  respondError('b', new Error('network down'))
+  await assert.rejects(requestB, /network down/)
+
+  // 最新一次加载（c）还没回来：只丢弃 b，不能把 loading 提前复位。
+  assert.equal(store.currentId, 'a')
+  assert.deepEqual(contents(store), ['A 的回答'])
+  assert.equal(store.loadingConversationId, 'c')
+  assert.equal(store.loading, true)
+
+  respond('c', [message(3, 'C 的回答')])
+  await requestC
+
+  assert.equal(store.currentId, 'c')
+  assert.deepEqual(contents(store), ['C 的回答'])
+  assert.equal(store.loading, false)
+})
+
 test('selectConversation 的 loading 只由最新一次加载复位', async () => {
   const store = createStore([conversation('a'), conversation('b')])
 
@@ -254,6 +322,31 @@ test('加载在飞时清空会话，返回后不得把旧消息写回当前视�
   assert.equal(store.currentId, null)
   assert.deepEqual(contents(store), [])
   assert.equal(store.loading, false)
+})
+
+test('加载在飞时流认领了新会话，迟到的加载不得覆盖它和刚发出的提问', async () => {
+  const store = createStore([conversation('a')])
+  assert.equal(store.currentId, null)
+
+  // 深链进入 /chat/a：消息加载在飞，currentId 仍为空。
+  const requestA = store.selectConversation('a')
+  assert.equal(store.loadingConversationId, 'a')
+  assert.equal(store.currentId, null)
+
+  // 加载还没返回，用户就发起了提问：流为新会话 c9 投递 conversation 事件并认领它。
+  store.sendMessage('在途时提问')
+  const stream = streams.at(-1)
+  stream.onMessage('', { type: 'conversation', conversation: conversation('c9') })
+  assert.equal(store.currentId, 'c9')
+
+  // 旧加载这时才返回：只比 seq 的实现会把 currentId 改回 a，并用 a 的历史覆盖新提问。
+  respond('a', [message(1, 'A 的历史回答')])
+  await requestA
+
+  assert.equal(store.currentId, 'c9')
+  assert.deepEqual(contents(store), ['在途时提问'])
+  assert.equal(store.loading, false)
+  assert.equal(store.loadingConversationId, null)
 })
 
 test('被新流式请求取代的旧回调不再写入状态', async () => {

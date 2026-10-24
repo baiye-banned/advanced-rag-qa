@@ -283,8 +283,9 @@ function newConversation() {
 
 function selectConversation(id) {
   chatStore.exitHistoryManageMode()
+  // 只负责导航：消息加载由 Chat.vue 的路由 watcher 统一处理，
+  // 两处各发一次请求会让「失败回滚」拿到两份互相追逐的结果。
   router.push(`/chat/${id}`)
-  chatStore.selectConversation(id)
 }
 
 function handleConversationClick(id) {
