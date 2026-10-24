@@ -35,6 +35,11 @@ EMPTY_EXTRACTED_TEXT_MESSAGE = "未从文件中提取到任何文本，可能是
 # 在预览里是一片空白，用户连「这份文件没抽出内容」都看不到（issue #166）。
 _EMPTY_CONTENT_HINT_EXTENSIONS = (".docx", ".pdf", ".txt", ".md")
 
+# DOCX 文档顺序抽取时，两张相邻表格之间没有段落隔开，仅靠「连续表格行」分组会把它们
+# 合成同一张表（table_id 相同、row_no 连续、第二张表头被当成普通行）。抽取阶段在表与表
+# 之间插入这条哨兵，切片阶段据此断表；哨兵本身绝不进入切片文本。
+_TABLE_BOUNDARY = "\x00__RAG_TABLE_BOUNDARY__\x00"
+
 
 def serialize_knowledge_file(file_entry: KnowledgeFile) -> dict:
     return {
@@ -151,20 +156,51 @@ def extract_file_text(filename: str, content: bytes) -> str:
     raise HTTPException(400, KNOWLEDGE_UPLOAD_TYPE_ERROR_MESSAGE)
 
 
+def _iter_docx_blocks(document):
+    """按 ``document.element.body`` 的文档顺序产出段落与表格。
+
+    ``document.paragraphs`` / ``document.tables`` 是两个独立列表：先写完全部段落再追加
+    全部表格会丢失两者在原文里的先后关系，表格行于是被挂到最后一个小节下，且相邻表格
+    无法区分（issue #287）。
+    """
+    from docx.oxml.ns import qn
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    for child in document.element.body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, document)
+        elif child.tag == qn("w:tbl"):
+            yield Table(child, document)
+
+
 def extract_docx_text(content: bytes) -> str:
     from docx import Document
+    from docx.table import Table
 
     try:
         document = Document(BytesIO(content))
     except Exception as exc:
         raise HTTPException(400, _internal_error_detail(DOCX_PARSE_FAILED_MESSAGE, "docx_parse", exc))
-    parts = [p.text.strip() for p in document.paragraphs if p.text.strip()]
 
-    for table in document.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-            if cells:
-                parts.append(" | ".join(cells))
+    parts: list[str] = []
+    seen_table = False
+    for block in _iter_docx_blocks(document):
+        if isinstance(block, Table):
+            # 每两张表之间都放边界：相邻表格之间可能只隔着空段落，而空段落在抽取结果里
+            # 没有任何行，仅靠「连续表格行」无法区分两张表。表之间已隔着正文时哨兵也
+            # 只是多一次无害的断表。
+            if seen_table:
+                parts.append(_TABLE_BOUNDARY)
+            seen_table = True
+            for row in block.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+            continue
+        text = block.text.strip()
+        if text:
+            parts.append(text)
 
     return "\n".join(parts)
 
@@ -306,7 +342,8 @@ def resolve_chunk_token_budget() -> tuple[int, int, int]:
     """
     hard_limit = max(1, int(CHUNK_TOKEN_LIMIT * CHUNK_TOKEN_SAFETY_RATIO))
     target = min(max(1, CHUNK_TOKEN_TARGET), hard_limit)
-    overlap = min(max(0, CHUNK_TOKEN_OVERLAP), target)
+    # overlap 必须严格小于 target：允许相等时每一片都会带上上一片全文。
+    overlap = min(max(0, CHUNK_TOKEN_OVERLAP), max(0, target - 1))
     return target, hard_limit, overlap
 
 
@@ -319,37 +356,88 @@ def _hard_split_by_chars(text: str, max_units: int) -> list[str]:
     return pieces
 
 
+def _decode_token_slice(encoding, token_ids: list[int]) -> str | None:
+    """解码一段 token；切点落在多字节字符中间时返回 ``None``。
+
+    tiktoken 的默认 ``decode`` 用 ``errors="replace"``：BPE token 是字节序列，切片
+    可能刚好切断一个 UTF-8 字符，结果里就会多出 U+FFFD。硬切不能这样改写正文，所以
+    这里用 strict 解码，让调用方把切点退回字符边界（issue #287）。
+    """
+    try:
+        value = encoding.decode(token_ids, errors="strict")
+    except UnicodeDecodeError:
+        return None
+    return None if "�" in value else value
+
+
 def _hard_split_by_tokens(text: str, max_tokens: int) -> list[str]:
+    """按 token 预算硬切，但不改写正文。
+
+    切点必须落在 UTF-8 字符边界上：先按预算取 token，解码失败就逐个回退 token，直到
+    得到一段严格可解码的文本。所有片段按原顺序拼接后与输入逐字一致（不 strip，避免
+    把原文里的空白也改掉）。多字节字符恰好跨越预算时，宁可让该片段多一个 token，也
+    不产生 U+FFFD——正文正确性优先于硬上限的那一个 token。
+    """
     encoding = _get_chunk_token_encoding()
     if encoding is None:
         return _hard_split_by_bytes(text, max_tokens)
     token_ids = encoding.encode(text, disallowed_special=())
-    pieces = []
-    for start in range(0, len(token_ids), max_tokens):
-        piece = encoding.decode(token_ids[start : start + max_tokens]).strip()
+    if not token_ids:
+        return []
+
+    pieces: list[str] = []
+    start = 0
+    total = len(token_ids)
+    while start < total:
+        end = min(start + max_tokens, total)
+        piece = None
+        while end > start:
+            piece = _decode_token_slice(encoding, token_ids[start:end])
+            if piece is not None:
+                break
+            end -= 1
+        if piece is None:
+            # 预算小到连一个完整字符都装不下：向后扩展到最近的字符边界。
+            end = min(start + max_tokens, total)
+            while end < total:
+                end += 1
+                piece = _decode_token_slice(encoding, token_ids[start:end])
+                if piece is not None:
+                    break
+            if piece is None:
+                # token 序列本身无法解码：保持正文不丢，留一条 warning 而不是静默替换。
+                piece = encoding.decode(token_ids[start:total])
+                logger.warning(
+                    "Hard split could not find a UTF-8 boundary; keeping the remaining text: "
+                    "start_token=%s total_tokens=%s",
+                    start,
+                    total,
+                )
+                end = total
         if piece:
             pieces.append(piece)
+        start = end
     return pieces
 
 
 def _hard_split_by_bytes(text: str, max_bytes: int) -> list[str]:
-    """tokenizer 不可用时的保守硬切：按 UTF-8 字节预算切，不再假装字符即 token。"""
+    """tokenizer 不可用时的保守硬切：按 UTF-8 字节预算切，不再假装字符即 token。
+
+    逐字符累加保证切点永远在字符边界上；返回片段不 strip，拼接后与输入完全一致。
+    """
     pieces = []
     buffer = []
     used = 0
     for char in text:
         char_bytes = len(char.encode("utf-8"))
         if buffer and used + char_bytes > max_bytes:
-            piece = "".join(buffer).strip()
-            if piece:
-                pieces.append(piece)
+            pieces.append("".join(buffer))
             buffer = []
             used = 0
         buffer.append(char)
         used += char_bytes
-    tail = "".join(buffer).strip()
-    if tail:
-        pieces.append(tail)
+    if buffer:
+        pieces.append("".join(buffer))
     return pieces
 
 
@@ -373,12 +461,20 @@ def _chunk_unit(text: str, kind: str, *, level: int | None = None) -> dict:
 
 
 def _assign_table_positions(units: list[dict]) -> None:
-    """按连续表格行分组，写入 table_id / row_no；首行标记为表头。"""
+    """按连续表格行分组，写入 table_id / row_no；每张表首行标记为表头。
+
+    ``table_break`` 是 DOCX 抽取时插在两张表之间的哨兵：它强制开启新表，使相邻表格
+    不会因为行在文本里连续而共用 ``table_id`` 或让 ``row_no`` 继续累加。
+    """
     table_id = 0
     row_no = 0
     in_table = False
     for unit in units:
-        if unit["kind"] == "table":
+        kind = unit["kind"]
+        if kind == "table_break":
+            in_table = False
+            continue
+        if kind == "table":
             if not in_table:
                 table_id += 1
                 row_no = 0
@@ -386,7 +482,7 @@ def _assign_table_positions(units: list[dict]) -> None:
             unit["table_id"] = table_id
             unit["row_no"] = row_no
             unit["is_table_header"] = row_no == 1
-        in_table = unit["kind"] == "table"
+        in_table = kind == "table"
 
 
 _ARTICLE_NO_RE = re.compile(rf"^第[{_CHINESE_NUMERAL}0-9]+\s*条")
@@ -581,10 +677,12 @@ def _semantic_units(
     max_len: int,
     measure=len,
     hard_split=None,
+    warn_oversized=None,
 ) -> list[dict]:
     """把一段文本拆成标题/正文/表格行单元，并附带结构信息。
 
     表格行是原子单元：既不并入相邻正文，也不在超限时拆单元格（只记 warning）。
+    ``warn_oversized`` 由调用方传入时用于按文件限流，避免同一份文档每行一条告警。
     """
     lines = [_normalize_line(line) for line in block.split("\n") if _normalize_line(line)]
     if not lines:
@@ -602,16 +700,27 @@ def _semantic_units(
             units.append(_chunk_unit(piece, "body"))
         body_buffer = []
 
+    def warn_table_oversized(line: str) -> None:
+        if warn_oversized is not None:
+            warn_oversized(measure(line), max_len, line)
+            return
+        logger.warning(
+            "Table row exceeds the chunk budget; keeping it atomic: size=%s limit=%s text=%r",
+            measure(line),
+            max_len,
+            line[:80],
+        )
+
     for line in lines:
+        if line == _TABLE_BOUNDARY:
+            # 表格边界是结构信号，不是正文：断掉当前正文，并给表分组一个明确的分隔单元。
+            flush_body()
+            units.append(_chunk_unit("", "table_break"))
+            continue
         if _is_table_row(line):
             flush_body()
             if measure(line) > max_len:
-                logger.warning(
-                    "Table row exceeds the chunk budget; keeping it atomic: size=%s limit=%s text=%r",
-                    measure(line),
-                    max_len,
-                    line[:80],
-                )
+                warn_table_oversized(line)
             units.append(_chunk_unit(line, "table"))
             continue
         level = _heading_level(line)
@@ -636,8 +745,19 @@ def _content_measure(lines: list[str], measure=len) -> int:
     return measure("\n".join(line for line in lines if line).strip())
 
 
-def _overlap_units(body_units: list[dict], max_units: int, measure=len) -> list[dict]:
-    """取上一片末尾最多两条正文行做重叠，预算单位与切片路径一致。"""
+def _overlap_units(
+    body_units: list[dict],
+    max_units: int,
+    measure=len,
+    *,
+    enforce_single_budget: bool = False,
+) -> list[dict]:
+    """取上一片末尾最多两条正文行做重叠，预算单位与切片路径一致。
+
+    ``enforce_single_budget`` 只由 token 路径开启：token 路径下一个正文单元可能接近
+    硬上限，若把整块塞进 ``pending_overlap``，下一片会翻倍超限。字符路径保留 develop
+    的语义——预算为空时允许一条超预算单元进入重叠，否则无标点长句永远没有重叠。
+    """
     if max_units <= 0:
         return []
 
@@ -647,12 +767,10 @@ def _overlap_units(body_units: list[dict], max_units: int, measure=len) -> list[
         text = unit.get("text") or ""
         # 标题不是正文；表格行也不做重叠——整行重复既没有上下文收益，还会让下一片
         # 的 table/row 元数据指向上一片已经出现过的行。
-        if not text or unit.get("kind") in {"heading", "table"}:
+        if not text or unit.get("kind") in {"heading", "table", "table_break"}:
             continue
         candidate_len = measure(text)
-        # 单条比整个重叠预算还大时直接放弃重叠（不硬塞）：token 路径下一个正文单元
-        # 可能接近硬上限，若把整块塞进 pending_overlap，下一片会翻倍超限。
-        if candidate_len > max_units:
+        if enforce_single_budget and candidate_len > max_units:
             break
         if selected and total + candidate_len > max_units:
             break
@@ -701,13 +819,49 @@ def chunk_text(
     enforce_hard = not character_mode
     hard_limit = semantic_limit
 
+    # 超限告警按文件限流：一份文档里几十个超长表格行/正文片不能再刷几十条日志。
+    # 原子表格与硬上限是两类不同的问题，各自最多一条，诊断信息不丢。
+    warned_atomic_table = False
+    warned_hard_limit = False
+
+    def warn_atomic_table(size: int, limit: int, line: str) -> None:
+        nonlocal warned_atomic_table
+        if warned_atomic_table:
+            return
+        warned_atomic_table = True
+        logger.warning(
+            "Table row exceeds the chunk budget; keeping it atomic: size=%s limit=%s text=%r",
+            size,
+            limit,
+            line[:80],
+        )
+
+    def warn_hard_limit(tokens: int) -> None:
+        nonlocal warned_hard_limit
+        if warned_hard_limit:
+            return
+        warned_hard_limit = True
+        logger.warning(
+            "Chunk exceeds the token hard limit; keeping the text intact: "
+            "tokens=%s limit=%s file_id=%s",
+            tokens,
+            hard_limit,
+            file_id,
+        )
+
     normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
     raw_blocks = [block.strip() for block in re.split(r"\n\s*\n+", normalized_text) if block.strip()]
 
     units: list[dict] = []
     for block in raw_blocks:
         units.extend(
-            _semantic_units(block, semantic_limit, measure=measure, hard_split=hard_split)
+            _semantic_units(
+                block,
+                semantic_limit,
+                measure=measure,
+                hard_split=hard_split,
+                warn_oversized=warn_atomic_table,
+            )
         )
     # 表格编号必须按整篇文档的连续行分配：块（空行）边界不打断同一张表。
     _assign_table_positions(units)
@@ -727,6 +881,24 @@ def chunk_text(
         # 层位在重新赋值时清掉（见下方 set），flush 成功时把当时路径里的层位全记上。
         emitted_levels: set[int] = set()
 
+        def emit_chunk(body_units: list[dict]) -> None:
+            """把一组正文单元连同当前标题路径写成一片。"""
+            heading_lines = _heading_lines(heading_path)
+            content_lines = [*heading_lines, *(unit["text"] for unit in body_units if unit["text"])]
+            chunk_text_value = "\n".join(content_lines).strip()
+            if not chunk_text_value:
+                return
+            chunks.append(
+                {
+                    "id": f"{len(chunks)}",
+                    "text": chunk_text_value,
+                    "metadata": _build_chunk_metadata(
+                        chunk_text_value, heading_path, body_units
+                    ),
+                }
+            )
+            emitted_levels.update(heading_path)
+
         def flush_chunk() -> None:
             nonlocal current_body, pending_overlap
             if not current_body:
@@ -738,40 +910,77 @@ def chunk_text(
             # 收回来那一种，而它同时会从 heading_path 里摘掉，不会再当一次前缀；
             # _overlap_units 也会跳过标题行。
             heading_lines = _heading_lines(heading_path)
-            body_units = [*pending_overlap, *current_body]
-            content_lines = [*heading_lines, *(unit["text"] for unit in body_units)]
-
-            chunk_text_value = "\n".join(content_lines).strip()
-            # token 路径的硬上限保护：重叠是「锦上添花」，不能把它顶过硬上限。
-            # 去掉重叠后仍超限时只留 warning——正文不能再丢（超长表格行就是这种形态）。
-            if enforce_hard and chunk_text_value:
-                chunk_tokens = count_chunk_tokens(chunk_text_value)
-                if chunk_tokens > hard_limit and pending_overlap:
-                    body_units = list(current_body)
-                    content_lines = [*heading_lines, *(unit["text"] for unit in body_units)]
-                    chunk_text_value = "\n".join(content_lines).strip()
-                    chunk_tokens = count_chunk_tokens(chunk_text_value)
-                if chunk_tokens > hard_limit:
-                    logger.warning(
-                        "Chunk exceeds the token hard limit; keeping the text intact: "
-                        "tokens=%s limit=%s file_id=%s",
-                        chunk_tokens,
-                        hard_limit,
-                        file_id,
-                    )
-            if chunk_text_value:
-                chunks.append(
-                    {
-                        "id": f"{len(chunks)}",
-                        "text": chunk_text_value,
-                        "metadata": _build_chunk_metadata(
-                            chunk_text_value, heading_path, body_units
-                        ),
-                    }
-                )
-                emitted_levels.update(heading_path)
-            pending_overlap = _overlap_units(current_body, overlap_limit, measure)
+            heading_text = "\n".join(heading_lines).strip()
+            heading_tokens = count_chunk_tokens(heading_text) if enforce_hard else 0
+            overlap_units = pending_overlap
+            body_units = current_body
+            pending_overlap = []
             current_body = []
+
+            if not enforce_hard:
+                # 字符路径保持原有语义：一次 flush 只成一片，重叠允许一条超预算单元。
+                emit_chunk([*overlap_units, *body_units])
+                pending_overlap = _overlap_units(body_units, overlap_limit, measure)
+                return
+
+            # token 路径：正文预算先扣掉标题前缀（重叠随后在候选文本里一并计入），
+            # 仍超限时把超出部分顺延到下一片，而不是整片保留后只留 warning。
+            queue = [*overlap_units, *body_units]
+            overlap_ids = {id(unit) for unit in overlap_units}
+            last_group_body: list[dict] = []
+
+            if heading_tokens >= hard_limit:
+                # 标题本身已经吃满硬上限：无论怎么切正文都会超限。保住文本，留一次告警。
+                warn_hard_limit(heading_tokens)
+                body_budget = 0
+            else:
+                body_budget = hard_limit - heading_tokens
+
+            while queue:
+                group: list[dict] = []
+                while queue:
+                    unit = queue[0]
+                    candidate_text = "\n".join(
+                        [heading_text, *(item["text"] for item in [*group, unit] if item["text"])]
+                    ).strip()
+                    if count_chunk_tokens(candidate_text) <= hard_limit:
+                        group.append(queue.pop(0))
+                        continue
+                    if group:
+                        break
+                    # 单个单元 + 标题就超限。表格行是原子单元，不能拆单元格；正文单元
+                    # 按 token 硬切，切出的第一段留在本片、其余顺延到后续切片。
+                    if unit.get("kind") == "table" or body_budget <= 0:
+                        warn_hard_limit(count_chunk_tokens(candidate_text))
+                        group.append(queue.pop(0))
+                        break
+                    # 预留 1 个 token 给标题与正文之间的换行，避免边界上刚好越线。
+                    piece_budget = max(1, body_budget - 1)
+                    pieces = _hard_split_by_tokens(unit.get("text") or "", piece_budget)
+                    if len(pieces) <= 1:
+                        warn_hard_limit(count_chunk_tokens(candidate_text))
+                        group.append(queue.pop(0))
+                        break
+                    unit_kind = unit.get("kind") or "body"
+                    unit_level = unit.get("level")
+                    queue[0:1] = [
+                        _chunk_unit(piece, unit_kind, level=unit_level)
+                        for piece in pieces
+                        if piece
+                    ]
+                if not group and queue:
+                    # 理论不可达；保底避免死循环，同时不丢正文。
+                    unit = queue.pop(0)
+                    warn_hard_limit(count_chunk_tokens(heading_text) + measure(unit.get("text")))
+                    group.append(unit)
+                if group:
+                    emit_chunk(group)
+                    last_group_body = [unit for unit in group if id(unit) not in overlap_ids]
+
+            # 重叠只从「本片自己的正文」里取；上一片带来的重叠不再二次重叠，避免滚雪球。
+            pending_overlap = _overlap_units(
+                last_group_body, overlap_limit, measure, enforce_single_budget=True
+            )
 
         def _rescue_dropped_headings(min_level: int | None) -> None:
             """把「从没进过任何切片、又马上要被覆盖掉」的标题行收回正文，独立成片。
@@ -805,6 +1014,13 @@ def chunk_text(
             flush_chunk()
 
         for unit in candidate_units:
+            if unit.get("kind") == "table_break":
+                # 表格边界只用于分表：强制收尾，避免相邻两张表的行落进同一片，
+                # 让 metadata.table_id / row_no 指向两张不同的表。
+                flush_chunk()
+                pending_overlap = []
+                continue
+
             level = None if as_body else unit.get("level")
             if level == 0:
                 flush_chunk()

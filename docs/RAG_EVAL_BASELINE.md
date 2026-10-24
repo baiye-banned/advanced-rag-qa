@@ -147,18 +147,20 @@ python scripts/eval_rag.py --dry-run \
 - `ingestion_failure_rate`：入库失败文件数 / 入库文件总数。
 - 两者都只在真实入库运行时产生；一阶段为 `null`。
 
-## 4. 字符切片基线
+## 4. 切片基线口径
 
-当前生产默认是 `backend/crud/knowledge_file.py::chunk_text` 的标题层级感知字符切片：
+报告里有两套基线，不能混用：
 
-| 参数 | 值 |
-| --- | ---: |
-| `chunk_size` | 1200 字符 |
-| `chunk_overlap` | 150 字符 |
+- `legacy-character`：`chunk_text(chunk_size=..., chunk_overlap=...)` 显式传参时的
+  历史字符窗口（1200 字符 / 150 字符重叠）。它只用于和历史结果对比，**不是**当前
+  生产默认口径。
+- `current-token`：`chunk_text(file_id=...)` 的默认路径。issue #287 之后生产按 token
+  预算切片（`CHUNK_TOKEN_LIMIT` / `TARGET` / `OVERLAP`，硬上限再乘
+  `CHUNK_TOKEN_SAFETY_RATIO`）。
 
-一阶段只在报告的 `baseline` 段记录该配置（`status=configuration_only`），不运行真实
-embedding/检索，因此不给出召回分数。`tests/test_eval_harness_293.py` 会从生产函数
-的 AST 默认值反查这两个数字，配置漂移时测试失败。二阶段再把该配置与 token 切片、
+一阶段只在报告的 `baseline` 段记录这两套配置（`status=configuration_only`），不运行
+真实 embedding/检索，因此不给出召回分数。`tests/test_eval_harness_293.py` 会从生产
+函数的 AST 默认值反查字符基线数字，配置漂移时测试失败。二阶段再把 token 切片与
 父子切片、BM25 一起跑同一问题集。
 
 ## 5. 报告结构
@@ -175,10 +177,10 @@ validation       ok / question_count / category_counts / answerable / unanswerab
                  missing_required_categories / warnings / errors
 metrics          status / reason / values（含 recall_at_5/20、mrr_at_5）/ retrieval
                  （含 unmatched_evidence_count）/ per_question / definitions
-baseline         character 切片配置与状态
+baseline         legacy-character 配置 + current-token 生产基线配置与状态
 ```
 
-Markdown 报告包含同一份分类计数、可回答分布、校验明细、指标状态和字符切片基线，
+Markdown 报告包含同一份分类计数、可回答分布、校验明细、指标状态和两套基线口径，
 供 PR / CI 人工比对。
 
 ### 确定性

@@ -265,6 +265,90 @@ def test_rebuild_existing_knowledge_index_continues_after_single_file_failure(mo
     assert closed == [True]
 
 
+def _fake_rebuild_session(entries):
+    class FakeSession:
+        def query(self, model):
+            return self
+
+        def filter(self, *args):
+            return self
+
+        def all(self):
+            return entries
+
+        def close(self):
+            pass
+
+    return FakeSession()
+
+
+def test_rebuild_existing_knowledge_index_refreshes_chunk_metadata(monkeypatch):
+    """重建成功后必须刷新切片元数据，否则 #289 会读到上一次的结构（issue #287）。"""
+    entries = [
+        type("Entry", (), {"id": 1, "content": "第一段", "name": "文件1.txt", "knowledge_base_id": 2})(),
+    ]
+    chunks = [{"id": "0", "text": "第一段", "metadata": {"section_path": "第一章"}}]
+    calls = []
+
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _fake_rebuild_session(entries))
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "chunk_text",
+        lambda text, file_id: chunks,
+    )
+    monkeypatch.setattr(knowledge_service, "add_chunks", lambda *args, **kwargs: calls.append("indexed"))
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "replace_chunk_metadata",
+        lambda db, file_id, knowledge_base_id, chunk_list: calls.append(
+            ("replace", file_id, knowledge_base_id, chunk_list)
+        ),
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_chunk_metadata",
+        lambda db, file_id: calls.append(("delete", file_id)),
+    )
+
+    knowledge_service.rebuild_existing_knowledge_index()
+
+    assert calls == ["indexed", ("replace", 1, 2, chunks)]
+
+
+def test_rebuild_existing_knowledge_index_clears_stale_metadata_on_failure(monkeypatch):
+    """单个文件重建失败时清掉旧元数据，避免 #289 读到与向量不一致的结构。"""
+    entries = [
+        type("Entry", (), {"id": 1, "content": "第一段", "name": "文件1.txt", "knowledge_base_id": 2})(),
+    ]
+    calls = []
+
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _fake_rebuild_session(entries))
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "chunk_text",
+        lambda text, file_id: [{"id": "0", "text": text, "metadata": {}}],
+    )
+
+    def fail_add_chunks(*args, **kwargs):
+        raise RuntimeError("milvus unavailable")
+
+    monkeypatch.setattr(knowledge_service, "add_chunks", fail_add_chunks)
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "replace_chunk_metadata",
+        lambda *args, **kwargs: calls.append("replace"),
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_chunk_metadata",
+        lambda db, file_id: calls.append(("delete", file_id)),
+    )
+
+    knowledge_service.rebuild_existing_knowledge_index()
+
+    assert calls == [("delete", 1)]
+
+
 class _User:
     id = 7
 

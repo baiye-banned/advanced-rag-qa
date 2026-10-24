@@ -237,11 +237,24 @@ def _delete_file_vectors_and_row(entry_id: int, user_id: int) -> None:
 
 
 def _delete_chunk_metadata_best_effort(db: Session, file_id: int) -> None:
-    """失败清理路径上的元数据删除：失败只留痕，不遮蔽原始错误。"""
+    """失败清理路径上的元数据删除：失败只留痕，不遮蔽原始错误。
+
+    读的是任意 ``Session`` 替身/半关闭会话时，失败可能不是 ``SQLAlchemyError``
+    （例如替身没有实现 ``delete``）。清理路径本身不允许再把异常抛回去。
+    先 rollback：上一步（replace/add_chunks）失败后会话可能处于待回滚状态，
+    直接 delete 会以 PendingRollbackError 失败，旧行反而清不掉。
+    """
+    try:
+        db.rollback()
+    except Exception:
+        pass
     try:
         crud_knowledge_file.delete_chunk_metadata(db, file_id)
-    except SQLAlchemyError as exc:
-        db.rollback()
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.warning(
             "Failed to remove chunk metadata: file_id=%s error=%s", file_id, exc, exc_info=True
         )
@@ -307,6 +320,25 @@ def rebuild_existing_knowledge_index():
             except Exception as exc:
                 # 单个文件失败不阻塞启动：旧索引保持原样，可修复向量化服务后再次重建。
                 logger.warning("Knowledge index rebuild failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
+                # issue #287：重建失败时 #289 的检索侧不能读到与旧向量/本次分块不一致的
+                # 结构元数据；清掉比留着陈旧值更安全（缺失时按文本路径降级）。
+                _delete_chunk_metadata_best_effort(db, entry.id)
+                continue
+            try:
+                # 重建成功（整体替换语义的 add_chunks）后同步刷新切片元数据，
+                # 让 #289 的章节/条款/表格信息跟当前切片文本一致。
+                crud_knowledge_file.replace_chunk_metadata(
+                    db, entry.id, entry.knowledge_base_id, chunks
+                )
+            except Exception as exc:
+                # 元数据刷新失败不推翻已经完成的向量重建；清掉旧行避免读到更早的切片。
+                logger.warning(
+                    "Knowledge chunk metadata rebuild failed: file_id=%s error=%s",
+                    entry.id,
+                    exc,
+                    exc_info=True,
+                )
+                _delete_chunk_metadata_best_effort(db, entry.id)
         # 启动重建完成后把 BM25 语料也预热一遍；重建路径本来就要遍历整库，这里不该让
         # 第一问再独自扫描一次。
         schedule_bm25_prewarm()

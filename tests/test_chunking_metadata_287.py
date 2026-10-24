@@ -11,6 +11,7 @@
 
 import asyncio
 import json
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -27,12 +28,15 @@ from config import (
     CHUNK_TOKEN_OVERLAP,
     CHUNK_TOKEN_SAFETY_RATIO,
     CHUNK_TOKEN_TARGET,
+    normalize_chunk_token_budget,
 )
 from crud import knowledge_file as crud_knowledge_file
 from crud.knowledge_file import (
+    _hard_split_by_tokens,
     chunk_coverage_ratio,
     chunk_text,
     count_chunk_tokens,
+    extract_docx_text,
     resolve_chunk_token_budget,
 )
 from database.session import Base
@@ -174,6 +178,149 @@ def test_oversized_table_row_is_kept_atomic_with_explicit_warnings(caplog):
     row_chunks = [chunk for chunk in chunks if oversized_row in chunk["text"]]
     assert row_chunks[0]["metadata"]["row_no"] == 2
     assert row_chunks[0]["metadata"]["is_table_header"] is False
+
+
+def test_docx_multi_table_keeps_document_order_and_per_table_metadata():
+    """两张表必须各自编号、各自表头，并挂在原文所在的章节下（issue #287）。
+
+    修复前 ``extract_docx_text`` 先写完全部段落、再把所有表格堆到文末：两张表的
+    行在文本里连续，``_assign_table_positions`` 把它们合成 ``table_id=1``，
+    ``row_no`` 从 1 连到 5，第二张表的表头被当成普通行，``section_path`` 也统一
+    落到最后一个章节。这里用「3 行表 + 2 行表 + 中间隔一个章节标题」钉住修复。
+    """
+    docx = pytest.importorskip("docx")
+    document = docx.Document()
+    document.add_paragraph("第一章 考勤管理")
+    document.add_paragraph("第一条")
+    document.add_paragraph("员工应按时上下班。")
+
+    first = document.add_table(rows=3, cols=3)
+    for row_index, cells in enumerate(
+        [
+            ("姓名", "部门", "迟到次数"),
+            ("张三", "研发部", "2"),
+            ("李四", "市场部", "1"),
+        ]
+    ):
+        for column_index, value in enumerate(cells):
+            first.rows[row_index].cells[column_index].text = value
+
+    document.add_paragraph("第二章 处罚标准")
+    second = document.add_table(rows=2, cols=2)
+    for row_index, cells in enumerate(
+        [
+            ("违规行为", "处罚"),
+            ("迟到超过三十分钟", "旷工半天"),
+        ]
+    ):
+        for column_index, value in enumerate(cells):
+            second.rows[row_index].cells[column_index].text = value
+
+    document.add_paragraph("第三章 附则")
+    document.add_paragraph("本制度自发布之日起施行。")
+
+    buffer = BytesIO()
+    document.save(buffer)
+    extracted = extract_docx_text(buffer.getvalue())
+
+    chunks = chunk_text(extracted, file_id=1)
+
+    table_chunks = {
+        table_id: [
+            chunk
+            for chunk in chunks
+            if chunk["metadata"]["table_id"] == table_id
+        ]
+        for table_id in (1, 2)
+    }
+    assert table_chunks[1] and table_chunks[2]
+
+    expected_sections = {1: "第一章 考勤管理", 2: "第二章 处罚标准"}
+    expected_rows = {1: {1, 2, 3}, 2: {1, 2}}
+    header_rows = {1: "姓名 | 部门 | 迟到次数", 2: "违规行为 | 处罚"}
+
+    for table_id, table_rows in expected_rows.items():
+        covered_rows = set()
+        header_chunks = []
+        for chunk in table_chunks[table_id]:
+            metadata = chunk["metadata"]
+            covered_rows.update(range(metadata["row_no"], metadata["row_no_end"] + 1))
+            assert expected_sections[table_id] in metadata["section_path"]
+            if metadata["is_table_header"]:
+                header_chunks.append(chunk)
+        # 每张表都从 row_no=1 重新开始，第二张表不会被并进 table_id=1。
+        assert covered_rows == table_rows
+        assert header_chunks
+        assert all(chunk["metadata"]["row_no"] == 1 for chunk in header_chunks)
+        assert any(header_rows[table_id] in chunk["text"] for chunk in header_chunks)
+
+    # 边界哨兵只服务于分表，绝不能进入切片正文。
+    assert all("\x00" not in chunk["text"] for chunk in chunks)
+
+
+def test_token_hard_limit_is_enforced_with_multi_level_headings_and_long_clause():
+    """标题前缀 + 正文必须一起算预算；超出硬上限的部分顺延到下一片。"""
+    body = "员工应当遵守考勤请假和信息安全要求" * 300
+    source = "第一章 总 则\n第一节 适用范围\n第一条\n" + body
+
+    chunks = chunk_text(source, file_id=1)
+
+    assert len(chunks) > 3
+    assert all(chunk["metadata"]["token_count"] <= _hard_limit() for chunk in chunks)
+    assert all(
+        chunk["metadata"]["token_count"] == count_chunk_tokens(chunk["text"])
+        for chunk in chunks
+    )
+    # 顺延不能变成丢字。
+    assert chunk_coverage_ratio(source, chunks) >= 0.9
+
+
+def test_hard_split_never_rewrites_rare_characters_or_emoji():
+    """硬切点必须落在 UTF-8 字符边界上：拼接后与原文逐字一致且没有 U+FFFD。"""
+    text = "生僻字𠮷𠀀😀🚀🧑‍🚀" * 40
+
+    pieces = _hard_split_by_tokens(text, 7)
+
+    assert len(pieces) > 1
+    assert "".join(pieces) == text
+    assert "�" not in "".join(pieces)
+
+
+def test_character_path_overlap_still_allows_one_oversized_unit():
+    """字符路径保留 develop 的「允许一条超预算单元」重叠语义（issue #287 返工）。
+
+    无标点长句会被硬切成 200 字符的单元；重叠预算是 80，单条 200 字符的超预算。
+    token 路径会放弃重叠，字符路径必须仍然带上它，否则这种排版永远没有上下文重叠。
+    """
+    source = "甲" * 200 + "乙" * 200 + "丙" * 200 + "丁" * 200
+
+    chunks = chunk_text(source, file_id=1, chunk_size=150, chunk_overlap=80)
+
+    assert len(chunks) > 2
+    # 第二片以第一片唯一的（超预算）正文单元开头，说明重叠确实发生了。
+    assert chunks[1]["text"].startswith("甲" * 200)
+    assert "乙" * 200 in chunks[1]["text"]
+
+
+def test_chunk_token_budget_config_rejects_out_of_range_values(caplog):
+    """LIMIT=0 / TARGET=0 / OVERLAP=-5 都回退默认值并留下 warning。"""
+    with caplog.at_level("WARNING"):
+        limit, target, overlap = normalize_chunk_token_budget(0, 0, -5)
+
+    assert (limit, target, overlap) == (500, 400, 50)
+    assert "CHUNK_TOKEN_LIMIT" in caplog.text
+    assert "CHUNK_TOKEN_TARGET" in caplog.text
+    assert "CHUNK_TOKEN_OVERLAP" in caplog.text
+    # 重叠必须严格小于目标，否则每一片都会带上上一片全文。
+    assert overlap < target
+
+
+def test_chunk_token_budget_config_keeps_overlap_strictly_below_target():
+    limit, target, overlap = normalize_chunk_token_budget(500, 10, 10)
+
+    assert limit == 500
+    assert target == 10
+    assert overlap == 9
 
 
 @pytest.mark.parametrize("value", [None, "", "   \n\t\n  "])

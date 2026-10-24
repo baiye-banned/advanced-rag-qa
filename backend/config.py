@@ -274,9 +274,63 @@ EMBEDDING_INGEST_BATCH_MAX_CHARS = _env_int("EMBEDDING_INGEST_BATCH_MAX_CHARS", 
 # configured tiktoken encoding; the safety ratio scales the hard limit down so the
 # provider tokenizer has headroom. Character-mode callers of chunk_text (explicit
 # chunk_size/chunk_overlap) are unaffected by these knobs.
-CHUNK_TOKEN_LIMIT = _env_int("CHUNK_TOKEN_LIMIT", 500)
-CHUNK_TOKEN_TARGET = _env_int("CHUNK_TOKEN_TARGET", 400)
-CHUNK_TOKEN_OVERLAP = _env_int("CHUNK_TOKEN_OVERLAP", 50)
+DEFAULT_CHUNK_TOKEN_LIMIT = 500
+DEFAULT_CHUNK_TOKEN_TARGET = 400
+DEFAULT_CHUNK_TOKEN_OVERLAP = 50
+
+
+def normalize_chunk_token_budget(
+    limit,
+    target,
+    overlap,
+    *,
+    limit_default: int = DEFAULT_CHUNK_TOKEN_LIMIT,
+    target_default: int = DEFAULT_CHUNK_TOKEN_TARGET,
+    overlap_default: int = DEFAULT_CHUNK_TOKEN_OVERLAP,
+) -> tuple[int, int, int]:
+    """Validate the chunk token budget and fall back per knob.
+
+    A non-positive limit makes the safety-scaled hard limit collapse to 1 token;
+    ``target`` must be at least one token; overlap must be non-negative and strictly
+    smaller than the target, otherwise every chunk would start with a full copy of the
+    previous one. Invalid values warn and use the documented default instead of running
+    with a budget that cannot produce a usable chunk.
+    """
+    if limit <= 0:
+        _logger.warning(
+            "CHUNK_TOKEN_LIMIT value %s must be > 0; using the default %s", limit, limit_default
+        )
+        limit = limit_default
+    if target < 1:
+        _logger.warning(
+            "CHUNK_TOKEN_TARGET value %s must be >= 1; using the default %s", target, target_default
+        )
+        target = target_default
+    if overlap < 0 or overlap >= target:
+        _logger.warning(
+            "CHUNK_TOKEN_OVERLAP value %s must be >= 0 and < CHUNK_TOKEN_TARGET (%s); "
+            "using the default %s",
+            overlap,
+            target,
+            overlap_default,
+        )
+        overlap = overlap_default
+        # A very small (but valid) target can still be <= the default overlap; keep the
+        # strict overlap < target invariant rather than rejecting the whole config.
+        if overlap >= target:
+            overlap = max(0, target - 1)
+    return limit, target, overlap
+
+
+(
+    CHUNK_TOKEN_LIMIT,
+    CHUNK_TOKEN_TARGET,
+    CHUNK_TOKEN_OVERLAP,
+) = normalize_chunk_token_budget(
+    _env_int("CHUNK_TOKEN_LIMIT", DEFAULT_CHUNK_TOKEN_LIMIT),
+    _env_int("CHUNK_TOKEN_TARGET", DEFAULT_CHUNK_TOKEN_TARGET),
+    _env_int("CHUNK_TOKEN_OVERLAP", DEFAULT_CHUNK_TOKEN_OVERLAP),
+)
 CHUNK_TOKENIZER = os.getenv("CHUNK_TOKENIZER", "cl100k_base").strip() or "cl100k_base"
 CHUNK_TOKEN_SAFETY_RATIO = normalize_token_safety_ratio(
     _env_float("CHUNK_TOKEN_SAFETY_RATIO", 0.85),
