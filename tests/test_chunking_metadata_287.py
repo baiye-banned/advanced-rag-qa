@@ -610,6 +610,9 @@ def _run_upload(db, monkeypatch, add_chunks):
 def test_upload_writes_chunk_metadata_and_keeps_the_response_shape(metadata_db, monkeypatch):
     db = metadata_db.db
     indexed = []
+    # 本用例钉住 #287 的单层语义；父子切片（#289）默认开启时另见
+    # tests/test_parent_child_289.py 的上传断言。
+    monkeypatch.setattr(knowledge_service, "PARENT_CHILD_ENABLED", False)
     response = _run_upload(db, monkeypatch, lambda chunks, *_args, **_kwargs: indexed.append(chunks))
 
     assert set(response) == {"id", "knowledge_base_id", "name", "size", "created_at"}

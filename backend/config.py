@@ -340,6 +340,12 @@ CHUNK_TOKEN_SAFETY_RATIO = normalize_token_safety_ratio(
     name="CHUNK_TOKEN_SAFETY_RATIO",
 )
 
+# Parent-child chunking (issue #289). Children are embedded and recalled; the matching
+# parent keeps the article/section context and is returned after rerank. Set to false to
+# keep the single-layer #287 behavior for both ingestion and retrieval. Old files without
+# metadata rows automatically fall back to their child content even when this is true.
+PARENT_CHILD_ENABLED = _env_bool("PARENT_CHILD_ENABLED", True)
+
 # Bulk ingestion keeps its own timeout instead of sharing the online-QA one above.
 # A batch now carries at most EMBEDDING_MAX_BATCH_ITEMS chunks (10 by default), so the
 # per-request body is much smaller than the old 64-chunk shape; 60s still covers a slow

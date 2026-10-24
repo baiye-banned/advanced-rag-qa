@@ -10,7 +10,11 @@ from fastapi import Depends, File, Form, HTTPException, Query, Request, UploadFi
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from config import KNOWLEDGE_INDEX_MAX_WORKERS, KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
+from config import (
+    KNOWLEDGE_INDEX_MAX_WORKERS,
+    KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS,
+    PARENT_CHILD_ENABLED,
+)
 from rag.milvus_client import EmbeddingBackendError, add_chunks, delete_file_chunks
 from rag.retrieval import schedule_bm25_prewarm
 from crud import knowledge_base as crud_knowledge_base
@@ -309,11 +313,26 @@ def resolve_knowledge_base(db: Session, knowledge_base_id: int | None, user_id: 
     return get_default_knowledge_base(db, user_id)
 
 
+def _chunk_for_index(text: str, file_id: int, file_name: str) -> tuple[list[dict], list[dict]]:
+    """返回 ``(写入向量库的 child 切片, 写入元数据表的切片)``。
+
+    父子切片（issue #289）只在服务层分支：关闭开关时两者都是 #287 的单层切片，
+    现有上传/重建语义完全不变。parent 只进 MySQL 侧表，不进 Milvus。
+    """
+    base_chunks = crud_knowledge_file.chunk_text(text, file_id)
+    if not PARENT_CHILD_ENABLED:
+        return base_chunks, base_chunks
+    children, parents = crud_knowledge_file.build_parent_child_chunks(
+        base_chunks, file_name=file_name
+    )
+    return children, [*children, *parents]
+
+
 def rebuild_existing_knowledge_index():
     db = SessionLocal()
     try:
         for entry in db.query(KnowledgeFile).filter(KnowledgeFile.knowledge_base_id.isnot(None)).all():
-            chunks = crud_knowledge_file.chunk_text(entry.content or "", entry.id)
+            chunks, metadata_chunks = _chunk_for_index(entry.content or "", entry.id, entry.name)
             _warn_on_low_chunk_coverage(entry, entry.content or "", chunks, scope="Knowledge index rebuild")
             try:
                 add_chunks(chunks, entry.id, entry.name, entry.knowledge_base_id)
@@ -328,7 +347,7 @@ def rebuild_existing_knowledge_index():
                 # 重建成功（整体替换语义的 add_chunks）后同步刷新切片元数据，
                 # 让 #289 的章节/条款/表格信息跟当前切片文本一致。
                 crud_knowledge_file.replace_chunk_metadata(
-                    db, entry.id, entry.knowledge_base_id, chunks
+                    db, entry.id, entry.knowledge_base_id, metadata_chunks
                 )
             except Exception as exc:
                 # 元数据刷新失败不推翻已经完成的向量重建；清掉旧行避免读到更早的切片。
@@ -578,8 +597,8 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         raise HTTPException(500, crud_knowledge_file.knowledge_file_save_error_message(exc))
 
     try:
-        chunks = await run_ingest_step(
-            crud_knowledge_file.chunk_text, text, entry.id, deadline=deadline
+        chunks, metadata_chunks = await run_ingest_step(
+            _chunk_for_index, text, entry.id, entry.name, deadline=deadline
         )
     except KnowledgeIngestTimeout:
         # 分块超时发生在写向量之前，只回滚刚落下的元数据行。
@@ -594,7 +613,7 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
     # 切片结构元数据（issue #287）先于向量写入落库：后续任何一步失败都能按 file_id
     # 找到并清掉它；老文件没有这张表的行时检索照常按文本路径降级。
     try:
-        crud_knowledge_file.replace_chunk_metadata(db, entry.id, knowledge_base.id, chunks)
+        crud_knowledge_file.replace_chunk_metadata(db, entry.id, knowledge_base.id, metadata_chunks)
     except SQLAlchemyError as exc:
         db.rollback()
         logger.warning(
