@@ -251,21 +251,28 @@ def test_rerank_request_contract_clamps_and_sorts_scores(monkeypatch):
     assert call["json"]["top_n"] == min(rerank.RETRIEVAL_RERANK_TOP_N, len(CHUNKS))
 
 
-def test_rerank_timeout_reports_failed_trace(monkeypatch):
+def test_rerank_timeout_reports_failed_trace(monkeypatch, caplog):
     def behaviour(_request):
         raise httpx.TimeoutException("rerank endpoint timed out")
 
     calls = _install_rerank_client(monkeypatch, behaviour)
     monkeypatch.setattr(rerank, "RERANK_LLM_FALLBACK_ENABLED", False)
 
-    ranked, trace = asyncio.run(rerank.rerank_chunks("迟到怎么处罚", [dict(chunk) for chunk in CHUNKS]))
+    with caplog.at_level(logging.WARNING, logger=rerank.__name__):
+        ranked, trace = asyncio.run(rerank.rerank_chunks("迟到怎么处罚", [dict(chunk) for chunk in CHUNKS]))
 
     assert ranked == []
     assert trace["status"] == "failed"
     assert trace["provider"] == rerank.RERANK_PROVIDER
     assert trace["model"] == rerank.RERANK_MODEL
-    assert "rerank endpoint timed out" in trace["error"]
+    # issue #263: the trace is persisted and returned to clients, so it carries only the
+    # fixed message -- never the provider's raw exception text.
+    assert trace["error"] == rerank.RERANK_FAILED_MESSAGE
+    assert "rerank endpoint timed out" not in trace["error"]
     assert len(calls) == 1
+    # Diagnosability is not lost: the original exception still reaches the server log.
+    assert "rerank endpoint timed out" in caplog.text
+    assert "scope=rerank_primary" in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -288,7 +295,7 @@ def test_rerank_malformed_response_reports_failed_trace(monkeypatch, payload):
     assert trace["error"]
 
 
-def test_rerank_without_api_key_reports_failed_trace(monkeypatch):
+def test_rerank_without_api_key_reports_failed_trace(monkeypatch, caplog):
     def explode(*_args, **_kwargs):  # pragma: no cover - must never run
         raise AssertionError("HTTP client must not be created without credentials")
 
@@ -296,11 +303,17 @@ def test_rerank_without_api_key_reports_failed_trace(monkeypatch):
     monkeypatch.setattr(rerank.httpx, "AsyncClient", explode)
     monkeypatch.setattr(rerank, "RERANK_LLM_FALLBACK_ENABLED", False)
 
-    ranked, trace = asyncio.run(rerank.rerank_chunks("迟到怎么处罚", [dict(chunk) for chunk in CHUNKS]))
+    with caplog.at_level(logging.WARNING, logger=rerank.__name__):
+        ranked, trace = asyncio.run(rerank.rerank_chunks("迟到怎么处罚", [dict(chunk) for chunk in CHUNKS]))
 
     assert ranked == []
     assert trace["status"] == "failed"
-    assert "RERANK_API_KEY" in trace["error"]
+    # issue #263: a missing credential is configuration detail, not client-facing trace text.
+    assert trace["error"] == rerank.RERANK_FAILED_MESSAGE
+    assert "RERANK_API_KEY" not in trace["error"]
+    # ...but the operator still learns which configuration is missing from the server log.
+    assert "RERANK_API_KEY or DASHSCOPE_API_KEY is not configured" in caplog.text
+    assert "scope=rerank_primary" in caplog.text
 
 
 def _load_smoke_module(monkeypatch):
@@ -355,7 +368,7 @@ def _reachable_fallback(*_args, **_kwargs):
     return _call()
 
 
-def test_smoke_rerank_check_rejects_a_fallback_served_request(monkeypatch):
+def test_smoke_rerank_check_rejects_a_fallback_served_request(monkeypatch, caplog):
     # issue #148: the LLM fallback returns status="done" too, so `rerank` used to report a
     # pass while the qwen3-rerank endpoint never answered -- an unreachable endpoint, an
     # expired key and a bad model name were all indistinguishable from a verified rerank.
@@ -366,15 +379,22 @@ def test_smoke_rerank_check_rejects_a_fallback_served_request(monkeypatch):
     monkeypatch.setattr(rerank.httpx, "AsyncClient", _UnreachableRerankClient)
     monkeypatch.setattr(rerank, "call_chat_json", _reachable_fallback)
 
-    with pytest.raises(AssertionError) as exc_info:
-        smoke.check_rerank(live=True)
+    with caplog.at_level(logging.WARNING, logger=rerank.__name__):
+        with pytest.raises(AssertionError) as exc_info:
+            smoke.check_rerank(live=True)
 
     # The failure has to carry enough to tell an operator which provider answered and why
     # the primary one did not.
     message = str(exc_info.value)
     assert "status='done'" in message
     assert "provider='deepseek_fallback'" in message
-    assert "fallback='dashscope rerank unreachable'" in message
+    # issue #263: the trace's fallback_reason is the fixed message, so the smoke failure
+    # message carries that contract rather than the raw exception text.
+    assert f"fallback='{rerank.RERANK_FALLBACK_MESSAGE}'" in message
+    assert "dashscope rerank unreachable" not in message
+    # The original exception is still visible in the server log.
+    assert "dashscope rerank unreachable" in caplog.text
+    assert "scope=rerank_fallback_success" in caplog.text
 
 
 def test_smoke_rerank_fallback_check_rejects_a_primary_served_request(monkeypatch):
