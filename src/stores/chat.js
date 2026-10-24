@@ -123,6 +123,15 @@ export const useChatStore = defineStore('chat', () => {
       const rows = Array.isArray(response) ? response : []
       const { page, hasMore } = splitConversationPage(rows)
       conversations.value = page
+      // 列表被这一次最新结果整体替换：历史管理模式下可能还留着已经不在列表里的选中项
+      //（请求在途时用户点了「全选」，选中的是上一批结果）。只保留仍可见的 id，
+      // 否则「已选 N/M」会统计不可见会话，批量删除会删掉用户根本看不到的会话。
+      const visibleIds = new Set(page.map((conversation) => conversation?.id))
+      if (selectedConversationIds.value.length) {
+        selectedConversationIds.value = selectedConversationIds.value.filter((id) =>
+          visibleIds.has(id)
+        )
+      }
       conversationCursor = conversationCursorOf(page)
       hasMoreConversations.value = hasMore && conversationCursor !== null
       return conversations.value

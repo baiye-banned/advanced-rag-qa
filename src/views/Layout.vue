@@ -64,7 +64,8 @@
           <div class="flex items-center justify-between gap-3">
             <button
               type="button"
-              class="text-xs font-medium text-brand-600 transition-colors hover:text-brand-700"
+              class="text-xs font-medium text-brand-600 transition-colors hover:text-brand-700 disabled:cursor-not-allowed disabled:text-slate-300"
+              :disabled="chatStore.loading"
               @click="chatStore.toggleSelectAllConversations"
             >
               {{ allConversationsSelected ? '取消全选' : '全选' }}
@@ -104,6 +105,7 @@
             <el-checkbox
               v-if="chatStore.historyManageMode"
               :model-value="chatStore.isConversationSelected(conversation.id)"
+              :disabled="chatStore.loading"
               @click.stop
               @change="chatStore.toggleConversationSelection(conversation.id)"
             />
@@ -346,6 +348,9 @@ function handleConversationClick(id) {
   // 不允许「正在编辑的行」被这一下顺手选中/跳转。
   if (editingConversationId.value === id) return
   if (chatStore.historyManageMode) {
+    // 列表正在加载时结果还没落地：此时的选择会指向即将被替换的旧行，
+    // 等响应回来再选，避免「已选」里混进不可见会话（store 落地时还会再对齐一次）。
+    if (chatStore.loading) return
     chatStore.toggleConversationSelection(id)
     return
   }

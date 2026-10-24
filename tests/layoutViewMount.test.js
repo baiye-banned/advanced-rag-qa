@@ -648,3 +648,86 @@ test('标题检索 S2：检索词变化清空历史管理模式下的选中项�
     await close(view)
   }
 })
+
+test('标题检索 S3：加载在途时全选与行选择禁用，结果落地后选中与可见列表一致', async () => {
+  const { view } = await mountLayout({ conversations: [CONV1, CONV2] })
+
+  const HIT = {
+    id: 'hit',
+    title: '报表统计',
+    knowledge_base_id: null,
+    updated_at: '2026-09-01T10:00:00',
+  }
+
+  try {
+    const { useChatStore } = await import(
+      new URL('../src/stores/chat.js', import.meta.url).href
+    )
+    const chatStore = useChatStore(view.pinia)
+
+    chatStore.enterHistoryManageMode()
+    await settle(view)
+
+    // 带 q 的请求先挂住：模拟「检索请求在途、旧的 c1 / c2 仍在列表里」的窗口。
+    let resolveSearch
+    respond('get', (url, config) => {
+      if (url === '/chat/conversations') {
+        if (config?.params?.q) {
+          return new Promise((resolve) => {
+            resolveSearch = () => resolve([HIT])
+          })
+        }
+        return [CONV1, CONV2]
+      }
+      if (url === '/user/profile') return PROFILE
+      return {}
+    })
+
+    const before = conversationListCalls().length
+    typeInto(view.query('.conversation-search input'), '报表')
+    const sent = await until(view, () => conversationListCalls().length > before, 2000)
+    assert.ok(sent, '停止输入后应当发出检索请求')
+    assert.equal(chatStore.loading, true, '请求在途时 store 应当处于加载态')
+    assert.match(view.text(), /第一段对话/, '前置：结果落地前列表仍是旧结果')
+
+    const selectAllButton = () =>
+      view.queryAll('button').find((node) => node.textContent.trim() === '全选')
+    assert.equal(selectAllButton().disabled, true, '加载在途时「全选」应当禁用')
+    const rowCheckboxes = view.queryAll('.conversation-list .el-checkbox input')
+    assert.ok(rowCheckboxes.length > 0, '管理模式每行应当渲染选择框')
+    assert.ok(
+      rowCheckboxes.every((input) => input.disabled),
+      '加载在途时每行选择框应当禁用'
+    )
+
+    // 禁用状态下两处点击都不应当产生选中项。
+    selectAllButton().click()
+    conversationRows(view)[0].click()
+    await settle(view)
+    assert.deepEqual(chatStore.selectedConversationIds, [], '结果落地前不应当选中任何会话')
+
+    resolveSearch()
+    const landed = await until(view, () => view.text().includes('报表统计'), 2000)
+    assert.ok(landed, '响应落地后列表应当换成检索结果')
+    await until(view, () => !chatStore.loading, 2000)
+
+    assert.equal(
+      selectAllButton().disabled,
+      false,
+      '响应落地后「全选」应当恢复可用'
+    )
+    selectAllButton().click()
+    await until(view, () => view.text().includes('已选 1 / 1'), 2000)
+
+    // 选中集合、界面计数、可见列表三者一致：批量删除只会碰到可见的 hit。
+    assert.deepEqual(chatStore.selectedConversationIds, ['hit'])
+    assert.deepEqual(chatStore.conversations.map((item) => item.id), ['hit'])
+    assert.doesNotMatch(view.text(), /已选 2 \/ 1/, '计数不应当统计已被替换掉的旧会话')
+    const deleteButton = view
+      .queryAll('button')
+      .find((node) => node.textContent.trim() === '删除选中')
+    assert.equal(deleteButton.disabled, false, '选中可见会话后批量删除应当可用')
+  } finally {
+    await close(view)
+  }
+})

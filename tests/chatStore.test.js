@@ -1430,3 +1430,63 @@ test('搜索后全选只覆盖当前可见的命中项', async () => {
 
   assert.deepEqual(store.selectedConversationIds, ['hit-1', 'hit-2'])
 })
+
+test('检索在途时全选：首页结果落地后选中集合只保留可见项', async () => {
+  const store = createStore([conversation('c1'), conversation('c2')])
+  store.enterHistoryManageMode()
+
+  const searched = store.setConversationQuery('报表')
+  // 请求还在途，列表仍是旧结果：此刻「全选」选中是即将被替换掉的 c1 / c2。
+  assert.equal(store.loading, true)
+  store.toggleSelectAllConversations()
+  assert.deepEqual(store.selectedConversationIds, ['c1', 'c2'])
+
+  respondConversations([conversationRow('hit', '报表统计')])
+  await searched
+
+  assert.deepEqual(conversationIds(store), ['hit'])
+  // 响应落地、列表被整体替换：选中集合必须与可见列表对齐，
+  // 否则界面会显示「已选 2 / 1」，批量删除会删掉用户看不见的 c1 / c2。
+  assert.deepEqual(store.selectedConversationIds, [])
+  assert.equal(store.selectedConversationIds.length, 0)
+  assert.ok(
+    store.selectedConversationIds.length <= store.conversations.length,
+    '选中计数不得超过可见列表条数'
+  )
+})
+
+test('首页刷新后选中集合只保留仍然可见的会话', async () => {
+  const store = createStore([conversation('c1'), conversation('c2')])
+  store.enterHistoryManageMode()
+  store.toggleSelectAllConversations()
+  assert.deepEqual(store.selectedConversationIds, ['c1', 'c2'])
+
+  const refreshing = store.fetchConversations()
+  respondConversations([conversationRow('c1', '仍在列表'), conversationRow('c3', '新增命中')])
+  await refreshing
+
+  // 只过滤、不清空：仍在列表里的 c1 保留选中，消失的 c2 移除。
+  assert.deepEqual(conversationIds(store), ['c1', 'c3'])
+  assert.deepEqual(store.selectedConversationIds, ['c1'])
+})
+
+test('迟到的旧首页响应不改动选中集合（只对齐最新响应）', async () => {
+  const store = createStore([conversation('c1'), conversation('c2')])
+  store.enterHistoryManageMode()
+  store.toggleSelectAllConversations()
+
+  const stale = store.fetchConversations()
+  const latest = store.fetchConversations()
+  respondConversation(1, [conversationRow('hit', '新结果')])
+  await latest
+  assert.deepEqual(store.selectedConversationIds, [])
+
+  store.toggleConversationSelection('hit')
+  respondConversation(0, [conversationRow('c1', '旧结果'), conversationRow('c2', '旧结果')])
+  await stale
+
+  // 旧响应整段丢弃：列表与选中都保持最新响应落地后的状态。
+  assert.deepEqual(conversationIds(store), ['hit'])
+  assert.deepEqual(store.selectedConversationIds, ['hit'])
+})
+
