@@ -48,6 +48,9 @@ function conversationCursorOf(page) {
 
 export const useChatStore = defineStore('chat', () => {
   const conversations = ref([])
+  // 会话标题检索词（issue #251）：空串表示不过滤。原始输入保留给搜索框，
+  // 真正发给后端时去首尾空白，空白查询按「未搜索」处理。
+  const conversationQuery = ref('')
   const currentId = ref(null)
   // 正在加载的会话 id（不是「已选中」）：currentId 只在加载成功后才提交，
   // 请求在途期间它仍指向上一个成功加载的会话，视图不会出现「标题是 B、内容是 A」。
@@ -82,6 +85,12 @@ export const useChatStore = defineStore('chat', () => {
   let windowTruncated = false
   // 会话列表已加载区间的末位游标（{ id, updated_at }），loadMoreConversations 用它向后翻。
   let conversationCursor = null
+  // 会话列表请求序号：快速改检索词时，先发后到的响应不得覆盖新结果。
+  // 与消息加载的 loadSeq 分开——两者失效的原因不同，混用会让清理逻辑互相误伤。
+  let conversationListSeq = 0
+  // 列表世代：每次重取第一页（含检索词变化）都递增，在途的「加载更早」据此作废，
+  // 否则旧检索词的一页会被追加到新结果后面，游标也会被写回旧区间。
+  let conversationListEpoch = 0
   // 视图世代：用户显式清空会话视图（新建对话 / 删除会话）时递增。在途流据此放弃「认领新建会话」，
   // 否则用户已经开了新对话，旧流收尾还会把他拽回原会话。
   let viewEpoch = 0
@@ -90,12 +99,27 @@ export const useChatStore = defineStore('chat', () => {
     conversations.value.find((conversation) => conversation.id === currentId.value)
   )
 
+  // 当前检索词（去首尾空白后的形态）：空白查询等于没搜索，请求里不带 q。
+  function conversationKeyword() {
+    return conversationQuery.value.trim()
+  }
+
   // 取最新一页会话。收尾（handleStreamDone）与侧栏挂载都走这里：只刷新最前面这一页，
   // 更早的会话由 loadMoreConversations 按需向后翻——整表取回正是 #191 要修的那件事。
+  // 有检索词时刷新也带着它：问答结束后列表仍停留在当前搜索结果里，不会被重置成全部会话。
   async function fetchConversations() {
+    const seq = ++conversationListSeq
+    // 重取第一页会重建列表和游标，在途的「加载更早」必须作废（见 loadMoreConversations）。
+    conversationListEpoch += 1
+    const keyword = conversationKeyword()
     loading.value = true
     try {
-      const response = await chatAPI.getConversations({ limit: CONVERSATION_FETCH_LIMIT })
+      const response = await chatAPI.getConversations({
+        limit: CONVERSATION_FETCH_LIMIT,
+        ...(keyword ? { q: keyword } : {}),
+      })
+      // 先发后到：发起后检索词又变了，这一页属于旧结果，整段丢弃，不碰游标与列表。
+      if (seq !== conversationListSeq) return conversations.value
       const rows = Array.isArray(response) ? response : []
       const { page, hasMore } = splitConversationPage(rows)
       conversations.value = page
@@ -103,21 +127,41 @@ export const useChatStore = defineStore('chat', () => {
       hasMoreConversations.value = hasMore && conversationCursor !== null
       return conversations.value
     } finally {
-      loading.value = false
+      // 只让最新一次列表请求复位 loading：旧请求晚到时不得把仍在进行的请求标成已完成。
+      if (seq === conversationListSeq) loading.value = false
     }
+  }
+
+  // 切换检索词：重置游标并重取第一页。检索词没变（含仅空白差异）时不必重复请求，
+  // 否则清空输入框这类幂等操作也会打断正在进行的翻页。
+  async function setConversationQuery(query) {
+    const next = typeof query === 'string' ? query : ''
+    const previous = conversationKeyword()
+    conversationQuery.value = next
+    if (next.trim() === previous) return conversations.value
+    conversationCursor = null
+    hasMoreConversations.value = false
+    return fetchConversations()
   }
 
   // 向后翻页：以已加载区间的最后一条作游标，把更早的一页接在列表末尾。
   // 后端按同一游标返回，翻页不会重复也不会漏；取不满一页即说明已经到最早一条。
+  // 翻页必须带上发起时的检索词，否则第二页会混进未被搜索命中的会话。
   async function loadMoreConversations() {
     if (!hasMoreConversations.value || loadingMoreConversations.value || !conversationCursor) return
+    const epoch = conversationListEpoch
+    const keyword = conversationKeyword()
+    const cursor = conversationCursor
     loadingMoreConversations.value = true
     try {
       const response = await chatAPI.getConversations({
         limit: CONVERSATION_FETCH_LIMIT,
-        before_updated_at: conversationCursor.updated_at,
-        before_id: conversationCursor.id,
+        before_updated_at: cursor.updated_at,
+        before_id: cursor.id,
+        ...(keyword ? { q: keyword } : {}),
       })
+      // 请求期间重取过第一页（改检索词或收尾刷新）：这一页属于旧区间，丢弃。
+      if (epoch !== conversationListEpoch || keyword !== conversationKeyword()) return
       const rows = Array.isArray(response) ? response : []
       const { page, hasMore } = splitConversationPage(rows)
       // 逐条去重：流式收尾新插入的会话、以及刷新期间被改动的会话都可能与这一页重叠。
@@ -717,6 +761,7 @@ export const useChatStore = defineStore('chat', () => {
 
   return {
     conversations,
+    conversationQuery,
     currentId,
     loadingConversationId,
     messages,
@@ -737,6 +782,7 @@ export const useChatStore = defineStore('chat', () => {
     errorMessage,
     currentConversation,
     fetchConversations,
+    setConversationQuery,
     loadMoreConversations,
     selectConversation,
     cancelConversationLoad,
