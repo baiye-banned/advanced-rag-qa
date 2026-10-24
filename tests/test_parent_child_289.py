@@ -26,6 +26,7 @@ from crud import knowledge_file as crud_knowledge_file
 from crud.knowledge_file import (
     MIN_CHILD_TOKEN_COUNT,
     _context_prefix,
+    _parent_text_for_group,
     build_parent_child_chunks,
     chunk_text,
     count_chunk_tokens,
@@ -463,6 +464,13 @@ def test_split_children_never_produce_tiny_fragments():
     )
 
 
+def _parent_lines(*, source: str, file_name: str = "制度.txt") -> tuple[list[dict], str]:
+    children, parents = build_parent_child_chunks(
+        chunk_text(source, 1), file_name=file_name
+    )
+    return children, "\n".join(parent["text"] for parent in parents)
+
+
 def test_parent_text_strips_chunk_overlap_and_keeps_sentence_count():
     children, parents = build_parent_child_chunks(
         chunk_text(LONG_ARTICLE_TEXT, 1), file_name="长条款.txt"
@@ -478,6 +486,114 @@ def test_parent_text_strips_chunk_overlap_and_keeps_sentence_count():
     # parent 仍保留一次标题，且 child 数量大于 parent（长条款被切成多片）。
     assert parent_text.count("第五条") == 1
     assert len(children) > len(parents)
+
+
+def test_metadata_records_only_the_overlap_actually_carried_forward():
+    """``overlap_text`` 必须精确对应本片开头真正来自上一片的正文。
+
+    旧的「上一片末尾 == 当前片开头」比较没有记录来源，只能靠位置猜；这里要求
+    metadata 里的字段与本片正文严格一致，parent 拼接才有可信依据。
+    """
+    chunks = chunk_text(LONG_ARTICLE_TEXT, 1)
+
+    assert all("overlap_text" in chunk["metadata"] for chunk in chunks)
+    assert chunks[0]["metadata"]["overlap_text"] == ""
+    assert any(chunk["metadata"]["overlap_text"] for chunk in chunks)
+    for chunk in chunks:
+        overlap_text = chunk["metadata"]["overlap_text"]
+        if not overlap_text:
+            continue
+        body = chunk["text"]
+        heading_prefix = "\n".join(
+            part.strip()
+            for part in str(chunk["metadata"].get("section_path") or "").split(" > ")
+            if part.strip()
+        )
+        if heading_prefix and body.startswith(heading_prefix):
+            body = body[len(heading_prefix):].lstrip("\n")
+        assert body.startswith(overlap_text)
+
+
+def test_parent_keeps_every_identical_short_line():
+    """60 行相同短句：原文本来就重复，parent 必须保留 60 句（旧实现只剩 55）。"""
+    sentence = "员工应当按时上下班，不得迟到早退，违反考勤制度者按旷工处理。"
+    source = "\n".join([sentence] * 60)
+
+    _children, parent_text = _parent_lines(source=source, file_name="同句.txt")
+
+    sentences = [item for item in re.split(r"(?<=。)", parent_text) if item.strip()]
+    assert len(sentences) == 60
+    assert parent_text.count(sentence) == 60
+
+
+def test_parent_keeps_every_identical_44_token_sentence():
+    """44-token 同句重复 60 行：真实重叠仍要剥，正文重复一行都不能少。"""
+    sentence = "员工应当遵守考勤管理、请假审批和信息安全要求，由人事部负责解释并定期接受检查。"
+    assert count_chunk_tokens(sentence) == 44
+    source = "\n".join([sentence] * 60)
+
+    _children, parent_text = _parent_lines(source=source, file_name="同句.txt")
+
+    sentences = [item for item in re.split(r"(?<=。)", parent_text) if item.strip()]
+    assert len(sentences) == 60
+    assert parent_text.count(sentence) == 60
+
+
+def test_parent_keeps_every_identical_85_token_paragraph():
+    """12 段相同的 85-token 段落：parent 段落数必须等于原文（旧实现只剩 8 段）。"""
+    paragraph = (
+        "员工应当遵守考勤管理、请假审批和信息安全要求，由人事部负责解释并归档保存，"
+        "违反规定的按照公司制度处理，各部门负责人承担管理责任并定期接受公司监督检查相关。"
+    )
+    assert count_chunk_tokens(paragraph) == 85
+    source = "\n\n".join([paragraph] * 12)
+
+    _children, parent_text = _parent_lines(source=source, file_name="同段落.txt")
+
+    paragraphs = [item for item in re.split(r"(?<=。)", parent_text) if item.strip()]
+    assert len(paragraphs) == 12
+    assert parent_text.count(paragraph) == 12
+
+
+def test_parent_keeps_every_identical_table_row():
+    """200 行相同表格行：表格行不参与重叠，parent 行数必须等于原文（旧实现 185 行）。"""
+    header = "姓名 | 事项 | 次数 | 处理"
+    row = "张三 | 迟到 | 一次 | 口头提醒"
+    source_lines = [header, *([row] * 200)]
+    source = "\n".join(source_lines)
+
+    _children, parent_text = _parent_lines(source=source, file_name="表格.txt")
+
+    assert parent_text.split("\n") == source_lines
+    assert parent_text.count(row) == 200
+    assert all(
+        chunk["metadata"]["overlap_text"] == ""
+        for chunk in chunk_text(source, 1)
+    )
+
+
+def test_token_flush_multi_piece_records_overlap_only_on_first(monkeypatch):
+    """一次 flush 因硬上限拆成多片时，只有第一片带 overlap_text。
+
+    ``(target, hard, overlap) = (10, 12, 100)`` 会让重叠单元与新正文各自成片：
+    重叠片记录文本，紧随其后的新片必须是空串，否则 parent 拼接会把相邻片误判成重叠。
+    """
+    monkeypatch.setattr(
+        crud_knowledge_file, "resolve_chunk_token_budget", lambda: (10, 12, 100)
+    )
+    lines = ["甲甲甲甲甲。", "乙乙乙乙乙。", "丙丙丙丙丙。", "丁丁丁丁丁。", "戊戊戊戊戊。"]
+
+    chunks = chunk_text("\n".join(lines), 1)
+
+    overlaps = [chunk["metadata"]["overlap_text"] for chunk in chunks]
+    assert overlaps[0] == ""
+    assert any(overlaps)
+    for index, overlap in enumerate(overlaps[:-1]):
+        if overlap:
+            # 重叠片之后紧跟的新正文片，其 overlap_text 必须为空。
+            assert overlaps[index + 1] == ""
+    # 拼接回 parent 时每行恰好出现一次。
+    assert _parent_text_for_group(chunks).split("\n") == lines
 
 
 # ---------------------------------------------------------------------------

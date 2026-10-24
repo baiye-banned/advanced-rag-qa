@@ -520,7 +520,13 @@ def _first_article_no(lines: list[str]) -> str:
     return ""
 
 
-def _build_chunk_metadata(text: str, heading_path: dict[int, str], body_units: list[dict]) -> dict:
+def _build_chunk_metadata(
+    text: str,
+    heading_path: dict[int, str],
+    body_units: list[dict],
+    *,
+    overlap_text: str = "",
+) -> dict:
     heading_lines = _heading_lines(heading_path)
     table_units = [unit for unit in body_units if unit.get("kind") == "table"]
     metadata = {
@@ -529,6 +535,10 @@ def _build_chunk_metadata(text: str, heading_path: dict[int, str], body_units: l
         "section_path": " > ".join(heading_lines),
         "article_no": _first_article_no([*heading_lines, *(unit.get("text", "") for unit in body_units)]),
         "token_count": count_chunk_tokens(text),
+        # 本片开头真正从上一片带过来的重叠文本（issue #289 返工）。parent 拼接时
+        # 只按这段精确剥离；没有重叠时为空字符串，绝不能用「上一片末尾 == 本片开头」
+        # 之类的位置比较去猜——正文里重复出现的句子/表格行会被误删。
+        "overlap_text": overlap_text,
         "table_id": table_units[0]["table_id"] if table_units else None,
         "row_no": table_units[0]["row_no"] if table_units else None,
         "row_no_end": table_units[-1]["row_no"] if table_units else None,
@@ -904,7 +914,7 @@ def chunk_text(
         # 层位在重新赋值时清掉（见下方 set），flush 成功时把当时路径里的层位全记上。
         emitted_levels: set[int] = set()
 
-        def emit_chunk(body_units: list[dict]) -> None:
+        def emit_chunk(body_units: list[dict], *, overlap_text: str = "") -> None:
             """把一组正文单元连同当前标题路径写成一片。"""
             heading_lines = _heading_lines(heading_path)
             content_lines = [*heading_lines, *(unit["text"] for unit in body_units if unit["text"])]
@@ -916,7 +926,10 @@ def chunk_text(
                     "id": f"{len(chunks)}",
                     "text": chunk_text_value,
                     "metadata": _build_chunk_metadata(
-                        chunk_text_value, heading_path, body_units
+                        chunk_text_value,
+                        heading_path,
+                        body_units,
+                        overlap_text=overlap_text,
                     ),
                 }
             )
@@ -942,7 +955,12 @@ def chunk_text(
 
             if not enforce_hard:
                 # 字符路径保持原有语义：一次 flush 只成一片，重叠允许一条超预算单元。
-                emit_chunk([*overlap_units, *body_units])
+                emit_chunk(
+                    [*overlap_units, *body_units],
+                    overlap_text="\n".join(
+                        unit["text"] for unit in overlap_units if unit.get("text")
+                    ),
+                )
                 pending_overlap = _overlap_units(body_units, overlap_limit, measure)
                 return
 
@@ -951,6 +969,9 @@ def chunk_text(
             queue = [*overlap_units, *body_units]
             overlap_ids = {id(unit) for unit in overlap_units}
             last_group_body: list[dict] = []
+            # 一次 flush 可能因为硬上限被拆成多片；重叠只会出现在第一片开头，
+            # 后续片没有带过来的文本，metadata 里必须是空串。
+            first_group = True
 
             if heading_tokens >= hard_limit:
                 # 标题本身已经吃满硬上限：无论怎么切正文都会超限。保住文本，留一次告警。
@@ -997,7 +1018,15 @@ def chunk_text(
                     warn_hard_limit(count_chunk_tokens(heading_text) + measure(unit.get("text")))
                     group.append(unit)
                 if group:
-                    emit_chunk(group)
+                    group_overlap_text = ""
+                    if first_group:
+                        group_overlap_text = "\n".join(
+                            item["text"]
+                            for item in group
+                            if id(item) in overlap_ids and item.get("text")
+                        )
+                    emit_chunk(group, overlap_text=group_overlap_text)
+                    first_group = False
                     last_group_body = [unit for unit in group if id(unit) not in overlap_ids]
 
             # 重叠只从「本片自己的正文」里取；上一片带来的重叠不再二次重叠，避免滚雪球。
@@ -1184,9 +1213,6 @@ def _group_chunks_by_parent(chunks: list[dict], *, max_tokens: int) -> list[dict
 # 切分后的 child 不得小到没有检索价值：一个小碎片既占一个上下文槽位，又因为缺少
 # 上下文而几乎不可能被命中。只有正文真的超过硬上限时才切，切完再保证这个下限。
 MIN_CHILD_TOKEN_COUNT = 100
-# #287 的重叠最多带两条正文单元进下一片；parent 拼接时只剥这一段，避免误删正文里
-# 本来就重复出现的句子。
-_MAX_PARENT_OVERLAP_UNITS = 2
 
 
 def _strip_duplicate_context_headings(
@@ -1246,41 +1272,30 @@ def _parent_text_for_group(chunks: list[dict]) -> str:
     正文里的重复行（制度文档很常见）原样保留。
 
     #287 的 token 路径还会把上一片末尾最多两条正文单元作为重叠带到下一片开头。
-    这里按「上一片正文的结尾 == 当前片正文的开头」剥掉这段重叠，否则 parent 上下文
-    里每个切片边界都会重复两句话，长条款聚合后句子数明显多于原文。
+    这里只剥 ``chunk_text`` 实际写进 ``metadata["overlap_text"]`` 的那一段：先去掉
+    重复标题，若正文确实以这段重叠开头才精确删除，否则一行也不删。不能再按
+    「上一片末尾 == 当前片开头」做位置比较——正文里本来就重复的句子、段落和表格行
+    会被误判成重叠，parent 句子数会平白少于原文。
     """
     parts: list[str] = []
-    previous_lines: list[str] = []
     for chunk in chunks:
+        metadata = chunk.get("metadata") or {}
         text = str(chunk.get("text") or "")
         if parts:
-            section = str((chunk.get("metadata") or {}).get("section_path") or "")
+            section = str(metadata.get("section_path") or "")
             heading_prefix = "\n".join(
                 part.strip() for part in section.split(" > ") if part.strip()
             )
             if heading_prefix and text.startswith(heading_prefix):
                 text = text[len(heading_prefix):].lstrip("\n")
         if not text.strip():
-            previous_lines = []
             continue
-        body_lines = text.split("\n")
-        overlap = 0
-        if previous_lines and body_lines:
-            for candidate in range(
-                min(len(previous_lines), len(body_lines), _MAX_PARENT_OVERLAP_UNITS),
-                0,
-                -1,
-            ):
-                if previous_lines[-candidate:] == body_lines[:candidate]:
-                    overlap = candidate
-                    break
-        if overlap:
-            body_lines = body_lines[overlap:]
-        body_text = "\n".join(body_lines).strip()
+        overlap_text = str(metadata.get("overlap_text") or "")
+        if overlap_text and text.startswith(overlap_text):
+            text = text[len(overlap_text):].lstrip("\n")
+        body_text = text.strip()
         if body_text:
             parts.append(body_text)
-        # 下一片要对比的是本片完整的正文（含带过来的重叠），而不是剥掉重叠后的部分。
-        previous_lines = text.split("\n")
     return "\n".join(parts).strip()
 
 
