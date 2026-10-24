@@ -648,6 +648,14 @@ watch(
       return
     }
     if (seq !== routeLoadSeq) return
+    // selectConversation 可能成功返回却没提交这个 id：加载在飞时流已经认领了
+    // 新会话（currentId 被改写），store 按发起时的 currentId 作废了这次加载。
+    // 此时 URL 还停在旧会话上，界面与刷新都会把用户带回旧会话，必须校正到
+    // 实际生效的会话。正常加载时 activeId === id，不会导航。
+    const activeId = chatStore.currentId
+    if (activeId && activeId !== id) {
+      router.replace(`/chat/${activeId}`)
+    }
     syncSelectedKnowledgeBase()
   },
   { immediate: true }

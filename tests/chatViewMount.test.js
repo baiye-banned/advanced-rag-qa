@@ -123,12 +123,19 @@ const PERSISTED = [
   { id: 2, role: 'assistant', content: '你好，世界', created_at: '2024-01-01T00:00:02Z' },
 ]
 
-async function mountChat({ bases = [KB1, KB2], streamFrames = ANSWER_FRAMES, messages = PERSISTED, route = '/chat' } = {}) {
+async function mountChat({
+  bases = [KB1, KB2],
+  streamFrames = ANSWER_FRAMES,
+  messages = PERSISTED,
+  route = '/chat',
+  responses = {},
+} = {}) {
   resetRequestStub()
   respond('get', (url) => {
     if (url === '/knowledge-bases') return bases
     if (url === '/chat/conversations') return [CONV1]
     if (url === '/chat/conversations/c1') return messages
+    if (url in responses) return responses[url]
     return {}
   })
   const streamCalls = installStreamStub(streamFrames)
@@ -729,6 +736,86 @@ test('导出按钮：HTTP 失败只提示一次，不保存文件且恢复可重
     assert.equal(urls.length, 0)
     assert.equal(button.disabled, false)
     assert.equal(JSON.stringify(store.messages), initialMessages)
+  } finally {
+    await close(view)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// h. 深链加载在飞时流认领新会话：迟到的加载作废后，路由要跟随实际会话
+//
+// issue #261 返修：上一轮加的 claimedAtStart 守卫挡住了迟到加载对
+// currentId / messages 的覆盖，但 Chat.vue 的路由 watcher 在
+// `await selectConversation(c1)` 返回后没有校正路由。深链 /chat/c1 时
+// 两个负责跳转的 watcher 都以 `!route.params.id` 为前提，URL 会一直停在
+// c1 —— 界面与刷新都会把用户带回旧会话。本用例从挂载开始走完整链路：
+// 加载在飞 -> 提问 -> 流认领 c9 -> c1 加载返回 -> 路由校正到 c9。
+// ---------------------------------------------------------------------------
+
+const C1_OLD_HISTORY = [
+  { id: 11, role: 'user', content: 'c1 的旧问题', created_at: '2024-01-01T00:00:01Z' },
+  { id: 12, role: 'assistant', content: 'c1 的旧回答', created_at: '2024-01-01T00:00:02Z' },
+]
+
+const C9_PERSISTED = [
+  { id: 91, role: 'user', content: '在途时提问', created_at: '2024-01-01T00:00:03Z' },
+  { id: 92, role: 'assistant', content: '新回答', created_at: '2024-01-01T00:00:04Z' },
+]
+
+const CLAIM_FRAMES = [
+  'data: {"type":"conversation","conversation":{"id":"c9","title":"新对话","knowledge_base_id":"kb1","knowledge_base_name":"KB1"}}\n\n',
+  'data: {"type":"token","content":"新回答"}\n\n',
+  'data: [DONE]\n\n',
+]
+
+test('深链加载在飞时流认领新会话：迟到的加载作废后路由校正到新会话', async () => {
+  let resolveC1
+  // 用挂起的 Promise 当 c1 的消息响应：请求真的发出去，但由用例决定何时返回。
+  const pendingC1 = new Promise((resolve) => { resolveC1 = resolve })
+  const { view, router, streamCalls } = await mountChat({
+    route: '/chat/c1',
+    messages: pendingC1,
+    streamFrames: CLAIM_FRAMES,
+    responses: { '/chat/conversations/c9': C9_PERSISTED },
+  })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    const store = await viewStore(view)
+    // 前置：深链 c1 的加载已经发出且在飞，currentId 仍为空。
+    await until(view, () => calls.some(
+      (entry) => entry.method === 'get' && entry.args[0] === '/chat/conversations/c1'
+    ))
+    assert.equal(store.currentId, null, '前置：c1 的加载还没返回，currentId 仍为空')
+    assert.equal(store.loadingConversationId, 'c1', '前置：c1 的加载在飞')
+
+    // 加载在飞时提问：流为新建的会话 c9 投递 conversation 事件并认领它。
+    await sendQuestion(view, '在途时提问')
+    await until(view, () => store.currentId === 'c9')
+    assert.equal(store.currentId, 'c9', '流应当先认领新会话 c9')
+    assert.equal(
+      router.currentRoute.value.path,
+      '/chat/c1',
+      '前置：旧加载尚未返回，路由仍停在深链会话（否则本用例测不到校正）'
+    )
+
+    // c1 的旧加载这时才返回：store 必须作废它，视图必须把路由校正到 c9。
+    resolveC1(C1_OLD_HISTORY)
+    await settle(view)
+    await until(view, () => router.currentRoute.value.path === '/chat/c9')
+
+    assert.equal(store.currentId, 'c9', 'currentId 应当仍是流认领的 c9')
+    assert.equal(router.currentRoute.value.path, '/chat/c9', '路由应当校正到实际生效的会话 c9')
+    assert.deepEqual(
+      store.messages.map((item) => item.content),
+      ['在途时提问', '新回答'],
+      '刚发出的提问及其回答应当留在消息列表'
+    )
+    assert.ok(
+      !store.messages.some((item) => String(item.content).includes('c1 的旧')),
+      'c1 的旧历史不得覆盖当前视图'
+    )
+    assert.doesNotMatch(view.text(), /c1 的旧回答/, '屏幕上不得出现 c1 的旧历史')
   } finally {
     await close(view)
   }
