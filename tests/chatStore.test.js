@@ -1238,7 +1238,8 @@ test('重新生成截断视图后，刷新重建窗口而不是在中间留空�
   }
   assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1))
 
-  // 重新生成：砍掉后半段，只留第 1 条（Chat.vue 的 regenerate 就是这么调用的）
+  // 本地窗口被截断：砍掉后半段，只留第 1 条（重新生成/编辑重发现在先走服务端
+  // DELETE 截断，这里只保底 replaceMessages 自身的窗口重建语义）
   store.replaceMessages(store.messages.slice(0, 1))
   assert.deepEqual(ids(store), [1])
 

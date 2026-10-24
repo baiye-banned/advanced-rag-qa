@@ -1342,3 +1342,412 @@ test('删除按钮：流式生成期间全部禁用，点击也不发请求', as
     await close(view)
   }
 })
+
+// ---------------------------------------------------------------------------
+// l. 编辑用户消息并重发（issue #253）
+//
+// 「编辑」和 #256 的「删除」是同一条服务端截断路径：先 `DELETE /chat/messages/{id}`
+// 让后端把这条提问及其后的回答删掉，再用新的文本走原来的流式发送。视图不能只改
+// 本地 messages —— 否则刷新一次旧回答就会从服务端回来。这一组用例钉住：
+//   - 入口只挂在用户消息上，进入编辑后带原文并全选；
+//   - 提交恰好一次 DELETE，随后流式请求体的 question 是新文本、附件沿用原消息；
+//   - 取消（Esc / 失焦 / 按钮）没有 DELETE、没有流式请求，消息原样保留；
+//   - IME 组字中的 Enter 不提交（与主输入框同一条守卫）；
+//   - 流式期间入口禁用、提交被拒，取消不发请求；
+//   - 重新生成也先 DELETE 原提问，而不是只在前端 replaceMessages。
+// ---------------------------------------------------------------------------
+
+const EDIT_ATTACHMENT = { object_key: 'att-1', url: '/uploads/a.png', name: 'a.png' }
+
+const EDIT_MESSAGES = [
+  { id: 1, role: 'user', content: '原始问题', attachments: [EDIT_ATTACHMENT] },
+  { id: 2, role: 'assistant', content: '旧回答' },
+]
+
+// 编辑/重发生效后服务端的落库结果：流结束时的 refreshMessages 会用它重建列表，
+// 若继续返回旧的 PERSISTED，旧回答会被这次刷新带回来（用例就会红在错误的地方）。
+function postEditMessages(question) {
+  return [
+    { id: 11, role: 'user', content: question, attachments: [EDIT_ATTACHMENT] },
+    { id: 12, role: 'assistant', content: '你好，世界' },
+  ]
+}
+
+// 传函数而不是数组：用例要在动作命中服务端之后换一份「新的落库结果」，
+// 关闭包住数组变量的话，后面再赋值外面那个变量也改不到这里。
+function stubChatGets(getServerMessages) {
+  respond('get', (url) => {
+    if (url === '/knowledge-bases') return [KB1, KB2]
+    if (url === '/chat/conversations') return [CONV1]
+    if (url === '/chat/conversations/c1') return getServerMessages()
+    return {}
+  })
+}
+
+function editButtons(view) {
+  return view.queryAll('[data-testid="edit-message"][data-message-role="user"]')
+}
+
+function editTextarea(view) {
+  const input = view.query('[data-testid="edit-message-input"]')
+  if (!input) return null
+  return input.tagName === 'TEXTAREA' ? input : input.querySelector('textarea')
+}
+
+async function openEditor(view) {
+  const button = editButtons(view)[0]
+  assert.ok(button, '应当有用户消息的编辑入口')
+  button.click()
+  await view.flush(4)
+  return editTextarea(view)
+}
+
+async function typeEdit(view, text) {
+  const textarea = editTextarea(view)
+  assert.ok(textarea, '进入编辑后应当出现行内输入框')
+  textarea.value = text
+  textarea.dispatchEvent(new Event('input', { bubbles: true }))
+  await view.flush(3)
+  return textarea
+}
+
+function pressEditEnter(view, init = {}) {
+  const textarea = editTextarea(view)
+  assert.ok(textarea, '编辑态应当有 textarea')
+  const event = new KeyboardEvent('keydown', {
+    key: 'Enter', code: 'Enter', bubbles: true, cancelable: true, ...init,
+  })
+  textarea.dispatchEvent(event)
+  return event
+}
+
+test('编辑入口：只挂在用户消息上，进入后输入框带原文并全选', async () => {
+  const { view } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+
+  try {
+    const buttons = editButtons(view)
+    assert.equal(buttons.length, 1, 'PERSISTED 里只有一条用户消息，应当只有一个编辑入口')
+    assert.equal(buttons[0].disabled, false, '已落库的用户消息应当可编辑')
+    assert.equal(view.queryAll('[data-testid="edit-message"][data-message-role="assistant"]').length, 0,
+      '助手消息不应当有编辑入口')
+
+    const textarea = await openEditor(view)
+
+    // 承重：编辑框里是原文，而且进入编辑时聚焦 + 全选，用户可以直接覆盖。
+    assert.equal(textarea.value, '原始问题', '编辑框应当带出原消息内容')
+    assert.equal(document.activeElement, textarea, '进入编辑后应当聚焦输入框')
+    assert.equal(textarea.selectionStart, 0, '进入编辑时应当从第一个字符开始全选')
+    assert.equal(textarea.selectionEnd, '原始问题'.length, '进入编辑时应当选中全部原文')
+    assert.equal(editButtons(view).length, 0, '编辑中不应再显示同一条消息的入口')
+    assert.match(view.text(), /保存并重发/, '应当提供提交按钮')
+    assert.match(view.text(), /取消/, '应当提供取消按钮')
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑提交：恰好一次 DELETE 截断旧问答，再以新文本重发并沿用附件', async () => {
+  const { view, streamCalls } = await mountChat({
+    route: '/chat/c1',
+    messages: EDIT_MESSAGES,
+  })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    let serverMessages = EDIT_MESSAGES
+    stubChatGets(() => serverMessages)
+
+    await openEditor(view)
+    await typeEdit(view, '修改后的问题')
+
+    // 服务端在 DELETE 之后、流结束刷新之前的状态：旧回答已经没了。
+    serverMessages = postEditMessages('修改后的问题')
+
+    const event = pressEditEnter(view)
+    assert.equal(event.defaultPrevented, true, '非合成态的 Enter 应当提交编辑')
+
+    await until(view, () => streamCalls.length > 0)
+    await until(view, () => view.text().includes('你好，世界'))
+    await settle(view)
+
+    // 承重①：后端截断路径真的走了，且只走一次。
+    assert.deepEqual(callsOf('delete'), [
+      { method: 'delete', args: ['/chat/messages/1'] },
+    ], '编辑提交应当先删掉原提问及其后的回答')
+    assert.equal(streamCalls.length, 1, '截断成功后应当恰好重发一次')
+    const body = JSON.parse(streamCalls[0].options.body)
+    assert.equal(body.question, '修改后的问题', '流式请求体应当是新文本')
+    assert.deepEqual(body.attachments, [EDIT_ATTACHMENT], '原消息的附件应当一并带上')
+
+    // 承重②：编辑/重发不经过删除确认框（它是明确的用户动作）。
+    assert.deepEqual(confirmations, [], '编辑提交不应弹出删除确认框')
+
+    // 承重③：旧回答和旧提问都从屏幕上消失，编辑态收尾干净。
+    assert.doesNotMatch(view.text(), /旧回答/, '旧回答应当随截断从视图消失')
+    assert.match(view.text(), /修改后的问题/, '新提问应当上屏')
+    assert.equal(view.query('[data-testid="edit-message-editor"]'), null, '提交后应当退出编辑态')
+    assert.equal(editTextarea(view), null, '提交后不应残留编辑输入框')
+
+    const store = await viewStore(view)
+    assert.deepEqual(store.messages.map((message) => message.id), [11, 12],
+      '刷新后应当只剩服务端的「新提问 + 新回答」')
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑提交：内容为空或与原文相同都不删不重发，只退出编辑', async () => {
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    const store = await viewStore(view)
+
+    for (const draft of ['   ', '原始问题']) {
+      await openEditor(view)
+      await typeEdit(view, draft)
+      const event = pressEditEnter(view)
+      assert.equal(event.defaultPrevented, true, '空/未改的 Enter 仍应被编辑框消费（不换行）')
+      await settle(view)
+
+      assert.equal(callsOf('delete').length, 0, `「${draft}」不应删除服务端消息`)
+      assert.equal(streamCalls.length, 0, `「${draft}」不应发出流式请求`)
+      assert.equal(view.query('[data-testid="edit-message-editor"]'), null, '应当直接退出编辑态')
+      assert.deepEqual(store.messages.map((message) => message.id), [1, 2], '消息应当原样保留')
+    }
+
+    // 退出编辑后原文回到屏幕上，且入口重新可用。
+    assert.match(view.text(), /原始问题/)
+    assert.equal(editButtons(view)[0].disabled, false)
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑取消：Esc 不发请求、丢弃草稿并还原消息', async () => {
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    await openEditor(view)
+    const textarea = await typeEdit(view, '改到一半')
+    const event = new KeyboardEvent('keydown', {
+      key: 'Escape', code: 'Escape', bubbles: true, cancelable: true,
+    })
+    textarea.dispatchEvent(event)
+    await settle(view)
+
+    assert.equal(event.defaultPrevented, true, 'Esc 应当被编辑框消费')
+    assert.equal(callsOf('delete').length, 0, '取消不得发出删除请求')
+    assert.equal(streamCalls.length, 0, '取消不得发出流式请求')
+    assert.equal(view.query('[data-testid="edit-message-editor"]'), null, '取消后应当退出编辑态')
+    assert.doesNotMatch(view.text(), /改到一半/, '取消后草稿不得留在屏幕上')
+    assert.match(view.text(), /原始问题/, '取消后原文应当回到屏幕上')
+
+    const store = await viewStore(view)
+    assert.deepEqual(store.messages.map((message) => message.id), [1, 2], '取消后消息不变')
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑取消：失焦不发请求、丢弃草稿并还原消息', async () => {
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    await openEditor(view)
+    const textarea = await typeEdit(view, '失焦时的草稿')
+    // startEdit 已经 focus 过；这里再显式聚焦，保证 blur() 真的会派发事件。
+    textarea.focus()
+    textarea.blur()
+    await settle(view)
+
+    assert.equal(callsOf('delete').length, 0, '失焦取消不得发出删除请求')
+    assert.equal(streamCalls.length, 0, '失焦取消不得发出流式请求')
+    assert.equal(view.query('[data-testid="edit-message-editor"]'), null, '失焦后应当退出编辑态')
+    assert.doesNotMatch(view.text(), /失焦时的草稿/, '失焦后草稿不得留在屏幕上')
+    assert.match(view.text(), /原始问题/, '失焦后原文应当回到屏幕上')
+
+    const store = await viewStore(view)
+    assert.deepEqual(store.messages.map((message) => message.id), [1, 2], '失焦取消后消息不变')
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑输入：IME 组字中 / keyCode 229 与 Shift+Enter 都不提交', async () => {
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    // isComposing=true（现代引擎）与仅 keyCode=229（旧引擎）都必须让给输入法选词。
+    for (const init of [{ isComposing: true }, { keyCode: 229 }]) {
+      await openEditor(view)
+      await typeEdit(view, '输入法里的草稿')
+      const event = pressEditEnter(view, init)
+      await settle(view)
+
+      assert.equal(event.defaultPrevented, false, '组字中的 Enter 不得被编辑框吃掉')
+      assert.equal(callsOf('delete').length, 0, '组字中的 Enter 不得触发删除')
+      assert.equal(streamCalls.length, 0, '组字中的 Enter 不得触发重发')
+      assert.ok(editTextarea(view), '组字中的 Enter 后编辑框和草稿应当保留')
+
+      // 退出编辑，给下一轮一个干净的起点。
+      view.query('[data-testid="cancel-edit-message"]').dispatchEvent(
+        new MouseEvent('click', { bubbles: true })
+      )
+      await view.flush(2)
+    }
+
+    // Shift+Enter 在编辑框里是换行，不是提交。
+    await openEditor(view)
+    await typeEdit(view, '要换行')
+    const event = pressEditEnter(view, { shiftKey: true })
+    await settle(view)
+    assert.equal(event.defaultPrevented, false, 'Shift+Enter 不得被 preventDefault')
+    assert.equal(callsOf('delete').length, 0, 'Shift+Enter 不得触发删除')
+    assert.equal(streamCalls.length, 0, 'Shift+Enter 不得触发重发')
+    assert.ok(editTextarea(view), 'Shift+Enter 后应当继续编辑')
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑的流式保护：入口禁用、提交被拒，取消不发请求', async () => {
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    // 先进入编辑、写好草稿，再让会话进入流式（模拟生成过程中用户点了编辑的场景）。
+    await openEditor(view)
+    await typeEdit(view, '流式中不改了')
+    const store = await viewStore(view)
+    store.streaming = true
+    await view.flush(3)
+
+    // 提交按钮本身不靠 disabled 挡（它只防重复提交），必须由 submitEdit 的 streaming 守卫拦下。
+    view.query('[data-testid="submit-edit-message"]').dispatchEvent(
+      new MouseEvent('click', { bubbles: true })
+    )
+    await settle(view)
+    assert.equal(callsOf('delete').length, 0, '流式期间提交不得发出删除请求')
+    assert.equal(streamCalls.length, 0, '流式期间提交不得发出流式请求')
+    assert.ok(editTextarea(view), '提交被拒时编辑框和草稿应当保留')
+
+    // 取消始终可用，而且不产生任何请求。
+    view.query('[data-testid="cancel-edit-message"]').dispatchEvent(
+      new MouseEvent('click', { bubbles: true })
+    )
+    await view.flush(2)
+    assert.equal(view.query('[data-testid="edit-message-editor"]'), null, '取消后应当退出编辑态')
+    assert.equal(callsOf('delete').length, 0, '流式期间取消不得发出删除请求')
+    assert.equal(streamCalls.length, 0, '流式期间取消不得发出流式请求')
+
+    // 入口渲染为禁用；绕过 disabled 的程序化点击也进不去编辑态。
+    const button = editButtons(view)[0]
+    assert.equal(button.disabled, true, '流式期间编辑入口应当禁用')
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await view.flush(2)
+    assert.equal(view.query('[data-testid="edit-message-editor"]'), null,
+      '流式期间程序化点击也不得进入编辑态')
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑提交：store 拒绝删除时提示并保留编辑内容，不重发', async () => {
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    const store = await viewStore(view)
+    // store 在流式期间返回 false：视图必须当作「没删成」，不能继续发送。
+    store.deleteMessage = async () => false
+
+    await openEditor(view)
+    await typeEdit(view, '修改后的问题')
+    pressEditEnter(view)
+    await settle(view)
+
+    assert.equal(callsOf('delete').length, 0, 'store 未真正删除时不应有请求发出')
+    assert.equal(streamCalls.length, 0, '删除失败后不得重发')
+    assert.deepEqual(
+      view.messages.filter((message) => message.level === 'warning').map((message) => message.message),
+      ['正在生成回答，暂不能编辑'],
+      '应当明确提示此刻不能编辑'
+    )
+    assert.ok(editTextarea(view), '失败时编辑框应当保留')
+    assert.equal(editTextarea(view).value, '修改后的问题', '失败时草稿应当保留')
+    assert.deepEqual(store.messages.map((message) => message.id), [1, 2], '消息应当原样保留')
+  } finally {
+    await close(view)
+  }
+})
+
+test('编辑提交：删除请求失败时不重发，编辑框和草稿保留', async () => {
+  const { view, streamCalls } = await mountChat({ route: '/chat/c1', messages: EDIT_MESSAGES })
+  globalThis.__streamCalls = streamCalls
+
+  try {
+    respond('delete', () => {
+      throw new Error('删除失败')
+    })
+
+    await openEditor(view)
+    await typeEdit(view, '修改后的问题')
+    pressEditEnter(view)
+    await settle(view)
+
+    assert.equal(callsOf('delete').length, 1, '删除请求应当发出一次')
+    assert.equal(streamCalls.length, 0, '删除失败后不得重发')
+    assert.ok(editTextarea(view), '失败时编辑框应当保留')
+    assert.equal(editTextarea(view).value, '修改后的问题', '失败时草稿应当保留')
+
+    const store = await viewStore(view)
+    assert.deepEqual(store.messages.map((message) => message.id), [1, 2], '失败时消息不变')
+  } finally {
+    await close(view)
+  }
+})
+
+test('重新生成：先 DELETE 原提问做服务端截断，再重发原问题与附件', async () => {
+  const { view } = await mountChat({
+    route: '/chat/c1',
+    messages: EDIT_MESSAGES,
+    streamFrames: ANSWER_FRAMES,
+  })
+
+  try {
+    let serverMessages = EDIT_MESSAGES
+    stubChatGets(() => serverMessages)
+    // 重新生成的回答必须和旧回答不同，才能断言旧内容确实随截断消失。
+    const streamCalls = installStreamStub(ANSWER_FRAMES)
+    globalThis.__streamCalls = streamCalls
+
+    serverMessages = postEditMessages('原始问题')
+
+    view.query('[data-testid="regenerate-message"]').click()
+
+    await until(view, () => streamCalls.length > 0)
+    await until(view, () => view.text().includes('你好，世界'))
+    await settle(view)
+
+    // 承重：走的是后端截断（DELETE 原提问 id=1），不是前端 replaceMessages。
+    assert.deepEqual(callsOf('delete'), [
+      { method: 'delete', args: ['/chat/messages/1'] },
+    ], '重新生成应当删除原提问及其后的回答')
+    assert.deepEqual(confirmations, [], '重新生成不应弹出删除确认框')
+    assert.equal(streamCalls.length, 1, '截断成功后应当恰好重发一次')
+    const body = JSON.parse(streamCalls[0].options.body)
+    assert.equal(body.question, '原始问题', '重发的应当还是原问题')
+    assert.deepEqual(body.attachments, [EDIT_ATTACHMENT], '原提问的附件应当一并带上')
+    assert.doesNotMatch(view.text(), /旧回答/, '旧回答应当随截断从视图消失')
+
+    const store = await viewStore(view)
+    assert.deepEqual(store.messages.map((message) => message.id), [11, 12],
+      '刷新后应当只剩「原提问 + 新回答」')
+  } finally {
+    await close(view)
+  }
+})

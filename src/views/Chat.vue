@@ -175,21 +175,74 @@
                 <p v-else class="text-slate-400">评测中...</p>
               </div>
             </template>
-            <div v-else class="space-y-2">
-              <div v-if="hasDisplayValue(message.content)" class="whitespace-pre-wrap text-sm leading-6">{{ message.content }}</div>
-              <div v-if="message.attachments?.length" class="grid max-w-sm grid-cols-2 gap-2">
-                <img
-                  v-for="attachment in message.attachments"
-                  :key="attachment.object_key || attachment.url"
-                  :src="attachment.url"
-                  :alt="attachment.name || '上传图片'"
-                  class="h-28 w-full rounded-md border border-white/30 object-cover"
-                />
+            <template v-else>
+              <template v-if="isEditingMessage(message)">
+                <div class="space-y-2" data-testid="edit-message-editor">
+                  <el-input
+                    :ref="setEditInputRef"
+                    v-model="editingContent"
+                    type="textarea"
+                    :rows="3"
+                    resize="none"
+                    data-testid="edit-message-input"
+                    @keydown.enter="handleEditEnter($event, message)"
+                    @keydown.esc.prevent="cancelEdit"
+                    @blur="handleEditBlur"
+                  />
+                  <div class="flex items-center justify-end gap-2">
+                    <button
+                      type="button"
+                      class="rounded border border-white/40 px-2 py-0.5 text-xs text-white/80 transition-colors hover:bg-white/10 hover:text-white"
+                      data-testid="cancel-edit-message"
+                      @mousedown.prevent
+                      @click="cancelEdit"
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded bg-white px-2 py-0.5 text-xs font-medium text-brand-700 transition-colors hover:bg-brand-50 disabled:cursor-not-allowed disabled:opacity-60"
+                      data-testid="submit-edit-message"
+                      :disabled="editSubmitting"
+                      @mousedown.prevent
+                      @click="submitEdit(message)"
+                    >
+                      保存并重发
+                    </button>
+                  </div>
+                </div>
+              </template>
+              <div v-else class="space-y-2">
+                <div v-if="hasDisplayValue(message.content)" class="whitespace-pre-wrap text-sm leading-6">{{ message.content }}</div>
+                <div v-if="message.attachments?.length" class="grid max-w-sm grid-cols-2 gap-2">
+                  <img
+                    v-for="attachment in message.attachments"
+                    :key="attachment.object_key || attachment.url"
+                    :src="attachment.url"
+                    :alt="attachment.name || '上传图片'"
+                    class="h-28 w-full rounded-md border border-white/30 object-cover"
+                  />
+                </div>
               </div>
-            </div>
+            </template>
 
-            <!-- 用户消息没有悬浮操作栏，删除入口放在气泡内正文下方，避免遮住内容。 -->
-            <div v-if="message.role === 'user'" class="mt-1 flex justify-end">
+            <!-- 用户消息没有悬浮操作栏，编辑/删除入口放在气泡内正文下方，避免遮住内容。 -->
+            <div
+              v-if="message.role === 'user' && !isEditingMessage(message)"
+              class="mt-1 flex justify-end gap-2"
+            >
+              <button
+                type="button"
+                class="inline-flex items-center gap-1 rounded px-1 py-0.5 text-xs text-white/70 transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
+                data-testid="edit-message"
+                data-message-role="user"
+                :disabled="!message.id || chatStore.streaming"
+                @mousedown.prevent
+                @click="startEdit(message)"
+              >
+                <el-icon><Edit /></el-icon>
+                编辑
+              </button>
               <button
                 type="button"
                 class="inline-flex items-center gap-1 rounded px-1 py-0.5 text-xs text-white/70 transition-colors hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
@@ -211,7 +264,13 @@
                 <el-button link :icon="CopyDocument" @click="copyMessage(message.content)" />
               </el-tooltip>
               <el-tooltip content="重新生成" placement="bottom">
-                <el-button link :icon="Refresh" @click="regenerate(index)" />
+                <el-button
+                  link
+                  :icon="Refresh"
+                  data-testid="regenerate-message"
+                  data-message-role="assistant"
+                  @click="regenerate(index)"
+                />
               </el-tooltip>
               <el-tooltip content="有帮助" placement="bottom">
                 <el-button
@@ -575,6 +634,12 @@ const uploadingAttachment = ref(false)
 const exporting = ref(false)
 const knowledgeBases = computed(() => knowledgeStore.knowledgeBases)
 const selectedKnowledgeBaseId = ref(null)
+// 行内编辑一次只作用于一条用户消息；editingContent 与列表数据隔离，
+// 取消时丢弃即可，不会改到 store 里的原消息。
+const editingMessageId = ref(null)
+const editingContent = ref('')
+const editInputRef = ref(null)
+const editSubmitting = ref(false)
 
 const isCurrentConversationStreaming = computed(() => {
   if (!chatStore.streaming) return false
@@ -721,6 +786,8 @@ watch(
 watch(
   () => chatStore.currentId,
   (id) => {
+    // 会话切换后旧消息可能被复用到新列表里，别把上一条消息的草稿带过去。
+    cancelEdit()
     if (id && !route.params.id && !chatStore.streaming) {
       router.replace(`/chat/${id}`)
     }
@@ -784,11 +851,91 @@ function sendMessage() {
   scrollToBottom()
 }
 
+function isImeComposing(event) {
+  // 中文输入法选词时按 Enter 只是确认候选词，不能当成发送/提交。
+  return event.isComposing || event.keyCode === 229
+}
+
 function handleInputEnter(event) {
-  if (event.isComposing || event.keyCode === 229) return
+  if (isImeComposing(event)) return
   if (event.shiftKey) return
   event.preventDefault()
   sendMessage()
+}
+
+function setEditInputRef(instance) {
+  editInputRef.value = instance
+}
+
+function isEditingMessage(message) {
+  return editingMessageId.value !== null && message.id === editingMessageId.value
+}
+
+function startEdit(message) {
+  if (!message?.id || chatStore.streaming || editSubmitting.value) return
+
+  editingMessageId.value = message.id
+  editingContent.value = message.content || ''
+  nextTick(() => {
+    editInputRef.value?.focus()
+    editInputRef.value?.select()
+  })
+}
+
+function cancelEdit() {
+  editingMessageId.value = null
+  editingContent.value = ''
+  editInputRef.value = null
+}
+
+function handleEditBlur() {
+  // 提交失败时编辑框要保留，不能因为失焦把用户改到一半的内容清掉。
+  if (editSubmitting.value) return
+  cancelEdit()
+}
+
+function handleEditEnter(event, message) {
+  if (isImeComposing(event)) return
+  if (event.shiftKey) return
+  event.preventDefault()
+  submitEdit(message)
+}
+
+async function submitEdit(message) {
+  if (editSubmitting.value || chatStore.streaming) return
+  if (!message?.id || !isEditingMessage(message)) return
+
+  const nextContent = editingContent.value.trim()
+  const originalContent = (message.content || '').trim()
+  // 没改或改空：不删服务端消息也不重发，直接退出编辑。
+  if (!nextContent || nextContent === originalContent) {
+    cancelEdit()
+    return
+  }
+
+  const conversationId = chatStore.currentId
+  const originalAttachments = [...(message.attachments || [])]
+  editSubmitting.value = true
+  try {
+    // 先由后端截断这条提问及其后的回答，再重发，刷新后才不会把旧回答带回来。
+    const deleted = await chatStore.deleteMessage(message.id)
+    if (!deleted) {
+      ElMessage.warning('正在生成回答，暂不能编辑')
+      return
+    }
+    // 删除在途时用户可能切走了：别把新问题发进另一个会话。
+    if (chatStore.currentId !== conversationId) {
+      cancelEdit()
+      return
+    }
+    cancelEdit()
+    chatStore.sendMessage(nextContent, originalAttachments)
+    scrollToBottom()
+  } catch {
+    // 失败提示由 request.js 拦截器统一给出；保留编辑框和草稿方便重试。
+  } finally {
+    editSubmitting.value = false
+  }
 }
 
 function stopGeneration() {
@@ -839,17 +986,33 @@ async function onDeleteMessage(message) {
 }
 
 async function regenerate(index) {
+  if (chatStore.streaming) return
+
   const messages = chatStore.messages
   const previousUserMessage = [...messages]
     .slice(0, index)
     .reverse()
     .find((message) => message.role === 'user')
+  if (!previousUserMessage?.id) return
 
-  if (!previousUserMessage || chatStore.streaming) return
-
-  chatStore.replaceMessages(messages.slice(0, index))
-  question.value = previousUserMessage.content
-  await sendMessage()
+  const conversationId = chatStore.currentId
+  const originalQuestion = previousUserMessage.content
+  const originalAttachments = [...(previousUserMessage.attachments || [])]
+  cancelEdit()
+  try {
+    // 与编辑重发共用同一条后端截断路径：先删掉原提问及其后的回答，再重发。
+    // 只在前端 replaceMessages 会让刷新后的旧回答重新出现。
+    const deleted = await chatStore.deleteMessage(previousUserMessage.id)
+    if (!deleted) {
+      ElMessage.warning('正在生成回答，暂不能重新生成')
+      return
+    }
+    if (chatStore.currentId !== conversationId) return
+    chatStore.sendMessage(originalQuestion, originalAttachments)
+    scrollToBottom()
+  } catch {
+    // 失败提示由 request.js 拦截器统一给出，这里不再弹第二次。
+  }
 }
 
 function startRename() {
