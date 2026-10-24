@@ -177,6 +177,41 @@ TEXT_FALLBACK_BASE_URL = os.getenv(
 TEXT_FALLBACK_API_KEY = os.getenv("TEXT_FALLBACK_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
 TEXT_FALLBACK_MODEL = os.getenv("TEXT_FALLBACK_MODEL", "qwen3.6-plus")
 
+DEFAULT_EMBEDDING_TOKEN_SAFETY_RATIO = 0.85  # scan-secrets:allow numeric ratio, not a credential
+
+
+def normalize_token_safety_ratio(value, default: float = DEFAULT_EMBEDDING_TOKEN_SAFETY_RATIO) -> float:
+    """Clamp ``EMBEDDING_TOKEN_SAFETY_RATIO`` into ``(0, 1]``.
+
+    A ratio of 0 shrinks the packing budget to a single token and fails every batch;
+    a ratio above 1 removes the safety margin the provider tokenizer needs. Both are
+    configuration mistakes, so warn and use a usable value instead of honoring them.
+    """
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        _logger.warning(
+            "EMBEDDING_TOKEN_SAFETY_RATIO value %r is not a number; using default %s", value, default
+        )
+        return default
+    if ratio <= 0:
+        _logger.warning(
+            "EMBEDDING_TOKEN_SAFETY_RATIO value %s must be in (0, 1]; using the default %s "
+            "instead of shrinking the packing budget to nothing",
+            ratio,
+            default,
+        )
+        return default
+    if ratio > 1:
+        _logger.warning(
+            "EMBEDDING_TOKEN_SAFETY_RATIO value %s exceeds 1; clamping to 1.0 so requests cannot "
+            "overrun the model token limit",
+            ratio,
+        )
+        return 1.0
+    return ratio
+
+
 # OpenAI-compatible embedding API for semantic retrieval and RAGAS.
 # Defaults target DashScope text-embedding-v4. If EMBEDDING_API_KEY is not
 # set, reuse DASHSCOPE_API_KEY from Alibaba Cloud Model Studio.
@@ -203,7 +238,15 @@ EMBEDDING_TIMEOUT_SECONDS = _env_int("EMBEDDING_TIMEOUT_SECONDS", 10)
 # not public, so the budget is scaled by a safety ratio to leave headroom.
 EMBEDDING_MAX_BATCH_ITEMS = _env_int("EMBEDDING_MAX_BATCH_ITEMS", 10)
 EMBEDDING_MAX_REQUEST_TOKENS = _env_int("EMBEDDING_MAX_REQUEST_TOKENS", 8192)
-EMBEDDING_TOKEN_SAFETY_RATIO = _env_float("EMBEDDING_TOKEN_SAFETY_RATIO", 0.85)
+EMBEDDING_TOKEN_SAFETY_RATIO = normalize_token_safety_ratio(
+    _env_float("EMBEDDING_TOKEN_SAFETY_RATIO", 0.85)
+)
+# tiktoken's BPE cache directory for cl100k_base. Empty means tiktoken's default
+# (`<tempdir>/data-gym-cache`). A clean or network-restricted deployment must point
+# this at a directory pre-populated with cl100k_base.tiktoken; otherwise the first
+# ingest tries to download the BPE file and fails. Startup performs a non-fatal
+# prewarm and logs the effective directory (see rag/milvus_client.py).
+TIKTOKEN_CACHE_DIR = os.getenv("TIKTOKEN_CACHE_DIR", "").strip()
 # Extra attempts after the initial request, for 429/5xx only. Permanent errors such as
 # 400 are not retried. Retries stay inside the whole-document budget enforced by
 # KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS, so they cannot turn a timeout into success.

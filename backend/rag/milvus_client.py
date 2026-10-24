@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -26,6 +27,7 @@ from config import (
     EMBEDDING_MODEL,
     EMBEDDING_TIMEOUT_SECONDS,
     EMBEDDING_TOKEN_SAFETY_RATIO,
+    KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS,
     MILVUS_COLLECTION_NAME,
     MILVUS_DB_NAME,
     MILVUS_PASSWORD,
@@ -33,6 +35,8 @@ from config import (
     MILVUS_URI,
     MILVUS_USER,
     RETRIEVAL_ROUTE_TOP_K,
+    TIKTOKEN_CACHE_DIR,
+    normalize_token_safety_ratio,
 )
 
 
@@ -137,27 +141,82 @@ def _record_embedding_success(source: str) -> None:
     _embedding_state["last_used_at"] = _utc_now()
 
 
+def _record_embedding_failure(message: str) -> None:
+    _embedding_state["last_error"] = message
+    _embedding_state["last_error_at"] = _utc_now()
+
+
+# 入库重试循环内，单次 429/5xx 只是「本次尝试失败、还可以再试」：不能把它写成最终
+# 失败，也不能每次尝试都打 ERROR。由 `_embed_documents` 在真正放弃时统一记录状态并
+# 打 ERROR。没有重试循环的调用方（检索）不在这个作用域里，单次失败就是最终失败。
+_embedding_retry_scope: ContextVar[bool] = ContextVar("_embedding_retry_scope", default=False)
+
+
+@contextmanager
+def _defer_embedding_failure_state():
+    token = _embedding_retry_scope.set(True)
+    try:
+        yield
+    finally:
+        _embedding_retry_scope.reset(token)
+
+
 def _embedding_failure(
     message: str,
     *,
     retryable: bool = False,
     retry_after: Optional[float] = None,
 ) -> EmbeddingBackendError:
-    _embedding_state["last_error"] = message
-    _embedding_state["last_error_at"] = _utc_now()
-    logger.error("%s", message)
     error = EmbeddingBackendError(message)
     # 只有 429/5xx 打上可重试标记；400 等永久错误重试多少次都不会成功。
     error.retryable = retryable
     error.retry_after = retry_after
+    if retryable:
+        # 可重试的上游错误在尝试阶段只记 WARNING：它不代表本次入库最终失败。
+        logger.warning("%s", message)
+        if not _embedding_retry_scope.get():
+            _record_embedding_failure(message)
+    else:
+        _record_embedding_failure(message)
+        logger.error("%s", message)
     return error
 
 
 # token 估算是确定性的本地计算，绝不能拿字符数冒充 token：后者与真实 token 数
 # 在中文/英文/混排下差异很大，按字符数打包仍会发出超限请求。
 _TOKEN_ENCODING_NAME = "cl100k_base"  # scan-secrets:allow tokenizer encoding name, not a credential
+# tiktoken 按 sha1(blob URL) 命名的缓存文件；写进日志是为了运维能直接核对预置文件。
+_TIKTOKEN_CACHE_KEY = "9b5ad71b2ce5302211f9c61530b329a4922fc6a4"  # scan-secrets:allow sha1 of a public blob URL, not a credential; gitleaks:allow
 _token_encoding = None
 _token_encoding_lock = threading.Lock()
+
+
+def _configure_tiktoken_cache() -> str:
+    """把 TIKTOKEN_CACHE_DIR 交给 tiktoken，并返回实际生效的缓存目录。
+
+    空值必须从环境里删除而不是写成 ""：tiktoken 把空字符串解释为「关闭缓存」，
+    会每次启动都重新下载 BPE 文件——正是离线部署要避免的形态。
+    """
+    configured = (TIKTOKEN_CACHE_DIR or "").strip()
+    if configured:
+        os.environ["TIKTOKEN_CACHE_DIR"] = configured
+        return configured
+    os.environ.pop("TIKTOKEN_CACHE_DIR", None)
+    data_gym = (os.environ.get("DATA_GYM_CACHE_DIR") or "").strip()
+    if data_gym:
+        return data_gym
+    # 与 tiktoken.load.read_file_cached 的默认目录保持一致。
+    return os.path.join(tempfile.gettempdir(), "data-gym-cache")
+
+
+def _tokenizer_help(cache_dir: str) -> str:
+    """给运维看的一句话：缓存目录在哪、要预置什么、怎么预置。"""
+    return (
+        f"缓存目录={cache_dir}（cl100k_base 缓存文件名 {_TIKTOKEN_CACHE_KEY}）；"
+        "离线/受限网络部署需要预置 cl100k_base.tiktoken 到该缓存目录：在可联网机器上执行 "
+        "TIKTOKEN_CACHE_DIR=<目录> python -c \"import tiktoken; "
+        "tiktoken.get_encoding('cl100k_base')\"，再把整个目录随部署环境挂载。"
+    )
 
 
 def _get_token_encoding():
@@ -166,6 +225,7 @@ def _get_token_encoding():
     if _token_encoding is None:
         with _token_encoding_lock:
             if _token_encoding is None:
+                _configure_tiktoken_cache()
                 _token_encoding = tiktoken.get_encoding(_TOKEN_ENCODING_NAME)
     return _token_encoding
 
@@ -178,14 +238,45 @@ def _estimate_tokens(text: str) -> int:
         return len(_get_token_encoding().encode(text, disallowed_special=()))
     except Exception as exc:
         raise _embedding_failure(
-            f"token 估算失败（{_TOKEN_ENCODING_NAME}）：{exc}"
+            f"token 估算失败（{_TOKEN_ENCODING_NAME}）：{exc}；"
+            + _tokenizer_help(_configure_tiktoken_cache())
         ) from exc
 
 
+def prewarm_token_encoding() -> bool:
+    """启动时做一次非致命的分词表预热/检查。
+
+    首次调用会按需下载 BPE 文件；干净或受限网络环境下这里就会失败。失败只记
+    WARNING（不阻止服务启动），但日志必须点明缓存目录与预置文件名，否则上传入库
+    会在用户操作时才以「token 估算失败」的形式暴露同一个问题。
+    """
+    cache_dir = _configure_tiktoken_cache()
+    try:
+        _get_token_encoding()
+    except Exception as exc:
+        logger.warning(
+            "Embedding tokenizer unavailable: encoding=%s cache_dir(缓存目录)=%s error=%s. "
+            "离线/受限网络部署需要预置 cl100k_base.tiktoken（缓存文件名 %s），"
+            "否则上传入库会因 token 估算失败而失败。",
+            _TOKEN_ENCODING_NAME,
+            cache_dir,
+            exc,
+            _TIKTOKEN_CACHE_KEY,
+        )
+        return False
+    logger.info(
+        "Embedding tokenizer ready: encoding=%s cache_dir=%s",
+        _TOKEN_ENCODING_NAME,
+        cache_dir,
+    )
+    return True
+
+
 def _token_budget() -> int:
-    """单请求 token 预算 = 模型上限 × 安全系数。"""
+    """单请求 token 预算 = 模型上限 × 安全系数（系数运行时再夹一次，防止越界配置）。"""
     limit = max(1, EMBEDDING_MAX_REQUEST_TOKENS)
-    return max(1, int(limit * EMBEDDING_TOKEN_SAFETY_RATIO))
+    ratio = normalize_token_safety_ratio(EMBEDDING_TOKEN_SAFETY_RATIO)
+    return max(1, int(limit * ratio))
 
 
 def _batch_item_limit() -> int:
@@ -404,6 +495,15 @@ def embedding_trace_status(status: dict) -> dict:
 
 # 指数退避的起点：第 1 次重试等 0.5s，第 2 次等 1s。Retry-After 更大时以它为准。
 _EMBEDDING_RETRY_BASE_DELAY_SECONDS = 0.5
+# Retry-After 不能把入库线程按小时挂在 sleep 上：asyncio.wait_for 只是不再等待，
+# 线程仍然占着 KNOWLEDGE_INDEX_MAX_WORKERS 的槽位。所有退避都不得超过这个上限，
+# 也不得超过整份文档剩余的预算（见 `_retry_sleep_seconds`）。
+MAX_RETRY_SLEEP_SECONDS = 30.0
+
+
+def _monotonic_now() -> float:
+    """退避预算用的单调时钟；单独包一层便于测试注入假时钟（不真的睡）。"""
+    return time.monotonic()
 
 
 def _retry_delay_seconds(attempt: int, retry_after: Optional[float]) -> float:
@@ -413,31 +513,45 @@ def _retry_delay_seconds(attempt: int, retry_after: Optional[float]) -> float:
     return delay
 
 
-def _embedding_batches(texts: list[str]) -> Iterator[list[str]]:
-    """按模型能力切分待向量化文本：条数、累计 token、旧字符上限三约束，先到者生效。
+def _retry_sleep_seconds(attempt: int, retry_after: Optional[float], remaining: float) -> float:
+    """本次退避的睡眠时长：指数退避、Retry-After、剩余预算、绝对上限取最小。"""
+    return min(
+        _retry_delay_seconds(attempt, retry_after),
+        remaining,
+        MAX_RETRY_SLEEP_SECONDS,
+    )
+
+
+def _embedding_batches(texts: list[str]) -> Iterator[tuple[list[str], int]]:
+    """按模型能力切分待向量化文本，逐批产出 ``(batch, batch_tokens)``。
 
     - 条数上限 = min(EMBEDDING_MAX_BATCH_ITEMS, 旧 EMBEDDING_INGEST_BATCH_SIZE)。
-    - token 预算 = EMBEDDING_MAX_REQUEST_TOKENS × EMBEDDING_TOKEN_SAFETY_RATIO，
+    - 打包预算 = EMBEDDING_MAX_REQUEST_TOKENS × EMBEDDING_TOKEN_SAFETY_RATIO，
       由 tiktoken 的 cl100k_base 确定性估算，不拿字符数冒充 token。
     - 旧字符上限仅在显式配置为正数时生效，默认关闭。
 
-    单条文本自身超过 token 预算时直接抛 EmbeddingBackendError：该请求必然被上游拒绝，
+    单条校验用 EMBEDDING_MAX_REQUEST_TOKENS（模型真正的单输入能力），安全系数只用于
+    批打包，让「单条恰好可用、只是不能与别人合批」的切片仍然发得出去。
+
+    单条文本自身超过该上限时直接抛 EmbeddingBackendError：超过的是单条安全预算，
     预先校验可以保证一个请求都不发；也不二次切分，切片是检索的最小语义单位。
+
+    产出 `batch_tokens` 是为了让调用方直接复用日志里的估算值，避免每批重复计算。
     """
     batch_size = _batch_item_limit()
     max_chars = EMBEDDING_INGEST_BATCH_MAX_CHARS
     token_budget = _token_budget()
+    single_item_limit = max(1, EMBEDDING_MAX_REQUEST_TOKENS)
 
     # 先整篇估算再切分：任何一条超预算都在发出第一个请求之前失败，避免「前几批已发送、
     # 后面必失败」的半途状态。
     token_counts = [_estimate_tokens(text) for text in texts]
     for index, tokens in enumerate(token_counts):
-        if tokens > token_budget:
+        if tokens > single_item_limit:
             raise _embedding_failure(
-                f"切片 #{index + 1} 估算 {tokens} tokens，超过单请求 token 预算 {token_budget}"
-                f"（EMBEDDING_MAX_REQUEST_TOKENS={EMBEDDING_MAX_REQUEST_TOKENS} × "
-                f"EMBEDDING_TOKEN_SAFETY_RATIO={EMBEDDING_TOKEN_SAFETY_RATIO}）；"
-                "已拒绝发送必然失败的请求，且不拆分切片以免改变检索语义。"
+                f"切片 #{index + 1} 估算 {tokens} tokens，超过单条安全预算 {single_item_limit}"
+                f"（EMBEDDING_MAX_REQUEST_TOKENS={EMBEDDING_MAX_REQUEST_TOKENS}）；"
+                "已拒绝发送，且不拆分切片以免改变检索语义。"
             )
 
     batch: list[str] = []
@@ -450,31 +564,40 @@ def _embedding_batches(texts: list[str]) -> Iterator[list[str]]:
             or batch_tokens + tokens > token_budget
             or over_chars
         ):
-            yield batch
+            yield batch, batch_tokens
             batch, batch_tokens, batch_chars = [], 0, 0
         batch.append(text)
         batch_tokens += tokens
         batch_chars += len(text)
     if batch:
-        yield batch
+        yield batch, batch_tokens
 
 
-def _embed_documents(documents: list[str]) -> list[list[float]]:
-    """整份文档分批向量化：每批一次请求，共用入库超时预算。
+def _resolve_ingest_deadline(deadline: Optional[float]) -> float:
+    """整份文档的截止时刻（time.monotonic 时钟）；调用方没给就按总时限从现在起算。"""
+    if deadline is not None:
+        return float(deadline)
+    return _monotonic_now() + max(0, KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS)
+
+
+def _embed_documents(documents: list[str], deadline: Optional[float] = None) -> list[list[float]]:
+    """整份文档分批向量化：每批一次请求，共用整份文档的截止时刻。
 
     429/5xx 按 EMBEDDING_MAX_RETRIES 做有上限指数退避（尊重 Retry-After），
     400 等永久错误立即失败。任一批最终失败即抛出 EmbeddingBackendError，已算出的
     向量不会写库，调用方据此回滚——旧索引保持原样，不会留下「删了旧的、没写新的」空洞。
 
-    重试只发生在这里，整份文档的预算仍由调用方 KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS
-    约束：退避等待同样消耗总预算，不能靠无限重试把超时伪装成成功。
+    `deadline` 是调用方的整份文档截止时刻（time.monotonic 时钟）；上游给的
+    Retry-After 再大，退避也被限制在「剩余预算」与 MAX_RETRY_SLEEP_SECONDS 之内。
+    预算耗尽时不再睡眠，直接以最终失败抛出——线程不会为了等一个远期 Retry-After
+    继续占着 KNOWLEDGE_INDEX_MAX_WORKERS 的槽位。
     """
     embeddings: list[list[float]] = []
     batches = 0
     max_retries = max(0, EMBEDDING_MAX_RETRIES)
-    with _ingest_embedding_timeout():
-        for batch_index, batch in enumerate(_embedding_batches(documents), start=1):
-            estimated_tokens = sum(_estimate_tokens(text) for text in batch)
+    budget_deadline = _resolve_ingest_deadline(deadline)
+    with _ingest_embedding_timeout(), _defer_embedding_failure_state():
+        for batch_index, (batch, batch_tokens) in enumerate(_embedding_batches(documents), start=1):
             started = time.perf_counter()
             attempts = 0
             while True:
@@ -484,27 +607,44 @@ def _embed_documents(documents: list[str]) -> list[list[float]]:
                     break
                 except EmbeddingBackendError as exc:
                     elapsed_ms = (time.perf_counter() - started) * 1000
-                    if not getattr(exc, "retryable", False) or attempts > max_retries:
-                        logger.error(
-                            "Ingest embedding batch failed: batch=%s items=%s estimated_tokens=%s "
-                            "attempts=%s elapsed_ms=%.1f",
-                            batch_index,
-                            len(batch),
-                            estimated_tokens,
-                            attempts,
-                            elapsed_ms,
-                        )
+                    retryable = bool(getattr(exc, "retryable", False))
+                    if not retryable or attempts > max_retries:
+                        if retryable:
+                            # 可重试错误在尝试阶段只打了 WARNING；现在才是最终放弃。
+                            _record_embedding_failure(str(exc))
+                            logger.error(
+                                "Ingest embedding batch failed: batch=%s items=%s estimated_tokens=%s "
+                                "attempts=%s elapsed_ms=%.1f",
+                                batch_index,
+                                len(batch),
+                                batch_tokens,
+                                attempts,
+                                elapsed_ms,
+                            )
+                        # 非可重试错误已在 _embedding_failure 里记录 last_error 并打过一次
+                        # ERROR；这里再打一条只会让同一次永久失败出现两条 ERROR。
                         raise
-                    delay = _retry_delay_seconds(attempts, getattr(exc, "retry_after", None))
+                    remaining = budget_deadline - _monotonic_now()
+                    if remaining <= 0:
+                        raise _embedding_failure(
+                            "入库向量化重试预算已耗尽："
+                            f"batch={batch_index} attempt={attempts} items={len(batch)} "
+                            f"estimated_tokens={batch_tokens} remaining_budget_s={remaining:.2f}；"
+                            f"{exc}"
+                        ) from exc
+                    delay = _retry_sleep_seconds(
+                        attempts, getattr(exc, "retry_after", None), remaining
+                    )
                     logger.warning(
                         "Ingest embedding batch retry: batch=%s items=%s estimated_tokens=%s "
-                        "attempt=%s max_retries=%s delay_s=%.2f",
+                        "attempt=%s max_retries=%s delay_s=%.2f remaining_budget_s=%.1f",
                         batch_index,
                         len(batch),
-                        estimated_tokens,
+                        batch_tokens,
                         attempts,
                         max_retries,
                         delay,
+                        remaining,
                     )
                     time.sleep(delay)
             elapsed_ms = (time.perf_counter() - started) * 1000
@@ -513,7 +653,7 @@ def _embed_documents(documents: list[str]) -> list[list[float]]:
                 "attempts=%s elapsed_ms=%.1f",
                 batch_index,
                 len(batch),
-                estimated_tokens,
+                batch_tokens,
                 attempts,
                 elapsed_ms,
             )
@@ -531,7 +671,13 @@ def _embed_documents(documents: list[str]) -> list[list[float]]:
     return embeddings
 
 
-def add_chunks(chunks: list[dict], file_id: int, file_name: str, knowledge_base_id: int):
+def add_chunks(
+    chunks: list[dict],
+    file_id: int,
+    file_name: str,
+    knowledge_base_id: int,
+    deadline: Optional[float] = None,
+):
     client = _ensure_collection()
     if not chunks:
         _delete_file_chunks(client, file_id)
@@ -539,7 +685,7 @@ def add_chunks(chunks: list[dict], file_id: int, file_name: str, knowledge_base_
         return
     documents = [chunk["text"] for chunk in chunks]
     # 先取向量再删旧数据：向量化失败时抛错，旧索引保持原样，由调用方回滚。
-    embeddings = _embed_documents(documents)
+    embeddings = _embed_documents(documents, deadline=deadline)
     _delete_file_chunks(client, file_id)
     rows = [
         {
