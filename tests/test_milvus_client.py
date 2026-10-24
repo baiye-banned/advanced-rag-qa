@@ -2,6 +2,7 @@ import contextlib
 import json
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
@@ -631,3 +632,70 @@ def test_ingest_timeout_is_separate_from_retrieval_timeout(monkeypatch):
     milvus_client._embedding_fn(["迟到怎么处罚"])
 
     assert timeouts == [41, 41, 7]
+
+
+def test_connect_milvus_constructs_client_once_under_concurrency(monkeypatch):
+    """并发检索只能构造一个 Milvus Lite 客户端。
+
+    Milvus Lite 对同一数据目录独占加锁（DataDirLockedError），第二个实例会让整轮
+    检索 500。构造过程故意放慢，放大 check-then-set 的竞态窗口。
+    """
+    construct_calls = []
+
+    class SlowClient:
+        def __init__(self, **kwargs):
+            construct_calls.append(kwargs)
+            time.sleep(0.05)
+
+    monkeypatch.setattr(milvus_client, "MilvusClient", SlowClient)
+    monkeypatch.setattr(milvus_client, "_client", None)
+
+    thread_count = 8
+    start = threading.Barrier(thread_count)
+    results = []
+    errors = []
+
+    def connect():
+        start.wait()
+        try:
+            results.append(milvus_client._connect_milvus())
+        except Exception as exc:  # 竞态下的异常要作为断言失败暴露，而不是吞掉
+            errors.append(exc)
+
+    threads = [threading.Thread(target=connect) for _ in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not any(thread.is_alive() for thread in threads), "并发初始化出现死锁"
+    assert errors == []
+    assert len(construct_calls) == 1
+    assert len(results) == thread_count
+    # 所有线程拿到的必须是同一个实例。
+    assert len({id(client) for client in results}) == 1
+
+
+def test_connect_milvus_retries_after_initialization_failure(monkeypatch):
+    """初始化失败不得缓存半初始化实例：后续调用要能重新构造。"""
+    attempts = []
+
+    class FlakyClient:
+        def __init__(self, **kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                raise RuntimeError("another process holds the lock on milvus.db")
+
+    monkeypatch.setattr(milvus_client, "MilvusClient", FlakyClient)
+    monkeypatch.setattr(milvus_client, "_client", None)
+
+    with pytest.raises(RuntimeError, match="another process holds the lock"):
+        milvus_client._connect_milvus()
+
+    # 失败后不能留下不可用的实例，否则后续请求会一直复用坏对象。
+    assert milvus_client._client is None
+
+    client = milvus_client._connect_milvus()
+
+    assert client is not None
+    assert len(attempts) == 2
