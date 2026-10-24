@@ -603,12 +603,24 @@ export const useChatStore = defineStore('chat', () => {
     // 流式期间拒绝删除：正在生成的回答还没落库，此时删消息会让流式收尾把内容写回。
     if (streaming.value || !messageId) return false
 
-    const index = messages.value.findIndex((message) => message.id === messageId)
-    const target = index >= 0 ? messages.value[index] : null
+    // 请求期间用户可能切换会话。记住发起时的会话：响应落地后只有「仍停在同一会话」
+    // 才能改 messages——否则旧会话的 index 会把新会话的尾部截掉。
+    const conversationId = currentId.value
 
     await chatAPI.deleteMessage(messageId)
 
+    // 已经切走：服务端的删除照常生效，但当前窗口属于另一个会话，绝不碰它的
+    // messages / hasMoreMessages / 评估轮询。只刷新侧栏（与视图无关）。
+    if (currentId.value !== conversationId) {
+      await fetchConversations().catch(() => {})
+      return true
+    }
+
+    // 仍停在原会话：等待期间消息列表可能被流式收尾或刷新改过，按 id 重新定位。
+    // 复用 await 前的 index 会在列表缩短/重排后截错位置。
+    const index = messages.value.findIndex((message) => message.id === messageId)
     if (index >= 0) {
+      const target = messages.value[index]
       if (target.role === 'user') {
         // 用户消息 = 截断：它和它之后的所有本地消息一起消失（与后端语义一致）。
         messages.value = messages.value.slice(0, index)

@@ -1396,6 +1396,37 @@ test('deleteMessage：没有本地 id 的消息不可删除', async () => {
   assert.deepEqual(deleteCalls, [])
 })
 
+test('deleteMessage：请求在途时切换会话，迟到的响应不得截断新会话', async () => {
+  const store = createStore([conversation('a'), conversation('b')])
+  await openConversation(store, 'a', [
+    roleMessage(1, 'user', 'A 的第一问'),
+    roleMessage(2, 'user', 'A 的第二问'),
+    roleMessage(3, 'assistant', 'A 的回答'),
+  ])
+
+  // 删除 A 的第二问（用户消息）。旧实现会在响应落地时按 await 前的 index 截断。
+  const deletion = store.deleteMessage(2)
+  await flush()
+  assert.deepEqual(deleteCalls, [2])
+
+  // 删除请求还没回来，用户切到 B：B 的整页消息已经提交到视图。
+  const switching = store.selectConversation('b')
+  respond('b', [roleMessage(9, 'user', 'B 的问题'), roleMessage(10, 'assistant', 'B 的回答')])
+  await switching
+  assert.equal(store.currentId, 'b')
+  assert.deepEqual(contents(store), ['B 的问题', 'B 的回答'])
+
+  // 旧会话的删除响应现在才落地：服务端删的是 A，绝不能拿 A 的位置截 B。
+  respondDelete(2)
+  await flush()
+  respondConversations([conversation('a'), conversation('b')])
+  assert.equal(await deletion, true)
+
+  assert.equal(store.currentId, 'b', '响应落地不得把视图切回 A')
+  assert.deepEqual(contents(store), ['B 的问题', 'B 的回答'], '新会话的消息必须原样保留')
+  assert.equal(store.hasMoreMessages, false, '新会话的翻页状态也不得被旧删除改写')
+})
+
 // ---------------------------------------------------------------------------
 // 会话标题检索（issue #251）：检索词只影响会话列表请求，消息加载与流式收尾不受牵连。
 // 桩按发出顺序记录每次 getConversations 的参数，因此能直接断言 q / 游标到底带了什么。

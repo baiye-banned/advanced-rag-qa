@@ -6,8 +6,8 @@
   只删这一条。删完重新 GET 历史不复活，真实行删除而不是前端隐藏。
 - **归属**：`message_id + user_id` 一起查；别人的消息与不存在的消息一律 404，且不回显正文。
 - **联动状态**：会话 `updated_at` 前进（侧栏排序）；记忆摘要覆盖到被删区间时作废；
-  附件键只登记待回收行，**不在请求路径碰 OSS**。
-- **事务**：一次提交；提交失败时消息、摘要、登记行全部回滚。
+  附件键写进 #238 的墓碑状态，**不在请求路径碰 OSS**。
+- **事务**：一次提交；提交失败时消息、摘要、附件行全部回滚。
 
 夹具骨架取自 `tests/test_message_feedback_250.py`（HTTP 归属）与
 `tests/test_conversation_activity_bump_239.py`（内存 SQLite + 时间戳断言）。
@@ -289,10 +289,32 @@ def test_memory_summary_survives_when_pointer_is_before_the_deleted_region(api):
     assert first_user  # 前置消息保留，避免变量被优化掉时误读测试意图
 
 
-# --- 附件：登记待回收行，不碰 OSS ----------------------------------------------------
+# --- 附件：写墓碑（不碰 OSS） ---------------------------------------------------------
 
 
-def test_deleting_an_attachment_message_registers_a_pending_row_without_touching_oss(api, monkeypatch):
+def _register_consumed_upload(api, object_key=ATTACHMENT_KEY, *, user=None):
+    """走真实上传链路：登记行 + 发送时消费（consumed_at 非空）。"""
+    owner = user or api.alice
+    crud_chat.register_attachment_upload(api.db, object_key, owner.id)
+    consumed = crud_chat.confirm_attachment_uploads(api.db, [object_key], owner.id)
+    api.db.commit()
+    assert consumed == 1
+
+
+def _forbid_oss_path(monkeypatch):
+    calls = []
+
+    def fail_if_called(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("删除消息的请求路径不允许回收 OSS 对象")
+
+    monkeypatch.setattr(chat_service, "_delete_oss_object", fail_if_called)
+    monkeypatch.setattr(chat_service, "reclaim_orphan_chat_attachments", fail_if_called)
+    monkeypatch.setattr(crud_chat, "delete_attachment_uploads", fail_if_called)
+    return calls
+
+
+def test_deleting_an_attachment_message_tombstones_the_consumed_upload_without_touching_oss(api, monkeypatch):
     _add_conversation(api, "conv-attachment")
     target = _add_message(
         api,
@@ -301,40 +323,132 @@ def test_deleting_an_attachment_message_registers_a_pending_row_without_touching
         "带图回答",
         attachments=[{"object_key": ATTACHMENT_KEY, "name": "photo.png"}],
     )
+    # 真实链路：上传即登记、发送即消费。这也正是旧实现漏回收的形状——行一直在。
+    _register_consumed_upload(api)
+    before = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    assert before.consumed_at is not None
+    created_at = before.created_at
 
-    oss_calls = []
-    attachment_deletes = []
-
-    def fail_if_called(*args, **_kwargs):
-        oss_calls.append(args)
-        raise AssertionError("删除消息的请求路径不允许删除 OSS 对象")
-
-    monkeypatch.setattr(chat_service, "_delete_oss_object", fail_if_called)
-    monkeypatch.setattr(chat_service, "reclaim_orphan_chat_attachments", fail_if_called)
-    monkeypatch.setattr(crud_chat, "delete_attachment_uploads", fail_if_called)
-
-    started = datetime.now() - timedelta(seconds=5)
+    calls = _forbid_oss_path(monkeypatch)
     assert _delete(api, target).status_code == 200
-
-    assert oss_calls == [], "请求路径调用了 OSS 删除"
-    assert attachment_deletes == []
+    assert calls == [], "请求路径调用了 OSS 删除"
 
     api.db.expunge_all()
     upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
-    # P 状态：pending 行留给既有清扫按 TTL 处理，而不是在请求里同步删对象。
+    # 同一行转成墓碑：不删行、不改创建时间、不改归属。
     assert upload.user_id == api.alice.id
+    assert upload.created_at == created_at
     assert upload.consumed_at is None
-    assert upload.claimed_at is None
-    assert upload.reclaimed_at is None
-    assert upload.created_at >= started
+    assert upload.claimed_at is not None
+    assert upload.reclaimed_at is not None
+    assert upload.claimed_at == upload.reclaimed_at
 
+    # 墓碑不再是 pending 候选（P 已被墓碑排除），但可以被过期租约路径重新领取，
+    # 由既有清扫完成真正的 OSS 删除——这里只验证状态机可达，不发网络请求。
     pending = crud_chat.list_pending_attachment_uploads(
         api.db, older_than=datetime.now() + timedelta(seconds=1)
     )
-    assert [row.object_key for row in pending] == [ATTACHMENT_KEY]
+    assert [row.object_key for row in pending] == []
+
+    later = upload.claimed_at + timedelta(seconds=1)
+    stale = crud_chat.list_stale_reclaimed_attachment_uploads(
+        api.db, now=later, lease_seconds=0
+    )
+    assert stale == [ATTACHMENT_KEY]
+    assert crud_chat.claim_stale_attachment_upload(
+        api.db, ATTACHMENT_KEY, now=later, lease_seconds=0
+    ) is True
+
+    api.db.expunge_all()
+    reclaimed = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    # 重新领取只推进租约，墓碑本身不动。
+    assert reclaimed.reclaimed_at == upload.reclaimed_at
+    assert reclaimed.claimed_at == later
 
 
-def test_attachment_still_referenced_by_another_message_is_not_registered(api):
+def test_pending_upload_row_is_tombstoned_too(api):
+    _add_conversation(api, "conv-pending-upload")
+    target = _add_message(
+        api,
+        "conv-pending-upload",
+        "assistant",
+        "带图回答",
+        attachments=[{"object_key": ATTACHMENT_KEY}],
+    )
+    # 只登记、未消费：pending 行同样要被收敛成墓碑，否则它会继续被当成孤儿候选。
+    crud_chat.register_attachment_upload(api.db, ATTACHMENT_KEY, api.alice.id)
+    before = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    assert before.consumed_at is None
+    created_at = before.created_at
+
+    assert _delete(api, target).status_code == 200
+
+    api.db.expunge_all()
+    upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    assert upload.created_at == created_at
+    assert upload.consumed_at is None
+    assert upload.claimed_at is not None
+    assert upload.reclaimed_at is not None
+
+
+def test_attachment_owned_by_another_user_is_left_untouched(api):
+    _add_conversation(api, "conv-foreign-upload")
+    target = _add_message(
+        api,
+        "conv-foreign-upload",
+        "assistant",
+        "引用了别人的键",
+        attachments=[{"object_key": ATTACHMENT_KEY}],
+    )
+    consumed_at = T0 + timedelta(days=1)
+    api.db.add(ChatAttachmentUpload(
+        object_key=ATTACHMENT_KEY,
+        user_id=api.bob.id,
+        consumed_at=consumed_at,
+        created_at=T0,
+    ))
+    api.db.commit()
+
+    assert _delete(api, target).status_code == 200
+
+    api.db.expunge_all()
+    upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    # 归属判据（#233）：别人铸的键不归当前用户回收。
+    assert upload.user_id == api.bob.id
+    assert upload.consumed_at == consumed_at
+    assert upload.claimed_at is None
+    assert upload.reclaimed_at is None
+
+
+def test_already_reclaimed_attachment_row_is_left_untouched(api):
+    _add_conversation(api, "conv-reclaimed-upload")
+    target = _add_message(
+        api,
+        "conv-reclaimed-upload",
+        "assistant",
+        "带图回答",
+        attachments=[{"object_key": ATTACHMENT_KEY}],
+    )
+    reclaimed_at = T0 + timedelta(hours=1)
+    api.db.add(ChatAttachmentUpload(
+        object_key=ATTACHMENT_KEY,
+        user_id=api.alice.id,
+        created_at=T0,
+        reclaimed_at=reclaimed_at,
+    ))
+    api.db.commit()
+
+    assert _delete(api, target).status_code == 200
+
+    api.db.expunge_all()
+    upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    # 既成事实：墓碑不重写，避免把「已结算」改回「正在删」或缩短既有租约。
+    assert upload.consumed_at is None
+    assert upload.claimed_at is None
+    assert upload.reclaimed_at == reclaimed_at
+
+
+def test_attachment_still_referenced_by_another_message_is_not_tombstoned(api):
     _add_conversation(api, "conv-shared-attachment")
     target = _add_message(
         api,
@@ -350,47 +464,22 @@ def test_attachment_still_referenced_by_another_message_is_not_registered(api):
         "仍然引用",
         attachments=[{"object_key": ATTACHMENT_KEY}],
     )
+    _register_consumed_upload(api)
 
     assert _delete(api, target).status_code == 200
 
     api.db.expunge_all()
-    assert api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).first() is None
-
-
-def test_existing_attachment_row_is_not_overwritten(api):
-    _add_conversation(api, "conv-existing-upload")
-    target = _add_message(
-        api,
-        "conv-existing-upload",
-        "assistant",
-        "带图回答",
-        attachments=[{"object_key": ATTACHMENT_KEY}],
-    )
-    consumed_at = T0 + timedelta(days=1)
-    api.db.add(ChatAttachmentUpload(
-        object_key=ATTACHMENT_KEY,
-        user_id=api.bob.id,
-        consumed_at=consumed_at,
-        created_at=T0,
-    ))
-    api.db.commit()
-
-    assert _delete(api, target).status_code == 200
-
-    api.db.expunge_all()
-    uploads = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).all()
-    assert len(uploads) == 1
-    # 同键已有行原样保留：状态与属主是另一条链路的事实，删消息不能覆盖它。
-    assert uploads[0].user_id == api.bob.id
-    assert uploads[0].consumed_at == consumed_at
-    assert uploads[0].claimed_at is None
-    assert uploads[0].reclaimed_at is None
+    upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    # 还有存活消息引用这把键：不能判死。
+    assert upload.consumed_at is not None
+    assert upload.claimed_at is None
+    assert upload.reclaimed_at is None
 
 
 # --- 事务失败回滚 -------------------------------------------------------------------
 
 
-def test_commit_failure_rolls_back_messages_memory_and_attachment_rows(api, monkeypatch):
+def test_commit_failure_rolls_back_messages_memory_and_attachment_tombstone(api, monkeypatch):
     _add_conversation(api, "conv-rollback")
     target = _add_message(
         api,
@@ -400,6 +489,11 @@ def test_commit_failure_rolls_back_messages_memory_and_attachment_rows(api, monk
         attachments=[{"object_key": ATTACHMENT_KEY}],
     )
     answer = _add_message(api, "conv-rollback", "assistant", "回答")
+    _register_consumed_upload(api)
+    api.db.expunge_all()
+    consumed_at = (
+        api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one().consumed_at
+    )
     conversation = _reload_conversation(api, "conv-rollback")
     conversation.memory_summary = "删除前的摘要"
     conversation.memory_summary_upto_message_id = answer
@@ -414,7 +508,7 @@ def test_commit_failure_rolls_back_messages_memory_and_attachment_rows(api, monk
     with pytest.raises(RuntimeError):
         crud_chat.delete_message(api.db, target, api.alice.id)
 
-    # 消息、摘要、附件登记行都必须回到删除前，不能留下半写状态。
+    # 消息、摘要、附件墓碑都必须回到删除前，不能留下半写状态。
     api.db.expunge_all()
     assert [row.id for row in api.db.query(Message).order_by(Message.id.asc()).all()] == [target, answer]
     conversation = api.db.query(Conversation).filter_by(id="conv-rollback").one()
@@ -422,4 +516,7 @@ def test_commit_failure_rolls_back_messages_memory_and_attachment_rows(api, monk
     assert conversation.memory_summary_upto_message_id == answer
     assert conversation.memory_updated_at == T0
     assert conversation.updated_at == before_updated_at
-    assert api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).first() is None
+    upload = api.db.query(ChatAttachmentUpload).filter_by(object_key=ATTACHMENT_KEY).one()
+    assert upload.consumed_at == consumed_at
+    assert upload.claimed_at is None
+    assert upload.reclaimed_at is None

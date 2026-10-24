@@ -196,7 +196,7 @@
                 data-testid="delete-message"
                 data-message-role="user"
                 :disabled="!message.id || chatStore.streaming"
-                @click="onDeleteMessage(message, index)"
+                @click="onDeleteMessage(message)"
               >
                 <el-icon><Delete /></el-icon>
                 删除
@@ -240,7 +240,7 @@
                   data-testid="delete-message"
                   data-message-role="assistant"
                   :disabled="!message.id || chatStore.streaming"
-                  @click="onDeleteMessage(message, index)"
+                  @click="onDeleteMessage(message)"
                 />
               </el-tooltip>
             </div>
@@ -806,7 +806,7 @@ function onFeedback(message, value) {
   chatStore.setMessageFeedback(message.id, next).catch(() => {})
 }
 
-async function onDeleteMessage(message, index) {
+async function onDeleteMessage(message) {
   if (!message.id || chatStore.streaming) return
 
   const isQuestion = message.role === 'user'
@@ -820,11 +820,19 @@ async function onDeleteMessage(message, index) {
     return
   }
 
-  const wasLast = index === chatStore.messages.length - 1
+  // 确认框打开的这段时间里用户可能已经开始生成回答：store 此时直接返回 false、
+  // 不发删除请求。不能沿用「调用过就成功」的写法，否则消息还在却提示已删除。
+  const conversationId = chatStore.currentId
+  const wasLast = chatStore.messages[chatStore.messages.length - 1]?.id === message.id
   try {
-    await chatStore.deleteMessage(message.id)
+    const deleted = await chatStore.deleteMessage(message.id)
+    if (!deleted) {
+      ElMessage.warning('正在生成回答，暂不能删除')
+      return
+    }
     ElMessage.success(isQuestion ? '已删除该提问及其后的消息' : '已删除该回答')
-    if (isQuestion || wasLast) scrollToBottom()
+    // 请求期间切走时不要滚动另一个会话的窗口。
+    if (chatStore.currentId === conversationId && (isQuestion || wasLast)) scrollToBottom()
   } catch {
     // 失败提示由 request.js 拦截器统一给出，这里不再弹第二次。
   }

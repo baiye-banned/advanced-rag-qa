@@ -735,13 +735,15 @@ def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | No
     别人的消息在查询里就不存在，因此对调用方只呈现 404，不会回显正文。
 
     一次提交里完成四件事：删消息、推进会话 `updated_at`、必要时作废记忆摘要、给不再被
-    任何消息引用的附件键登记回收行。任何一步失败都整体回滚——不存在「消息删了但侧栏没动」
+    任何消息引用的附件键写下墓碑。任何一步失败都整体回滚——不存在「消息删了但侧栏没动」
     或「摘要清了但消息还在」的中间态。
 
     附件**不在这里删对象**（不调用 OSS / `_reclaim_chat_attachments` / `delete_attachment_uploads`）：
-    请求路径只登记一条 pending 行（created_at=now），由既有的 `reclaim_orphan_chat_attachments`
-    按 TTL 清扫。同键已有登记行时不覆盖——那行可能正被发送侧消费或已被判死，改写它会
-    制造「活消息引用已删对象」的竞态。
+    请求路径只把键收敛到 #238 的墓碑状态（`claimed_at` + `reclaimed_at` 同时写下、清掉
+    `consumed_at`），真正的 OSS DELETE 由既有的 `reclaim_orphan_chat_attachments` 在租约
+    到期后领取执行；失败时 `clear_attachment_claim` 会把行放回队列。不能只给「还没有行」
+    的键插 pending 行——真实链路上传时一定已登记、发送时盖了 `consumed_at`，那样写会让
+    所有实际用过的附件都漏出回收视野（对象桶是 public-read，泄漏即长期可读）。
     """
     message = get_message_by_user(db, message_id, user_id)
     if message is None:
@@ -762,7 +764,12 @@ def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | No
         # 助手消息只删这一条；其它角色（历史脏数据）同样按单条处理。
         delete_condition = Message.id == message.id
 
-    rows = db.query(Message.id, Message.attachments).filter(delete_condition).all()
+    rows = (
+        db.query(Message.id, Message.attachments)
+        .filter(delete_condition)
+        .order_by(Message.id.asc())
+        .all()
+    )
     deleted_ids = [row_id for row_id, _raw in rows]
 
     # 附件键必须在删行之前收集；删完就再也读不到这些消息引用过什么。
@@ -800,22 +807,42 @@ def delete_message(db: Session, message_id: int, user_id: int) -> list[int] | No
             conversation.memory_updated_at = None
 
         if orphan_keys:
-            # 同键已有行时**不改写**：那行的状态（待消费 / 已消费 / 墓碑）是另一条链路的
-            # 事实，覆盖它会把正在发送的附件误判成孤儿，或让已被判死的对象重新放行。
-            existing_keys = {
-                object_key
-                for (object_key,) in db.query(ChatAttachmentUpload.object_key)
+            # 附件回收复用 #238 的墓碑/租约状态机，不另造一套 pending 语义（见 docstring）。
+            # 同一批键共用一个时间戳：墓碑与租约起点同时写下，且整批可读作同一时刻的意图。
+            now = datetime.now()
+            existing_rows = (
+                db.query(ChatAttachmentUpload)
                 .filter(ChatAttachmentUpload.object_key.in_(orphan_keys))
                 .all()
-            }
+            )
+            registered_keys: set[str] = set()
+            for row in existing_rows:
+                registered_keys.add(row.object_key)
+                # 归属判据（#233）：别人铸的键不归当前用户回收，保持原状。
+                if row.user_id != user_id:
+                    continue
+                # 已经是墓碑（可能正被清扫领取、也可能已结算）：不重写，避免缩短/抹掉
+                # 既有租约状态，也避免把「删除已成」改回「正在删」。
+                if row.reclaimed_at is not None:
+                    continue
+                # pending 或 consumed 都收敛为墓碑：清掉消费标记（使其不再被当成活跃引用），
+                # 写下 claimed_at 让清扫在租约到期后重新领取并真正删除对象。
+                # 行必须保留——它是归属凭据；created_at 也不动——它仍按上传时刻排队。
+                row.consumed_at = None
+                row.claimed_at = now
+                row.reclaimed_at = now
+            # 历史老键（本服务登记过但库里没有行）：直接插入一条完整墓碑。
             db.add_all([
                 ChatAttachmentUpload(
                     object_key=object_key,
                     user_id=user_id,
-                    created_at=datetime.now(),
+                    created_at=now,
+                    consumed_at=None,
+                    claimed_at=now,
+                    reclaimed_at=now,
                 )
                 for object_key in orphan_keys
-                if object_key not in existing_keys
+                if object_key not in registered_keys
             ])
 
         db.commit()

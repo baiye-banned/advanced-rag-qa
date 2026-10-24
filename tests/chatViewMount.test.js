@@ -1279,6 +1279,43 @@ test('删除按钮：没有 id 的本地消息禁用，且点击不发请求', a
   }
 })
 
+test('删除消息：确认框打开后开始流式，不报成功并保留消息', async () => {
+  const { view } = await mountChat({ route: '/chat/c1' })
+
+  try {
+    const store = await viewStore(view)
+    respondWith('confirm')
+
+    // 点击同步打开确认框（记录会立刻落下），await 的续体要等当前栈结束才跑。
+    deleteButtons(view, 'assistant')[0].click()
+    // 确认框还开着时用户开始了生成：store 的删除入口会直接返回 false、不发请求。
+    store.streaming = true
+    await settle(view)
+
+    assert.deepEqual(confirmations, [{ message: '删除这条回答？', title: '删除消息' }])
+    assert.equal(store.streaming, true)
+    assert.equal(callsOf('delete').length, 0, '流式期间不得发出删除请求')
+    assert.deepEqual(
+      store.messages.map((message) => message.id),
+      [1, 2],
+      '没有真正删除时消息必须留在本地'
+    )
+    assert.match(view.text(), /你好，世界/, '没有真正删除时气泡必须留在屏幕上')
+    assert.deepEqual(
+      view.messages.filter((message) => message.level === 'success'),
+      [],
+      'store 返回 false 时不得报「已删除」'
+    )
+    assert.deepEqual(
+      view.messages.filter((message) => message.level === 'warning').map((message) => message.message),
+      ['正在生成回答，暂不能删除'],
+      '应当明确提示此刻不能删除'
+    )
+  } finally {
+    await close(view)
+  }
+})
+
 test('删除按钮：流式生成期间全部禁用，点击也不发请求', async () => {
   const { view } = await mountChat({ route: '/chat/c1' })
 
