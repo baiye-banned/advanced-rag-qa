@@ -4,6 +4,13 @@ import re
 from typing import Any
 
 from langchain_openai import ChatOpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    ContentFilterFinishReasonError,
+    RateLimitError,
+)
 
 from config import (
     DEEPSEEK_API_KEY,
@@ -24,6 +31,39 @@ logger = logging.getLogger(__name__)
 LLM_GENERATION_FAILED_MESSAGE = "DeepSeek 生成失败"
 LLM_TEXT_FALLBACK_FAILED_MESSAGE = "文本后备模型生成失败"
 ANSWER_GENERATION_FAILED_MESSAGE = "回答生成失败，请稍后重试"
+
+# 生成失败按原因给固定前缀：缺 Key 不能再说成网络故障，网络故障也不能被当成配置问题。
+# 异常原文只进 logger，这些文案才进 SSE error 事件（前端原样显示）。
+DEEPSEEK_API_KEY_MISSING_MESSAGE = "DeepSeek API Key 未配置，请在 .env 中配置 DEEPSEEK_API_KEY"  # scan-secrets:allow 用户提示文案，不是凭据值
+DEEPSEEK_TRANSPORT_FAILED_MESSAGE = "DeepSeek 网络/上游请求失败"
+DEEPSEEK_CONTENT_FILTERED_MESSAGE = "DeepSeek 模型拒绝生成该内容，请调整提问后重试"
+TEXT_FALLBACK_DISABLED_HINT = "；文本后备模型未启用，请设置 TEXT_FALLBACK_ENABLED=true。"
+TEXT_FALLBACK_UNCONFIGURED_HINT = "；文本后备模型未配置，请配置 TEXT_FALLBACK_API_KEY 或 DASHSCOPE_API_KEY。"
+
+
+class LLMCredentialError(RuntimeError):
+    """本地缺少模型凭据；单独成型以便与网络/上游失败分流。
+
+    继承 RuntimeError，保持既有调用方与测试的异常契约不变。
+    """
+
+
+def _is_transport_error(exc: Exception) -> bool:
+    """网络断开、超时、限流与上游 5xx 归入传输类；本地缺 Key 与模型拒绝另行分流。"""
+    if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError)):
+        return True
+    return isinstance(exc, APIStatusError) and exc.status_code >= 500
+
+
+def _classify_deepseek_failure(exc: Exception) -> tuple[str, str]:
+    """把生成异常映射为 (日志分类, 用户固定文案前缀)；异常原文只交给 logger。"""
+    if isinstance(exc, LLMCredentialError):
+        return "missing_credentials", DEEPSEEK_API_KEY_MISSING_MESSAGE
+    if isinstance(exc, ContentFilterFinishReasonError):
+        return "content_filtered", DEEPSEEK_CONTENT_FILTERED_MESSAGE
+    if _is_transport_error(exc):
+        return "transport", DEEPSEEK_TRANSPORT_FAILED_MESSAGE
+    return "generation", LLM_GENERATION_FAILED_MESSAGE
 
 
 def normalize_deepseek_model(model: str) -> str:
@@ -53,7 +93,7 @@ def openai_chat_url(base_url: str) -> str:
 
 def get_deepseek_model(*, streaming: bool = False, temperature: float = 0.1, max_tokens: int | None = None):
     if not DEEPSEEK_API_KEY:
-        raise RuntimeError("DeepSeek API Key 未配置")
+        raise LLMCredentialError("DeepSeek API Key 未配置")
     kwargs = {
         "api_key": DEEPSEEK_API_KEY,
         "base_url": openai_base_url(DEEPSEEK_BASE_URL),
@@ -70,7 +110,7 @@ def get_deepseek_model(*, streaming: bool = False, temperature: float = 0.1, max
 
 def get_text_fallback_model(*, streaming: bool = False, temperature: float = 0.1, max_tokens: int | None = None):
     if not TEXT_FALLBACK_API_KEY:
-        raise RuntimeError("文本后备模型 API Key 未配置")
+        raise LLMCredentialError("文本后备模型 API Key 未配置")
     kwargs = {
         "api_key": TEXT_FALLBACK_API_KEY,
         "base_url": openai_base_url(TEXT_FALLBACK_BASE_URL),
@@ -155,7 +195,13 @@ async def stream_answer_events(
             yield chunk
         return
     except Exception as exc:
-        logger.warning("DeepSeek stream generation failed: %s", exc, exc_info=True)
+        failure_kind, failure_prefix = _classify_deepseek_failure(exc)
+        logger.warning(
+            "DeepSeek stream generation failed (%s): %s",
+            failure_kind,
+            exc,
+            exc_info=True,
+        )
         await _trace_add(
             trace,
             "langchain_generation_failed",
@@ -166,13 +212,13 @@ async def stream_answer_events(
         if not TEXT_FALLBACK_ENABLED:
             yield {
                 "type": "error",
-                "message": "DeepSeek 网络请求失败，且文本后备模型未启用，请设置 TEXT_FALLBACK_ENABLED=true。",
+                "message": failure_prefix + TEXT_FALLBACK_DISABLED_HINT,
             }
             return
         if not TEXT_FALLBACK_API_KEY:
             yield {
                 "type": "error",
-                "message": "DeepSeek 网络请求失败，且文本后备模型未配置，请配置 TEXT_FALLBACK_API_KEY 或 DASHSCOPE_API_KEY。",
+                "message": failure_prefix + TEXT_FALLBACK_UNCONFIGURED_HINT,
             }
             return
 

@@ -7,6 +7,9 @@
 
 import asyncio
 
+import httpx
+from openai import APIConnectionError
+
 import rag.llm as llm
 from conftest import FakeKnowledgeBase, collect_stream, frames_of_type, parse_sse_frames
 from model.models import User
@@ -212,3 +215,90 @@ def _events_from_sse(frames):
         else:
             events.append(frame.get("content", ""))
     return events
+
+
+# --- issue #292：生成失败按「缺 Key / 网络 / 后备可用性」分流用户文案 -------
+
+def _error_messages(events):
+    return [
+        event["message"]
+        for event in events
+        if isinstance(event, dict) and event.get("type") == "error"
+    ]
+
+
+def _has_reset(events):
+    return any(isinstance(event, dict) and event.get("type") == "reset" for event in events)
+
+
+def _fallback_only_stream(monkeypatch):
+    """DeepSeek 在配置校验阶段就失败，因此只会走到后备模型这一次流式调用。"""
+
+    async def fake_stream(model, messages):
+        for piece in FALLBACK_CHUNKS:
+            yield piece
+
+    monkeypatch.setattr(llm, "_stream_model_chunks", fake_stream)
+
+
+def test_missing_deepseek_key_reports_config_hint_when_fallback_disabled(monkeypatch):
+    monkeypatch.setattr(llm, "DEEPSEEK_API_KEY", "")
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_ENABLED", False)
+
+    events = _collect_events("问题", "上下文", memory_context="")
+
+    messages = _error_messages(events)
+    assert len(messages) == 1
+    assert "DEEPSEEK_API_KEY" in messages[0]
+    assert "TEXT_FALLBACK_ENABLED" in messages[0]
+    assert "网络" not in messages[0]
+    assert not _has_reset(events)
+
+
+def test_missing_deepseek_key_uses_fallback_when_available(monkeypatch):
+    monkeypatch.setattr(llm, "DEEPSEEK_API_KEY", "")
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_API_KEY", "sk-test")
+    _fallback_only_stream(monkeypatch)
+
+    events = _collect_events("问题", "上下文", memory_context="")
+
+    assert _error_messages(events) == []
+    rendered, resets = _render_like_frontend(events)
+    assert resets == 1
+    assert rendered == FALLBACK_TEXT
+
+
+def test_missing_deepseek_key_reports_fallback_key_when_unconfigured(monkeypatch):
+    monkeypatch.setattr(llm, "DEEPSEEK_API_KEY", "")
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_ENABLED", True)
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_API_KEY", "")
+
+    events = _collect_events("问题", "上下文", memory_context="")
+
+    messages = _error_messages(events)
+    assert len(messages) == 1
+    assert "DEEPSEEK_API_KEY" in messages[0]
+    assert "TEXT_FALLBACK_API_KEY" in messages[0]
+    assert "DASHSCOPE_API_KEY" in messages[0]
+    assert "网络" not in messages[0]
+    assert not _has_reset(events)
+
+
+def test_transport_failure_keeps_network_wording(monkeypatch):
+    async def failing_stream(model, messages):
+        raise APIConnectionError(
+            request=httpx.Request("POST", "https://api.deepseek.test/v1/chat/completions")
+        )
+        yield ""  # pragma: no cover - 该分支只验证异常分流
+
+    monkeypatch.setattr(llm, "_stream_model_chunks", failing_stream)
+    monkeypatch.setattr(llm, "DEEPSEEK_API_KEY", "sk-test")
+    monkeypatch.setattr(llm, "TEXT_FALLBACK_ENABLED", False)
+
+    events = _collect_events("问题", "上下文", memory_context="")
+
+    messages = _error_messages(events)
+    assert len(messages) == 1
+    assert "网络/上游请求失败" in messages[0]
+    assert "DEEPSEEK_API_KEY 未配置" not in messages[0]
