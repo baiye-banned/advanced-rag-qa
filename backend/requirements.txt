@@ -16,3 +16,4 @@ openai>=3.23.0
 pymilvus[milvus_lite]==3.0.2
 milvus-lite==3.2.1
 python-dotenv>=1.2.4
+tiktoken==0.14.0

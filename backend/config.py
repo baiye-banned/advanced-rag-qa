@@ -28,6 +28,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 _logger = logging.getLogger(__name__)
 
 
@@ -182,18 +192,36 @@ EMBEDDING_DIM = _env_int("EMBEDDING_DIM", 1024)
 # online-QA scale. Bulk ingestion has its own budget below and ignores this one.
 EMBEDDING_TIMEOUT_SECONDS = _env_int("EMBEDDING_TIMEOUT_SECONDS", 10)
 
-# Bulk ingestion splits a whole document into several embedding requests instead of
-# sending every chunk at once. Two limits apply, whichever binds first: chunk count
-# and character count. chunk_text caps a chunk at ~1200 characters, so the character
-# limit usually binds first (60000 / 1200 = 50 chunks per request).
-EMBEDDING_INGEST_BATCH_SIZE = _env_int("EMBEDDING_INGEST_BATCH_SIZE", 64)
-EMBEDDING_INGEST_BATCH_MAX_CHARS = _env_int("EMBEDDING_INGEST_BATCH_MAX_CHARS", 60000)
+# Bulk ingestion packs a whole document into several embedding requests. The provider
+# (DashScope text-embedding-v4) accepts at most 10 inputs per request and at most 8192
+# tokens per input. Batching therefore has to respect both the item cap and a token
+# budget; the old 64-item / 60000-character defaults produced requests the provider
+# rejects with 400 (issue #286).
+#
+# Token counts come from tiktoken's cl100k_base encoding, a deterministic local
+# estimate -- not character counts dressed up as tokens. The provider's tokenizer is
+# not public, so the budget is scaled by a safety ratio to leave headroom.
+EMBEDDING_MAX_BATCH_ITEMS = _env_int("EMBEDDING_MAX_BATCH_ITEMS", 10)
+EMBEDDING_MAX_REQUEST_TOKENS = _env_int("EMBEDDING_MAX_REQUEST_TOKENS", 8192)
+EMBEDDING_TOKEN_SAFETY_RATIO = _env_float("EMBEDDING_TOKEN_SAFETY_RATIO", 0.85)
+# Extra attempts after the initial request, for 429/5xx only. Permanent errors such as
+# 400 are not retried. Retries stay inside the whole-document budget enforced by
+# KNOWLEDGE_INDEX_TOTAL_TIMEOUT_SECONDS, so they cannot turn a timeout into success.
+EMBEDDING_MAX_RETRIES = _env_int("EMBEDDING_MAX_RETRIES", 2)
+
+# Legacy knobs, kept so existing deployments keep working. The effective item cap is
+# min(EMBEDDING_MAX_BATCH_ITEMS, EMBEDDING_INGEST_BATCH_SIZE), so a legacy value can
+# only tighten -- never exceed -- the model capability. The legacy character cap is an
+# additional constraint when positive; 0 disables it. Neither default reproduces the
+# 64-item / 60000-character request that the provider rejects.
+EMBEDDING_INGEST_BATCH_SIZE = _env_int("EMBEDDING_INGEST_BATCH_SIZE", EMBEDDING_MAX_BATCH_ITEMS)
+EMBEDDING_INGEST_BATCH_MAX_CHARS = _env_int("EMBEDDING_INGEST_BATCH_MAX_CHARS", 0)
 
 # Bulk ingestion keeps its own timeout instead of sharing the online-QA one above.
-# A batch carries up to 64 chunks / 60000 characters in a single round trip, so the
-# budget scales 6x from the single-query one, and ingestion now runs on a worker
-# thread -- a slow batch no longer freezes the event loop. Raising it further only
-# extends how long one stuck batch holds a thread-pool slot.
+# A batch now carries at most EMBEDDING_MAX_BATCH_ITEMS chunks (10 by default), so the
+# per-request body is much smaller than the old 64-chunk shape; 60s still covers a slow
+# round trip. Ingestion runs on a worker thread, so a slow batch does not freeze the
+# event loop. Raising it only extends how long one stuck batch holds a pool slot.
 EMBEDDING_INGEST_TIMEOUT_SECONDS = _env_int("EMBEDDING_INGEST_TIMEOUT_SECONDS", 60)
 
 # Ingestion runs on a thread pool of its own rather than the asyncio default
