@@ -495,6 +495,104 @@ test('流式期间点了「新对话」，迟到的会话事件不得登记待�
   assert.deepEqual(contents(store), [])
 })
 
+// ---------------------------------------------------------------------------
+// issue #262：清空会话（新建对话 / 登出）必须中止在途流。
+// 只中止而不作废回调，或只清视图而不复位 streaming，都会让新对话的首条消息发不出去，
+// 或者让旧流把迟到的增量 / 停止标记写回已清空的视图。
+// ---------------------------------------------------------------------------
+
+const abortError = () => Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })
+
+test('清空会话会中止在途流并立即复位流状态', () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  stream.onMessage('回答了一半')
+  assert.equal(store.streaming, true)
+
+  store.clearMessages()
+
+  assert.equal(store.streaming, false)
+  assert.equal(store.currentId, null)
+  assert.deepEqual(store.messages, [])
+  assert.equal(store.hasMoreMessages, false)
+  assert.equal(store.streamContent, '')
+  assert.equal(store.streamingConversationId, null)
+  assert.equal(stream.signal.aborted, true)
+})
+
+test('清空会话后可以立即发起新提问，旧流回调不再写入新视图', () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('旧问题')
+  const oldStream = streams.at(-1)
+  oldStream.onMessage('旧回答')
+  store.clearMessages()
+
+  const streamsBefore = streams.length
+  store.sendMessage('新问题')
+
+  assert.equal(streams.length, streamsBefore + 1) // 不被旧的 streaming 状态挡住
+  const newStream = streams.at(-1)
+  assert.notEqual(newStream, oldStream)
+  assert.equal(store.streaming, true)
+  assert.deepEqual(contents(store), ['新问题'])
+
+  // 旧流迟到的回调（含 abort 收尾）全部失效，既不改内容也不补停止标记。
+  oldStream.onMessage('迟到的增量')
+  oldStream.onError(abortError())
+  oldStream.onDone()
+  assert.equal(store.streamContent, '')
+  assert.deepEqual(contents(store), ['新问题'])
+  assert.equal(store.streaming, true)
+
+  newStream.onMessage('新回答')
+  assert.equal(store.streamContent, '新回答')
+
+  store.clearMessages() // 收尾，避免留下在途流
+})
+
+test('手动停止生成仍然保留已生成内容与停止标记', () => {
+  const store = createStore([conversation('a')])
+  store.setCurrentId('a')
+
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  stream.onMessage('半截回答')
+
+  store.stopGeneration()
+  stream.onError(abortError())
+
+  assert.equal(stream.signal.aborted, true)
+  assert.equal(store.streaming, false)
+  assert.deepEqual(contents(store), ['问题', '半截回答\n\n*(已停止生成)*'])
+})
+
+test('删除当前正在流式回答的会话会中止流并清空视图', async () => {
+  const store = createStore([conversation('a'), conversation('b')])
+  store.setCurrentId('a')
+
+  store.sendMessage('问题')
+  const stream = streams.at(-1)
+  stream.onMessage('回答了一半')
+
+  await store.deleteConversation('a')
+
+  assert.equal(stream.signal.aborted, true)
+  assert.equal(store.streaming, false)
+  assert.equal(store.currentId, null)
+  assert.deepEqual(store.messages, [])
+
+  // 旧流收尾不得把已删除会话认领回来。
+  stream.onError(abortError())
+  stream.onDone()
+  assert.equal(store.currentId, null)
+  assert.deepEqual(contents(store), [])
+})
+
 test('后备模型接管时，reset 事件清空已渲染内容，只保留重置后的回答', async () => {
   const store = createStore([conversation('a')])
   store.setCurrentId('a')

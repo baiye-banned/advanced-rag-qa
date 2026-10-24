@@ -417,6 +417,18 @@ export const useChatStore = defineStore('chat', () => {
     abortController.value?.abort()
   }
 
+  // 中止在途流并作废它的回调（清空视图 / 删除会话时使用）。
+  // 先递增 streamSeq：旧流的 onMessage / onDone / onError 立刻失去写入资格，
+  // 包括 abort 触发的 AbortError 收尾，不会往已清空的视图补「已停止生成」。
+  // 再 abort 真正的传输，最后复位流状态，让 streaming 立即变为 false——
+  // 否则新对话的第一条消息会被 sendMessage 的 streaming 守卫挡住。
+  function abortAndDiscardStream() {
+    streamSeq += 1
+    const controller = abortController.value
+    controller?.abort()
+    finishStreaming()
+  }
+
   function finishStreaming() {
     streaming.value = false
     streamContent.value = ''
@@ -493,11 +505,13 @@ export const useChatStore = defineStore('chat', () => {
     await chatAPI.deleteConversation(id)
     conversations.value = conversations.value.filter((conversation) => conversation.id !== id)
     selectedConversationIds.value = selectedConversationIds.value.filter((item) => item !== id)
-    if (streamingConversationId.value === id) {
-      stopGeneration()
-    }
     if (currentId.value === id) {
+      // clearMessages 会中止并丢弃在途流，无需再单独 stopGeneration。
       clearMessages()
+    } else if (streamingConversationId.value === id) {
+      // 删除的不是当前视图里的会话（流式期间用户切走了）：同样中止并丢弃，
+      // 与手动「停止生成」不同，这里没有可保留的本地回答。
+      abortAndDiscardStream()
     }
   }
 
@@ -632,6 +646,9 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function clearMessages() {
+    // 先中止在途流：streaming 若不复位，新对话的第一条消息发不出去；
+    // 同时作废旧流回调，避免它把内容或「已停止生成」补进已清空的视图。
+    abortAndDiscardStream()
     // 用户显式离开当前视图：在途流的「认领会话」「改写知识库」写入随之失效。
     viewEpoch += 1
     currentId.value = null
