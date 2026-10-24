@@ -305,6 +305,17 @@ RAGAS_MAX_ANSWER_CHARS = _env_int("RAGAS_MAX_ANSWER_CHARS", 2000)
 RETRIEVAL_ROUTE_TOP_K = _env_int("RETRIEVAL_ROUTE_TOP_K", 8)
 RETRIEVAL_RERANK_TOP_N = _env_int("RETRIEVAL_RERANK_TOP_N", 5)
 
+# BM25 keyword ranking (issue #288). When enabled, the keyword route is ordered by
+# BM25 instead of the legacy hit-count score; the legacy score is still returned in
+# every candidate for final-selection compatibility. The DF corpus is every keyword
+# window of the knowledge base, so it can be large: BM25_MAX_DOCS caps how many
+# windows may be indexed. Exceeding the cap degrades to the legacy ordering and is
+# recorded in the retrieval trace; it never quietly uses the candidate-set DF.
+BM25_ENABLED = _env_bool("BM25_ENABLED", True)
+BM25_K1 = _env_float("BM25_K1", 1.5)
+BM25_B = _env_float("BM25_B", 0.75)
+BM25_MAX_DOCS = _env_int("BM25_MAX_DOCS", 20000)
+
 # Conversation memory.
 MEMORY_WINDOW_TURNS = _env_int("MEMORY_WINDOW_TURNS", 4)
 MEMORY_SUMMARY_MAX_CHARS = _env_int("MEMORY_SUMMARY_MAX_CHARS", 15000)

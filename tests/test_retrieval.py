@@ -498,6 +498,7 @@ class _FakeKnowledgeFile:
         self.id = file_id
         self.name = name
         self.content = content
+        self.size = len(content)
         self.knowledge_base_id = knowledge_base_id
 
 
