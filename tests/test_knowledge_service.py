@@ -70,6 +70,14 @@ def _patch_upload(monkeypatch, calls, failure):
         "delete_knowledge_file",
         lambda db, file_id, user_id: calls.append(("mysql", file_id)),
     )
+    # issue #287 的元数据 CRUD 走真实 SQLAlchemy Session；这些用例的 db 是 object()，
+    # 打桩为空操作，原有用例的调用顺序断言保持不变。
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file, "replace_chunk_metadata", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file, "delete_chunk_metadata", lambda *args, **kwargs: None
+    )
 
 
 def _upload():
@@ -141,6 +149,10 @@ def test_upload_shares_one_ingest_deadline_with_the_embedding_step(monkeypatch):
         lambda entry: {"id": entry.id},
     )
     monkeypatch.setattr(knowledge_service, "add_chunks", fake_add_chunks)
+    # issue #287：上传链路会写切片元数据；本用例的 db 是 FakeDb/object 桩。
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file, "replace_chunk_metadata", lambda *args, **kwargs: None
+    )
 
     started_at = time.monotonic()
     result = _upload()
@@ -251,6 +263,90 @@ def test_rebuild_existing_knowledge_index_continues_after_single_file_failure(mo
 
     assert calls == [1, 2]
     assert closed == [True]
+
+
+def _fake_rebuild_session(entries):
+    class FakeSession:
+        def query(self, model):
+            return self
+
+        def filter(self, *args):
+            return self
+
+        def all(self):
+            return entries
+
+        def close(self):
+            pass
+
+    return FakeSession()
+
+
+def test_rebuild_existing_knowledge_index_refreshes_chunk_metadata(monkeypatch):
+    """重建成功后必须刷新切片元数据，否则 #289 会读到上一次的结构（issue #287）。"""
+    entries = [
+        type("Entry", (), {"id": 1, "content": "第一段", "name": "文件1.txt", "knowledge_base_id": 2})(),
+    ]
+    chunks = [{"id": "0", "text": "第一段", "metadata": {"section_path": "第一章"}}]
+    calls = []
+
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _fake_rebuild_session(entries))
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "chunk_text",
+        lambda text, file_id: chunks,
+    )
+    monkeypatch.setattr(knowledge_service, "add_chunks", lambda *args, **kwargs: calls.append("indexed"))
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "replace_chunk_metadata",
+        lambda db, file_id, knowledge_base_id, chunk_list: calls.append(
+            ("replace", file_id, knowledge_base_id, chunk_list)
+        ),
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_chunk_metadata",
+        lambda db, file_id: calls.append(("delete", file_id)),
+    )
+
+    knowledge_service.rebuild_existing_knowledge_index()
+
+    assert calls == ["indexed", ("replace", 1, 2, chunks)]
+
+
+def test_rebuild_existing_knowledge_index_clears_stale_metadata_on_failure(monkeypatch):
+    """单个文件重建失败时清掉旧元数据，避免 #289 读到与向量不一致的结构。"""
+    entries = [
+        type("Entry", (), {"id": 1, "content": "第一段", "name": "文件1.txt", "knowledge_base_id": 2})(),
+    ]
+    calls = []
+
+    monkeypatch.setattr(knowledge_service, "SessionLocal", lambda: _fake_rebuild_session(entries))
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "chunk_text",
+        lambda text, file_id: [{"id": "0", "text": text, "metadata": {}}],
+    )
+
+    def fail_add_chunks(*args, **kwargs):
+        raise RuntimeError("milvus unavailable")
+
+    monkeypatch.setattr(knowledge_service, "add_chunks", fail_add_chunks)
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "replace_chunk_metadata",
+        lambda *args, **kwargs: calls.append("replace"),
+    )
+    monkeypatch.setattr(
+        knowledge_service.crud_knowledge_file,
+        "delete_chunk_metadata",
+        lambda db, file_id: calls.append(("delete", file_id)),
+    )
+
+    knowledge_service.rebuild_existing_knowledge_index()
+
+    assert calls == [("delete", 1)]
 
 
 class _User:
@@ -567,6 +663,23 @@ class _CleanupSession:
 
     def __init__(self, log):
         self.log = log
+
+    # 切片元数据清理（issue #287）在「向量没删掉」的分支上会走真实 CRUD 的
+    # query/filter/delete；这是纯数据库操作，不进入本文件的调用顺序断言。
+    def query(self, *_args, **_kwargs):
+        return self
+
+    def filter(self, *_args, **_kwargs):
+        return self
+
+    def delete(self, *_args, **_kwargs):
+        return 0
+
+    def commit(self):
+        pass
+
+    def rollback(self):
+        pass
 
     def close(self):
         self.log.append(("db-close",))
@@ -910,8 +1023,10 @@ def test_timeout_cleanup_keeps_metadata_row_when_vector_delete_fails(monkeypatch
     with caplog.at_level(logging.WARNING):
         knowledge_service._delete_file_vectors_and_row(11, 7)
 
-    # 关键断言：向量没删掉，元数据行必须留下（留下行下次启动会被重建修好）。
-    assert calls == [("vectors", 11)]
+    # 关键断言：向量没删掉，知识文件行必须留下（留下行下次启动会被重建修好）；
+    # issue #287 起清理分支会先开 Session 再试删向量，因此多一条句柄关闭记录。
+    assert [call for call in calls if call[0] != "db-close"] == [("vectors", 11)]
+    assert ("db-close",) in calls
     assert "Keeping knowledge file row" in caplog.text
 
 

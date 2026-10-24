@@ -101,14 +101,31 @@ METRIC_DEFINITIONS = {
     "ingestion_failure_rate": "入库失败文件数 / 入库文件总数。",
 }
 
-# Current production baseline: heading-aware character chunking in
-# backend/crud/knowledge_file.py::chunk_text. Phase 1 records the configuration only;
-# tests/test_eval_harness_293.py pins these values against the function's AST defaults.
+# Legacy baseline: heading-aware *character* chunking. Since issue #287 chunk_text()
+# slices by a token budget unless chunk_size/chunk_overlap are passed explicitly, so
+# this is kept only for historical comparison -- it is NOT the current production path.
+# Phase 1 records the configuration only; tests/test_eval_harness_293.py pins these
+# values against the function's AST defaults.
 CHARACTER_BASELINE = {
-    "name": "character",
-    "chunk_method": "chunk_text",
+    "name": "legacy-character",
+    "chunk_method": "chunk_text(chunk_size=..., chunk_overlap=...)",
     "chunk_size": 1200,
     "chunk_overlap": 150,
+    "source": "backend/crud/knowledge_file.py:chunk_text",
+}
+
+# Current production baseline (issue #287): token-budget chunking selected by the
+# default chunk_text() call path. Kept in sync with backend/config.py defaults; this
+# script stays offline and does not import the backend. Reports label it separately so
+# the legacy character numbers can never be mistaken for the current production baseline.
+CURRENT_TOKEN_BASELINE = {
+    "name": "current-token",
+    "chunk_method": "chunk_text(file_id=...)",
+    "budget_unit": "tokens",
+    "token_limit": 500,
+    "token_target": 400,
+    "token_overlap": 50,
+    "token_safety_ratio": 0.85,
     "source": "backend/crud/knowledge_file.py:chunk_text",
 }
 
@@ -736,8 +753,13 @@ def build_report(
         },
         "baseline": {
             "status": "configuration_only",
-            "note": "一阶段只记录当前字符切片配置，未运行真实 embedding/检索。",
+            "note": (
+                "legacy-character 是历史字符切片口径，不是当前生产默认值；"
+                "当前生产默认口径见 current，token 预算路径（issue #287）。"
+                "一阶段只记录配置，未运行真实 embedding/检索。"
+            ),
             **CHARACTER_BASELINE,
+            "current": CURRENT_TOKEN_BASELINE,
         },
     }
 
@@ -881,9 +903,12 @@ def render_markdown(report: dict) -> str:
         )
 
     baseline = report["baseline"]
+    current = baseline.get("current") or {}
     lines += [
         "",
-        "## 字符切片基线",
+        "## 基线口径",
+        "",
+        "### legacy-character（历史字符基线，非当前生产口径）",
         "",
         "| 字段 | 值 |",
         "| --- | --- |",
@@ -894,6 +919,24 @@ def render_markdown(report: dict) -> str:
         f"| 源码位置 | `{_md_cell(baseline['source'])}` |",
         f"| 状态 | `{_md_cell(baseline['status'])}` |",
         "",
+    ]
+    if current:
+        lines += [
+            "### current-token（当前生产默认口径）",
+            "",
+            "| 字段 | 值 |",
+            "| --- | --- |",
+            f"| 名称 | `{_md_cell(current['name'])}` |",
+            f"| 切片方法 | `{_md_cell(current['chunk_method'])}` |",
+            f"| 计量单位 | `{_md_cell(current['budget_unit'])}` |",
+            f"| CHUNK_TOKEN_LIMIT | {current['token_limit']} |",
+            f"| CHUNK_TOKEN_TARGET | {current['token_target']} |",
+            f"| CHUNK_TOKEN_OVERLAP | {current['token_overlap']} |",
+            f"| CHUNK_TOKEN_SAFETY_RATIO | {current['token_safety_ratio']} |",
+            f"| 源码位置 | `{_md_cell(current['source'])}` |",
+            "",
+        ]
+    lines += [
         f"说明：{baseline['note']}",
         "",
         "指标公式详见 `docs/RAG_EVAL_BASELINE.md`。",

@@ -19,7 +19,15 @@ from sqlalchemy.pool import StaticPool
 
 from database import session as db_session
 from database.session import Base
-from model.models import Conversation, KnowledgeBase, KnowledgeFile, Message, RevokedToken, User
+from model.models import (
+    Conversation,
+    KnowledgeBase,
+    KnowledgeChunkMetadata,
+    KnowledgeFile,
+    Message,
+    RevokedToken,
+    User,
+)
 from router import auth as auth_router
 from router import knowledge as knowledge_router
 from schema.schemas import ChatRequest
@@ -52,6 +60,7 @@ def api(monkeypatch):
             User.__table__, RevokedToken.__table__,
             KnowledgeBase.__table__,
             KnowledgeFile.__table__,
+            KnowledgeChunkMetadata.__table__,
             Conversation.__table__,
             Message.__table__,
         ],

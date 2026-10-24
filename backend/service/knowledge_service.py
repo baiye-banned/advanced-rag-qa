@@ -215,21 +215,49 @@ def _delete_file_vectors_and_row(entry_id: int, user_id: int) -> None:
     先删向量、失败即抛 500 并保留行）同一条判据：删向量失败还照样删行，就会留下
     上面 _keep_knowledge_file_row 记的那种不自愈的孤儿向量。
     """
-    try:
-        delete_file_chunks(entry_id)
-    except Exception as exc:
-        logger.warning("Failed to clean up timed-out ingest vectors: file_id=%s error=%s", entry_id, exc, exc_info=True)
-        _keep_knowledge_file_row(entry_id, reason="vector delete failed")
-        return
     db = SessionLocal()
     try:
-        # 复用既有 CRUD：归属过滤与「行可能已被并发删掉」都走它的语义。
+        try:
+            delete_file_chunks(entry_id)
+        except Exception as exc:
+            logger.warning("Failed to clean up timed-out ingest vectors: file_id=%s error=%s", entry_id, exc, exc_info=True)
+            _keep_knowledge_file_row(entry_id, reason="vector delete failed")
+            # issue #287：向量没删干净时文件行仍留着等启动重建，但本次切片的结构元数据
+            # 不该留下——它描述的向量已经不完整，清掉后按当前文本路径降级即可。
+            _delete_chunk_metadata_best_effort(db, entry_id)
+            return
+        # 复用既有 CRUD：归属过滤与「行可能已被并发删掉」都走它的语义；
+        # delete_knowledge_file 同一次提交里也会清掉切片元数据。
         crud_knowledge_file.delete_knowledge_file(db, entry_id, user_id)
     except SQLAlchemyError as exc:
         db.rollback()
         logger.warning("Failed to remove knowledge file after ingest timeout: file_id=%s error=%s", entry_id, exc, exc_info=True)
     finally:
         db.close()
+
+
+def _delete_chunk_metadata_best_effort(db: Session, file_id: int) -> None:
+    """失败清理路径上的元数据删除：失败只留痕，不遮蔽原始错误。
+
+    读的是任意 ``Session`` 替身/半关闭会话时，失败可能不是 ``SQLAlchemyError``
+    （例如替身没有实现 ``delete``）。清理路径本身不允许再把异常抛回去。
+    先 rollback：上一步（replace/add_chunks）失败后会话可能处于待回滚状态，
+    直接 delete 会以 PendingRollbackError 失败，旧行反而清不掉。
+    """
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    try:
+        crud_knowledge_file.delete_chunk_metadata(db, file_id)
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "Failed to remove chunk metadata: file_id=%s error=%s", file_id, exc, exc_info=True
+        )
 
 
 def upload_body_exceeds_limit(content_length: str | None, max_bytes: int) -> bool:
@@ -292,6 +320,25 @@ def rebuild_existing_knowledge_index():
             except Exception as exc:
                 # 单个文件失败不阻塞启动：旧索引保持原样，可修复向量化服务后再次重建。
                 logger.warning("Knowledge index rebuild failed: file_id=%s error=%s", entry.id, exc, exc_info=True)
+                # issue #287：重建失败时 #289 的检索侧不能读到与旧向量/本次分块不一致的
+                # 结构元数据；清掉比留着陈旧值更安全（缺失时按文本路径降级）。
+                _delete_chunk_metadata_best_effort(db, entry.id)
+                continue
+            try:
+                # 重建成功（整体替换语义的 add_chunks）后同步刷新切片元数据，
+                # 让 #289 的章节/条款/表格信息跟当前切片文本一致。
+                crud_knowledge_file.replace_chunk_metadata(
+                    db, entry.id, entry.knowledge_base_id, chunks
+                )
+            except Exception as exc:
+                # 元数据刷新失败不推翻已经完成的向量重建；清掉旧行避免读到更早的切片。
+                logger.warning(
+                    "Knowledge chunk metadata rebuild failed: file_id=%s error=%s",
+                    entry.id,
+                    exc,
+                    exc_info=True,
+                )
+                _delete_chunk_metadata_best_effort(db, entry.id)
         # 启动重建完成后把 BM25 语料也预热一遍；重建路径本来就要遍历整库，这里不该让
         # 第一问再独自扫描一次。
         schedule_bm25_prewarm()
@@ -544,6 +591,26 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
         raise HTTPException(500, INGEST_TIMEOUT_MESSAGE)
 
     _warn_on_low_chunk_coverage(entry, text, chunks, scope="Knowledge file upload")
+    # 切片结构元数据（issue #287）先于向量写入落库：后续任何一步失败都能按 file_id
+    # 找到并清掉它；老文件没有这张表的行时检索照常按文本路径降级。
+    try:
+        crud_knowledge_file.replace_chunk_metadata(db, entry.id, knowledge_base.id, chunks)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.warning(
+            "Knowledge chunk metadata save failed: file_id=%s error=%s", entry.id, exc, exc_info=True
+        )
+        try:
+            crud_knowledge_file.delete_knowledge_file(db, entry.id, user.id)
+        except SQLAlchemyError as cleanup_commit_exc:
+            db.rollback()
+            logger.warning(
+                "Failed to rollback knowledge file after metadata save failure: file_id=%s error=%s",
+                entry.id,
+                cleanup_commit_exc,
+                exc_info=True,
+            )
+        raise HTTPException(500, "知识文件上传失败，切片元数据写入异常。")
     try:
         # 向量化外呼与 Milvus 写入都是同步的，放进入库专用线程池执行：既不让事件循环
         # 被独占，也不与检索侧抢 asyncio 默认池。deadline 同时传给 add_chunks：它不只是
@@ -592,6 +659,9 @@ async def upload_knowledge(request: Request, file: UploadFile = File(...), knowl
                 logger.warning("Failed to rollback partially indexed knowledge file: file_id=%s error=%s", entry.id, cleanup_commit_exc, exc_info=True)
         else:
             _keep_knowledge_file_row(entry.id, reason="indexing failed and vector cleanup did not confirm success")
+            # issue #287：文件行留给启动重建，但本次已写入的切片元数据要清掉，
+            # 不对应任何完整向量的元数据没有保留价值。
+            _delete_chunk_metadata_best_effort(db, entry.id)
         raise HTTPException(500, _index_failure_detail(exc))
 
     # 行已提交、向量已写入：立刻在后台重建该知识库的 BM25 语料，让上传后的第一次提问

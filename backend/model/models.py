@@ -125,6 +125,52 @@ class KnowledgeFile(Base):
     created_at = Column(DateTime, server_default=func.now())
 
     knowledge_base = relationship("KnowledgeBase", back_populates="files")
+    # 切片元数据行（issue #287）。删除文件时一并清掉，避免删知识库等多条删除路径漏行；
+    # 批量删除路径（crud.knowledge_file.delete_knowledge_file）仍显式先删元数据，
+    # 不依赖这里按行懒加载。
+    chunk_metadata = relationship(
+        "KnowledgeChunkMetadata",
+        back_populates="knowledge_file",
+        cascade="all, delete-orphan",
+    )
+
+
+class KnowledgeChunkMetadata(Base):
+    """每个入库切片的结构元数据（issue #287）。
+
+    Milvus collection schema 保持不变，结构信息只落 MySQL 侧：章节路径、条款编号、
+    表格行列与 token 数。老文件没有对应行时检索照常走原文本路径，不要求重建；
+    #289 的父子切片会复用这里的 parent_id / parent_text。
+    """
+
+    __tablename__ = "knowledge_chunk_metadata"
+    __table_args__ = (
+        UniqueConstraint("file_id", "chunk_id", name="uq_knowledge_chunk_metadata_file_chunk"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    file_id = Column(
+        Integer,
+        ForeignKey("knowledge_files.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # 冗余知识库归属，便于按库排查；不做外键，避免删库顺序影响清理路径。
+    knowledge_base_id = Column(Integer, nullable=True, index=True)
+    # 与 Milvus 主键里的 chunk 段一致（chunk_text 返回的字符串序号）。
+    chunk_id = Column(String(64), nullable=False)
+    # 留给 #289 的父子切片；本单恒为 NULL。
+    parent_id = Column(String(64), nullable=True)
+    section_path = Column(String(1000), default="")
+    article_no = Column(String(64), default="")
+    token_count = Column(Integer, nullable=False, default=0)
+    table_id = Column(Integer, nullable=True)
+    row_no = Column(Integer, nullable=True)
+    parent_text = Column(LONGTEXT, nullable=True)
+    metadata_json = Column(LONGTEXT, default="")
+    created_at = Column(DateTime, server_default=func.now())
+
+    knowledge_file = relationship("KnowledgeFile", back_populates="chunk_metadata")
 
 
 class ChatAttachmentUpload(Base):

@@ -32,7 +32,14 @@ from sqlalchemy.pool import StaticPool
 from crud import knowledge_base as crud_knowledge_base
 from database import session as db_session
 from database.session import Base
-from model.models import Conversation, KnowledgeBase, KnowledgeFile, RevokedToken, User
+from model.models import (
+    Conversation,
+    KnowledgeBase,
+    KnowledgeChunkMetadata,
+    KnowledgeFile,
+    RevokedToken,
+    User,
+)
 from router import knowledge as knowledge_router
 from service import auth_service, knowledge_service
 
@@ -88,6 +95,7 @@ def api():
             User.__table__, RevokedToken.__table__,
             KnowledgeBase.__table__,
             KnowledgeFile.__table__,
+            KnowledgeChunkMetadata.__table__,
             Conversation.__table__,
         ],
     )
