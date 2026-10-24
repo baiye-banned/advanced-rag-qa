@@ -21,6 +21,7 @@ No network access is required.
 """
 
 import asyncio
+import logging
 
 import httpx
 import pytest
@@ -249,22 +250,29 @@ def test_acceptance_multi_route_rrf_rerank_final_order(monkeypatch):
     assert trace["rerank"]["model"] == rerank.RERANK_MODEL
 
 
-def test_acceptance_rerank_failure_falls_back_to_fused_order(monkeypatch):
+def test_acceptance_rerank_failure_falls_back_to_fused_order(monkeypatch, caplog):
     _install_recall(monkeypatch, ROUTE_RESULTS)
     monkeypatch.setattr(rerank, "RERANK_LLM_FALLBACK_ENABLED", False)
     captured = _install_rerank_transport(monkeypatch, _raising_handler(httpx.ConnectError("connection refused")))
 
-    final, trace = _retrieve()
+    with caplog.at_level(logging.WARNING, logger=rerank.__name__):
+        final, trace = _retrieve()
 
     assert [item["chunk_id"] for item in final] == FUSED_ORDER
     assert all("rerank_score" not in item for item in final)
     assert len(captured) == 1
     assert trace["rerank"]["status"] == "failed"
     assert trace["rerank"]["provider"] == rerank.RERANK_PROVIDER
-    assert "connection refused" in trace["rerank"]["error"]
+    # issue #263: the trace that is persisted with the message carries only the fixed
+    # message, not the provider's raw exception text.
+    assert trace["rerank"]["error"] == rerank.RERANK_FAILED_MESSAGE
+    assert "connection refused" not in trace["rerank"]["error"]
+    # The raw failure remains diagnosable from the server log.
+    assert "connection refused" in caplog.text
+    assert "scope=rerank_primary" in caplog.text
 
 
-def test_acceptance_rerank_falls_back_to_llm_with_real_fused_candidates(monkeypatch):
+def test_acceptance_rerank_falls_back_to_llm_with_real_fused_candidates(monkeypatch, caplog):
     _install_recall(monkeypatch, ROUTE_RESULTS)
     prompts = {}
 
@@ -282,14 +290,20 @@ def test_acceptance_rerank_falls_back_to_llm_with_real_fused_candidates(monkeypa
     monkeypatch.setattr(rerank, "call_chat_json", fake_call_chat_json)
     _install_rerank_transport(monkeypatch, _raising_handler(httpx.ConnectError("qwen3 unreachable")))
 
-    final, trace = _retrieve()
+    with caplog.at_level(logging.WARNING, logger=rerank.__name__):
+        final, trace = _retrieve()
 
     # Explicit candidate ids are 1-based over the fused list.
     assert [item["chunk_id"] for item in final] == ["c4", "c5"]
     assert final[0]["rerank_score"] == pytest.approx(0.9)
     assert trace["rerank"]["provider"] == "deepseek_fallback"
     assert trace["rerank"]["fallback_from"] == rerank.RERANK_MODEL
-    assert "qwen3 unreachable" in trace["rerank"]["fallback_reason"]
+    # issue #263: the fallback reason is a fixed message; the primary failure's raw text
+    # stays in the server log.
+    assert trace["rerank"]["fallback_reason"] == rerank.RERANK_FALLBACK_MESSAGE
+    assert "qwen3 unreachable" not in trace["rerank"]["fallback_reason"]
+    assert "qwen3 unreachable" in caplog.text
+    assert "scope=rerank_fallback_success" in caplog.text
     for key in FUSED_ORDER:
         assert next(chunk["content"] for chunk in ROUTE_RESULTS["planned"] + ROUTE_RESULTS["hyde"] if chunk["chunk_id"] == key) in prompts["user"]
 
