@@ -14,6 +14,24 @@ from service.json_utils import load_json_value
 CHAT_MESSAGE_DEFAULT_LIMIT = 50
 CHAT_MESSAGE_MAX_LIMIT = 200
 
+# 标题搜索的 LIKE 转义符。**显式写 ESCAPE**：MySQL 默认把反斜杠当转义符，SQLite 默认没有
+# 转义符，不写这一句同一个模式在两边含义不同。选 `!` 而不是反斜杠，还能让反斜杠本身
+# 保持字面含义（用户搜索 `a\b` 时不必再处理一层转义）。
+LIKE_ESCAPE = "!"
+
+
+def _escape_like(value: str) -> str:
+    """把用户输入转成可放进 LIKE 模式的字面量子串（不含两侧的 `%`）。
+
+    只转义 LIKE 的元字符：`!`（转义符自身）、`%`（任意串）、`_`（任意单字符）。
+    顺序必须先把 `!` 翻倍，再给通配符加前缀，否则刚插入的转义符会被再转义一次。
+    """
+    return (
+        value.replace(LIKE_ESCAPE, LIKE_ESCAPE * 2)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+
 
 # 登记行状态的三个判据（issue #238）。**每一条只在这里定义一次**，清扫、领取、消费、
 # 拒签四条链路共用同一段 SQL：判据一旦在多处各写一份，就会各自演化出微妙的差异，
@@ -89,6 +107,7 @@ def list_conversations(
     *,
     limit: int = LIST_DEFAULT_LIMIT,
     before: tuple[datetime, str] | None = None,
+    q: str | None = None,
 ) -> list[Conversation]:
     """按 user_id 取一页会话，按「最近活动」倒序，与旧接口的数组顺序一致。
 
@@ -117,6 +136,11 @@ def list_conversations(
     属于本单之外的可见行为变更，不做（见 issue #239 的修复计划）。
 
     `before` 是 (updated_at, id) 复合游标，两者必须同时给出（service 层负责拦半个游标）。
+
+    `q`（issue #251）按标题做子串匹配，和游标过滤是 AND 关系：翻页始终在同一个搜索结果集内
+    进行，不会因为翻到第二页就漏出未命中的会话。匹配用 LIKE、不是全文索引，`%`/`_`/`!`
+    由 `_escape_like` 转成字面量；大小写行为取决于数据库的 LIKE 语义（SQLite 对 ASCII
+    不区分大小写，MySQL 默认排序规则通常也不区分），接口不额外做大小写归一。
     """
     limit = clamp_limit(limit)
     # 排序与游标过滤共用同一个秒级表达式：两处必须同一口径，否则游标落不到排序位置上
@@ -129,6 +153,12 @@ def list_conversations(
         .options(selectinload(Conversation.knowledge_base))
         .filter_by(user_id=user_id)
     )
+    if q:
+        # 先转义再套两侧通配符：用户输入原样拼进去会把 `%`/`_` 当成通配符（搜 `100%` 会命中
+        # 所有以 `100` 开头的标题）。ESCAPE 与 _escape_like 必须用同一个字符。
+        query = query.filter(
+            Conversation.title.like(f"%{_escape_like(q)}%", escape=LIKE_ESCAPE)
+        )
     if before is not None:
         before_updated_at, before_id = before
         # 等价于 (updated_at, id) < (before_updated_at, before_id) 的行值比较，写成展开式是为了
