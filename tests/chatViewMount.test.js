@@ -820,3 +820,182 @@ test('深链加载在飞时流认领新会话：迟到的加载作废后路由�
     await close(view)
   }
 })
+
+// ---------------------------------------------------------------------------
+// i. 切换会话加载态（issue #254）
+//
+// #261 已在 store 里给出 loadingConversationId，但视图此前没用：切会话的等待期
+// 要么露出上一个会话的旧消息，要么从空白页闪一下「今天想了解什么？」。
+// 这一组直接把 GET 挂起，在等待窗口内断言主区的加载遮罩（.el-loading-mask）
+// 与 aria-busy，而不是读源码字符串。
+// ---------------------------------------------------------------------------
+
+const C2_HISTORY = [
+  { id: 21, role: 'user', content: 'c2 的问题', created_at: '2024-01-01T00:00:05Z' },
+  { id: 22, role: 'assistant', content: 'c2 的回答', created_at: '2024-01-01T00:00:06Z' },
+]
+
+function deferredResponse() {
+  let resolve
+  const promise = new Promise((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+// Element Plus 关闭遮罩时先 v-show 隐藏，400ms 后才把节点摘掉；
+// 所以「加载态消失」要按可见性判断，不能只查节点是否存在。
+function loadingMaskShown(view) {
+  const mask = view.query('.el-loading-mask')
+  return Boolean(mask) && mask.style.display !== 'none'
+}
+
+test('从有消息的会话切到另一会话：等待期显示加载态，不显示空态与旧会话内容', async () => {
+  const pending = deferredResponse()
+  const { view, router } = await mountChat({
+    route: '/chat/c1',
+    responses: { '/chat/conversations/c2': pending.promise },
+  })
+  let nav
+
+  try {
+    const store = await viewStore(view)
+    assert.equal(store.currentId, 'c1', '前置：A 已经加载完成')
+    assert.match(view.text(), /你好，世界/, '前置：A 的消息已经渲染')
+    assert.equal(loadingMaskShown(view), false, '前置：没有加载遮罩')
+
+    nav = router.push('/chat/c2')
+    assert.equal(
+      await until(view, () => store.loadingConversationId === 'c2'),
+      true,
+      '切到 B 之后 store 应当处于加载 B 的状态'
+    )
+    await view.flush(2)
+
+    assert.equal(loadingMaskShown(view), true, '等待期主区应当显示加载遮罩')
+    assert.equal(view.query('main').getAttribute('aria-busy'), 'true', '等待期主区应当标记 aria-busy')
+    assert.doesNotMatch(view.text(), /今天想了解什么/, '等待期不得显示空态')
+    assert.doesNotMatch(view.text(), /你好，世界/, 'A 的旧消息不得被当成 B 的内容展示')
+
+    pending.resolve(C2_HISTORY)
+    assert.equal(
+      await until(view, () => store.loadingConversationId === null),
+      true,
+      'B 返回后加载态应当结束'
+    )
+    assert.equal(await until(view, () => view.text().includes('c2 的回答')), true)
+
+    assert.equal(store.currentId, 'c2', '加载成功后提交 B 的会话 id')
+    assert.equal(view.query('main').getAttribute('aria-busy'), 'false')
+    assert.equal(await until(view, () => !loadingMaskShown(view)), true, '加载结束后遮罩应当隐藏')
+    assert.match(view.text(), /c2 的问题/, '应当渲染 B 的用户消息')
+    assert.match(view.text(), /c2 的回答/, '应当渲染 B 的助手消息')
+    assert.doesNotMatch(view.text(), /你好，世界/, 'A 的内容不得留在 B 的视图里')
+  } finally {
+    pending.resolve([])
+    await nav
+    await close(view)
+  }
+})
+
+test('从空白页切到会话：等待期显示加载态，不闪空态', async () => {
+  const pending = deferredResponse()
+  const { view, router } = await mountChat({
+    route: '/chat',
+    responses: { '/chat/conversations/c2': pending.promise },
+  })
+  let nav
+
+  try {
+    const store = await viewStore(view)
+    assert.equal(store.currentId, null, '前置：空白页没有当前会话')
+    assert.match(view.text(), /今天想了解什么/, '前置：空白页显示空态')
+
+    nav = router.push('/chat/c2')
+    assert.equal(
+      await until(view, () => store.loadingConversationId === 'c2'),
+      true,
+      '切到会话后应当进入加载态'
+    )
+    await view.flush(2)
+
+    assert.equal(loadingMaskShown(view), true, '等待期主区应当显示加载遮罩')
+    assert.equal(view.query('main').getAttribute('aria-busy'), 'true')
+    assert.doesNotMatch(view.text(), /今天想了解什么/, '等待期不得闪出空态')
+
+    pending.resolve(C2_HISTORY)
+    assert.equal(await until(view, () => view.text().includes('c2 的回答')), true)
+    assert.equal(await until(view, () => !loadingMaskShown(view)), true, '加载结束后遮罩应当隐藏')
+    assert.match(view.text(), /c2 的回答/)
+  } finally {
+    pending.resolve([])
+    await nav
+    await close(view)
+  }
+})
+
+test('切到的会话返回空消息：加载完成后仍显示空态', async () => {
+  const pending = deferredResponse()
+  const { view, router } = await mountChat({
+    route: '/chat',
+    responses: { '/chat/conversations/c2': pending.promise },
+  })
+  let nav
+
+  try {
+    const store = await viewStore(view)
+    nav = router.push('/chat/c2')
+    assert.equal(await until(view, () => store.loadingConversationId === 'c2'), true)
+    assert.doesNotMatch(view.text(), /今天想了解什么/, '加载中不显示空态')
+
+    pending.resolve([])
+    assert.equal(await until(view, () => store.loadingConversationId === null), true)
+    await settle(view)
+
+    assert.equal(store.currentId, 'c2', '空会话也应当提交 id')
+    assert.equal(store.messages.length, 0)
+    assert.match(view.text(), /今天想了解什么/, 'B 确实为空时应当显示空态')
+    assert.equal(await until(view, () => !loadingMaskShown(view)), true, '加载结束后遮罩应当隐藏')
+  } finally {
+    pending.resolve([])
+    await nav
+    await close(view)
+  }
+})
+
+test('切到的会话返回消息：加载完成后正常渲染该会话', async () => {
+  const pending = deferredResponse()
+  const { view, router } = await mountChat({
+    route: '/chat',
+    responses: { '/chat/conversations/c2': pending.promise },
+  })
+  let nav
+
+  try {
+    const store = await viewStore(view)
+    nav = router.push('/chat/c2')
+    assert.equal(await until(view, () => store.loadingConversationId === 'c2'), true)
+
+    pending.resolve(C2_HISTORY)
+    assert.equal(
+      await until(view, () => store.loadingConversationId === null && view.text().includes('c2 的回答')),
+      true
+    )
+
+    assert.equal(store.currentId, 'c2')
+    assert.deepEqual(
+      store.messages.map((item) => item.content),
+      ['c2 的问题', 'c2 的回答'],
+      'store 应当持有 B 的消息'
+    )
+    assert.match(view.text(), /c2 的问题/)
+    assert.match(view.text(), /c2 的回答/)
+    assert.equal(view.queryAll('.markdown-body').length, 1, 'B 的助手消息应当经 MarkdownRenderer 渲染')
+    assert.doesNotMatch(view.text(), /今天想了解什么/)
+    assert.equal(await until(view, () => !loadingMaskShown(view)), true, '加载结束后遮罩应当隐藏')
+  } finally {
+    pending.resolve([])
+    await nav
+    await close(view)
+  }
+})

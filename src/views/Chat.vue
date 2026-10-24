@@ -61,9 +61,15 @@
       </div>
     </header>
 
-    <main ref="chatRef" class="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+    <main
+      ref="chatRef"
+      v-loading="isConversationLoading"
+      element-loading-text="正在加载对话..."
+      :aria-busy="isConversationLoading ? 'true' : 'false'"
+      class="min-h-0 flex-1 overflow-y-auto px-6 py-5"
+    >
       <section
-        v-if="!chatStore.messages.length && !isCurrentConversationStreaming"
+        v-if="!chatStore.messages.length && !isCurrentConversationStreaming && !isConversationLoading"
         class="flex h-full items-center justify-center"
       >
         <div class="w-full max-w-2xl text-center">
@@ -86,7 +92,8 @@
         </div>
       </section>
 
-      <section v-else class="mx-auto max-w-5xl space-y-5">
+      <!-- 加载在途时不渲染消息列表：旧会话内容不能被当成新会话内容展示。 -->
+      <section v-else-if="!isConversationLoading" class="mx-auto max-w-5xl space-y-5">
         <div v-if="chatStore.hasMoreMessages" class="flex justify-center">
           <el-button
             text
@@ -536,6 +543,9 @@ const isCurrentConversationStreaming = computed(() => {
   if (!chatStore.streamingConversationId) return !route.params.id && !chatStore.currentId
   return chatStore.streamingConversationId === chatStore.currentId
 })
+
+// 切换会话的加载在途期间只做视觉承接：主区盖加载遮罩，空态与旧会话内容都不渲染。
+const isConversationLoading = computed(() => chatStore.loadingConversationId !== null)
 
 const currentKnowledgeBaseName = computed(() => {
   if (chatStore.currentConversation?.knowledge_base_name) {
