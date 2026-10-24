@@ -14,3 +14,13 @@
 #      未显式开启时评测链路根本不会加载该库。
 # 后续：上游发布包含修复的版本后，把这一行改为该版本下限，并同步更新本说明。
 ragas==0.4.3
+#
+# 关于 issue #291（导入失败）：
+#   ragas 0.4.x 在 import 阶段从 langchain_community.chat_models.vertexai 导入
+#   ChatVertexAI，而 langchain-community 0.4.x 已移除该模块。0.3.30 仍包含该模块，
+#   且其 langchain-core>=0.3.75,<2.0.0 与主应用 langchain-openai==1.6.x 的
+#   langchain-core>=1.6.6 可共存（pip check 无冲突），因此固定该版本。
+#   上游 ragas 不再导入 ChatVertexAI 后删除此 pin。
+#   已知限制：ragas 间接依赖的 instructor 与主应用 requirements.txt 的
+#   openai>=3.23.0 在全新解析时会冲突，需单独跟进；本 pin 只解决 LangChain 侧导入兼容。
+langchain-community==0.3.30
