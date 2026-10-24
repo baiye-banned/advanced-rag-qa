@@ -9,11 +9,17 @@ const stubSource = [
   // 混在一起会让「消费一条反馈响应」顺手吃掉一条消息响应。
   'const feedbackPending = new Map()',
   'const conversationResolvers = []',
+  // 每次会话列表请求的参数按发出顺序留档：用例据此断言 q / 游标真的带上了。
+  'export const conversationRequests = []',
   'export const streams = []',
   'export const getMessagesCalls = []',
   'export const getMessagesParams = []',
   'export const chatAPI = {',
-  '  getConversations: () => new Promise((resolve) => conversationResolvers.push(resolve)),',
+  '  getConversations: (params) => new Promise((resolve) => {',
+  '    const entry = { params, resolve }',
+  '    conversationRequests.push(entry)',
+  '    conversationResolvers.push(entry)',
+  '  }),',
   '  getMessages: (id, params) => new Promise((resolve, reject) => {',
   '    getMessagesCalls.push(id)',
   '    getMessagesParams.push(params)',
@@ -30,7 +36,11 @@ const stubSource = [
   '  }),',
   '}',
   'export function respondConversations(list) {',
-  '  conversationResolvers.splice(0).forEach((resolve) => resolve(list))',
+  '  conversationResolvers.splice(0).forEach((entry) => entry.resolve(list))',
+  '}',
+  // 乱序返回用：只解析第 index 次发出的列表请求，其余保持在途。
+  'export function respondConversation(index, list) {',
+  '  conversationRequests[index]?.resolve(list)',
   '}',
   // 按后端语义切片：messages 传该会话的完整消息（id 升序），
   // 这里按 limit / before_id 取「游标之前最新的 limit 条」，与真实接口一致，
@@ -79,6 +89,7 @@ const stubSource = [
   '  pending.clear()',
   '  feedbackPending.clear()',
   '  conversationResolvers.length = 0',
+  '  conversationRequests.length = 0',
   '}',
   'export function streamChat(options) {',
   '  streams.push(options)',
@@ -121,7 +132,7 @@ globalThis.window = {
 
 const { createPinia, setActivePinia } = await import('pinia')
 const { useChatStore } = await import('../src/stores/chat.js')
-const { respond, respondLatest, respondError, respondFeedback, respondFeedbackError, respondConversations, resetStub, streams, getMessagesCalls, getMessagesParams } =
+const { respond, respondLatest, respondError, respondFeedback, respondFeedbackError, respondConversations, respondConversation, conversationRequests, resetStub, streams, getMessagesCalls, getMessagesParams } =
   await import(chatApiStub)
 
 const conversation = (id, knowledgeBaseId = null) => ({
@@ -1246,3 +1257,236 @@ test('请求期间切走又切回，迟到的刷新不截断新加载的历史',
 
   assert.deepEqual(ids(store), Array.from({ length: 120 }, (_, index) => index + 1))
 })
+
+// ---------------------------------------------------------------------------
+// 会话标题检索（issue #251）：检索词只影响会话列表请求，消息加载与流式收尾不受牵连。
+// 桩按发出顺序记录每次 getConversations 的参数，因此能直接断言 q / 游标到底带了什么。
+// ---------------------------------------------------------------------------
+
+const CONVERSATION_FETCH = 51
+const CONVERSATION_PAGE = 50
+
+const conversationRow = (id, title = id, second = 0) => ({
+  id,
+  title,
+  knowledge_base_id: null,
+  updated_at: `2026-09-01T10:00:${String(second).padStart(2, '0')}`,
+})
+
+const conversationRows = (prefix, count) =>
+  Array.from({ length: count }, (_, index) =>
+    conversationRow(`${prefix}-${index}`, `${prefix} ${index}`, 59 - index)
+  )
+
+const conversationIds = (store) => store.conversations.map((item) => item.id)
+
+test('设置检索词后首页请求带 q（去首尾空白），并从新结果重建游标', async () => {
+  const store = createStore([])
+  const initial = store.fetchConversations()
+  respondConversations(conversationRows('base', CONVERSATION_FETCH))
+  await initial
+  assert.equal(store.hasMoreConversations, true)
+  const cursorBeforeSearch = conversationRequests[0]
+  assert.equal(cursorBeforeSearch.params.q, undefined)
+
+  const searched = store.setConversationQuery('  知识库  ')
+  // store 保留原始输入供输入框回显，发请求时才是去空白后的检索词。
+  assert.equal(store.conversationQuery, '  知识库  ')
+  assert.deepEqual(conversationRequests.at(-1).params, {
+    limit: CONVERSATION_FETCH,
+    q: '知识库',
+  })
+  respondConversations([conversationRow('hit-only', '知识库配置')])
+  await searched
+
+  assert.deepEqual(conversationIds(store), ['hit-only'])
+  // 上一轮未过滤列表留下的游标与「还有更多」必须清掉：新结果只有一条，
+  // 若沿用旧游标，下一次翻页会把不相干的默认列表接在搜索结果后面。
+  assert.equal(store.hasMoreConversations, false)
+  const requestsBeforeLoadMore = conversationRequests.length
+  await store.loadMoreConversations()
+  assert.equal(conversationRequests.length, requestsBeforeLoadMore)
+})
+
+test('搜索结果的「加载更早」携带当前检索词与新游标', async () => {
+  const store = createStore([])
+  const hits = conversationRows('hit', CONVERSATION_FETCH)
+  const searched = store.setConversationQuery('知识库')
+  respondConversations(hits)
+  await searched
+  assert.deepEqual(store.conversations.map((item) => item.id), hits.slice(0, CONVERSATION_PAGE).map((item) => item.id))
+  assert.equal(store.hasMoreConversations, true)
+
+  const loading = store.loadMoreConversations()
+
+  assert.deepEqual(conversationRequests.at(-1).params, {
+    limit: CONVERSATION_FETCH,
+    before_updated_at: hits[CONVERSATION_PAGE - 1].updated_at,
+    before_id: hits[CONVERSATION_PAGE - 1].id,
+    q: '知识库',
+  })
+  respondConversation(conversationRequests.length - 1, [])
+  await loading
+})
+
+test('快速改检索词时，先发出的旧响应不得覆盖新结果', async () => {
+  const store = createStore([])
+
+  const oldRequest = store.setConversationQuery('旧')
+  const newRequest = store.setConversationQuery('新')
+  assert.deepEqual(conversationRequests.map((entry) => entry.params.q), ['旧', '新'])
+
+  // 新请求先返回，旧请求后返回：只有新结果可以落到列表上。
+  respondConversation(1, [conversationRow('new-hit', '新结果')])
+  await newRequest
+  respondConversation(0, [conversationRow('old-hit', '旧结果')])
+  await oldRequest
+
+  assert.equal(store.conversationQuery, '新')
+  assert.deepEqual(conversationIds(store), ['new-hit'])
+  assert.equal(store.loading, false)
+})
+
+test('改检索词后，在途的「加载更早」不会把旧检索的结果追加进来', async () => {
+  const store = createStore([])
+  const initial = store.fetchConversations()
+  respondConversations(conversationRows('base', CONVERSATION_FETCH))
+  await initial
+
+  const loadingMore = store.loadMoreConversations()
+  assert.equal(conversationRequests.length, 2)
+  const searched = store.setConversationQuery('新')
+  assert.equal(conversationRequests.length, 3)
+
+  // 先返回新检索的第一页，再让旧检索的「加载更早」迟到。
+  respondConversation(2, [conversationRow('new-hit', '新结果')])
+  await searched
+  respondConversation(1, conversationRows('old-page', 3))
+  await loadingMore
+
+  assert.deepEqual(conversationIds(store), ['new-hit'])
+  assert.equal(store.loadingMoreConversations, false)
+})
+
+test('清空检索词后恢复默认列表，请求不再带 q', async () => {
+  const store = createStore([])
+  const searched = store.setConversationQuery('知识库')
+  respondConversations([conversationRow('hit', '知识库配置')])
+  await searched
+  assert.deepEqual(conversationIds(store), ['hit'])
+
+  const cleared = store.setConversationQuery('')
+  assert.deepEqual(conversationRequests.at(-1).params, { limit: CONVERSATION_FETCH })
+  respondConversations([conversationRow('a', '会话一'), conversationRow('b', '会话二')])
+  await cleared
+
+  assert.equal(store.conversationQuery, '')
+  assert.deepEqual(conversationIds(store), ['a', 'b'])
+  assert.equal(store.hasMoreConversations, false)
+})
+
+test('检索词变化时清空历史管理模式下已选中的会话', async () => {
+  const store = createStore([conversation('c1'), conversation('c2'), conversation('c3')])
+  store.enterHistoryManageMode()
+  store.toggleConversationSelection('c1')
+  store.toggleConversationSelection('c2')
+  assert.deepEqual(store.selectedConversationIds, ['c1', 'c2'])
+
+  const searched = store.setConversationQuery('报表')
+  respondConversations([conversationRow('hit', '报表统计')])
+  await searched
+
+  // 搜索结果只剩一条命中项，旧选中项已不在列表里：不清空的话「已选 2 / 1」
+  // 会让批量删除删掉用户根本看不见的 c1/c2。
+  assert.deepEqual(store.selectedConversationIds, [])
+  assert.deepEqual(conversationIds(store), ['hit'])
+})
+
+test('检索词未实际变化时不清空选中（幂等调用不误清）', async () => {
+  const store = createStore([conversation('c1')])
+  const searched = store.setConversationQuery('报表')
+  respondConversations([conversationRow('hit', '报表统计')])
+  await searched
+  store.toggleConversationSelection('hit')
+  assert.deepEqual(store.selectedConversationIds, ['hit'])
+
+  const requestsBefore = conversationRequests.length
+  // 仅首尾空白不同 = 同一个检索词：短路返回，不发请求，也不能动选中集合。
+  await store.setConversationQuery('  报表  ')
+
+  assert.equal(conversationRequests.length, requestsBefore)
+  assert.deepEqual(store.selectedConversationIds, ['hit'])
+})
+
+test('搜索后全选只覆盖当前可见的命中项', async () => {
+  const store = createStore([conversation('c1'), conversation('c2'), conversation('c3')])
+  store.enterHistoryManageMode()
+
+  const searched = store.setConversationQuery('报表')
+  respondConversations([conversationRow('hit-1', '报表一'), conversationRow('hit-2', '报表二')])
+  await searched
+
+  store.toggleSelectAllConversations()
+
+  assert.deepEqual(store.selectedConversationIds, ['hit-1', 'hit-2'])
+})
+
+test('检索在途时全选：首页结果落地后选中集合只保留可见项', async () => {
+  const store = createStore([conversation('c1'), conversation('c2')])
+  store.enterHistoryManageMode()
+
+  const searched = store.setConversationQuery('报表')
+  // 请求还在途，列表仍是旧结果：此刻「全选」选中是即将被替换掉的 c1 / c2。
+  assert.equal(store.loading, true)
+  store.toggleSelectAllConversations()
+  assert.deepEqual(store.selectedConversationIds, ['c1', 'c2'])
+
+  respondConversations([conversationRow('hit', '报表统计')])
+  await searched
+
+  assert.deepEqual(conversationIds(store), ['hit'])
+  // 响应落地、列表被整体替换：选中集合必须与可见列表对齐，
+  // 否则界面会显示「已选 2 / 1」，批量删除会删掉用户看不见的 c1 / c2。
+  assert.deepEqual(store.selectedConversationIds, [])
+  assert.equal(store.selectedConversationIds.length, 0)
+  assert.ok(
+    store.selectedConversationIds.length <= store.conversations.length,
+    '选中计数不得超过可见列表条数'
+  )
+})
+
+test('首页刷新后选中集合只保留仍然可见的会话', async () => {
+  const store = createStore([conversation('c1'), conversation('c2')])
+  store.enterHistoryManageMode()
+  store.toggleSelectAllConversations()
+  assert.deepEqual(store.selectedConversationIds, ['c1', 'c2'])
+
+  const refreshing = store.fetchConversations()
+  respondConversations([conversationRow('c1', '仍在列表'), conversationRow('c3', '新增命中')])
+  await refreshing
+
+  // 只过滤、不清空：仍在列表里的 c1 保留选中，消失的 c2 移除。
+  assert.deepEqual(conversationIds(store), ['c1', 'c3'])
+  assert.deepEqual(store.selectedConversationIds, ['c1'])
+})
+
+test('迟到的旧首页响应不改动选中集合（只对齐最新响应）', async () => {
+  const store = createStore([conversation('c1'), conversation('c2')])
+  store.enterHistoryManageMode()
+  store.toggleSelectAllConversations()
+
+  const stale = store.fetchConversations()
+  const latest = store.fetchConversations()
+  respondConversation(1, [conversationRow('hit', '新结果')])
+  await latest
+  assert.deepEqual(store.selectedConversationIds, [])
+
+  store.toggleConversationSelection('hit')
+  respondConversation(0, [conversationRow('c1', '旧结果'), conversationRow('c2', '旧结果')])
+  await stale
+
+  // 旧响应整段丢弃：列表与选中都保持最新响应落地后的状态。
+  assert.deepEqual(conversationIds(store), ['hit'])
+  assert.deepEqual(store.selectedConversationIds, ['hit'])
+})
+

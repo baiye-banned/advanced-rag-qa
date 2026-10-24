@@ -41,6 +41,22 @@
           </div>
         </div>
 
+        <!-- 标题检索（issue #251）：输入停顿 300ms 后才请求，避免每敲一个字都打一次接口。
+             清空立即恢复默认列表（不等防抖），否则用户点了 × 还要盯着旧结果等一会儿。 -->
+        <div class="px-3 pb-2">
+          <el-input
+            v-model="conversationQueryInput"
+            class="conversation-search"
+            size="small"
+            placeholder="搜索对话标题"
+            clearable
+            :prefix-icon="Search"
+            @input="scheduleConversationSearch"
+            @clear="applyConversationQueryNow('')"
+            @keydown.enter="handleConversationSearchEnter"
+          />
+        </div>
+
         <div
           v-if="chatStore.historyManageMode"
           class="mx-3 mb-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-3"
@@ -48,7 +64,8 @@
           <div class="flex items-center justify-between gap-3">
             <button
               type="button"
-              class="text-xs font-medium text-brand-600 transition-colors hover:text-brand-700"
+              class="text-xs font-medium text-brand-600 transition-colors hover:text-brand-700 disabled:cursor-not-allowed disabled:text-slate-300"
+              :disabled="chatStore.loading"
               @click="chatStore.toggleSelectAllConversations"
             >
               {{ allConversationsSelected ? '取消全选' : '全选' }}
@@ -70,7 +87,7 @@
           </div>
         </div>
 
-        <div v-loading="chatStore.loading" class="flex-1 min-h-0 overflow-y-auto px-2 pb-3">
+        <div v-loading="chatStore.loading" class="conversation-list flex-1 min-h-0 overflow-y-auto px-2 pb-3">
           <button
             v-for="conversation in chatStore.conversations"
             :key="conversation.id"
@@ -88,6 +105,7 @@
             <el-checkbox
               v-if="chatStore.historyManageMode"
               :model-value="chatStore.isConversationSelected(conversation.id)"
+              :disabled="chatStore.loading"
               @click.stop
               @change="chatStore.toggleConversationSelection(conversation.id)"
             />
@@ -153,7 +171,7 @@
             v-if="!chatStore.conversations.length && !chatStore.loading"
             class="px-4 py-8 text-center text-xs text-slate-400"
           >
-            暂无历史对话
+            {{ hasActiveConversationSearch ? '未找到匹配的对话' : '暂无历史对话' }}
           </div>
         </div>
       </div>
@@ -187,7 +205,7 @@
 </template>
 
 <script setup>
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   ArrowDown,
@@ -199,6 +217,7 @@ import {
   FolderOpened,
   Operation,
   Plus,
+  Search,
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { useChatStore } from '@/stores/chat'
@@ -226,10 +245,46 @@ const editingConversationId = ref(null)
 const editingTitle = ref('')
 const renameInputRef = ref(null)
 
+// 标题检索（issue #251）。输入框保留原始输入，store 里的 conversationQuery 才是
+// 「已经生效、对应列表里这批结果」的检索词——空列表文案要跟着后者，否则输入框
+// 刚敲下第一个字、请求还没发出去时就会先闪一下「未找到匹配的对话」。
+const conversationQueryInput = ref(chatStore.conversationQuery)
+const hasActiveConversationSearch = computed(() => chatStore.conversationQuery.trim() !== '')
+let conversationSearchTimer = null
+
+function cancelPendingConversationSearch() {
+  if (conversationSearchTimer === null) return
+  clearTimeout(conversationSearchTimer)
+  conversationSearchTimer = null
+}
+
+function scheduleConversationSearch() {
+  cancelPendingConversationSearch()
+  conversationSearchTimer = setTimeout(() => {
+    conversationSearchTimer = null
+    chatStore.setConversationQuery(conversationQueryInput.value)
+  }, 300)
+}
+
+// 清空与回车立即生效：这两下用户已经明确表达「就按现在的内容搜」，
+// 再等 300ms 只会让列表看起来没反应。
+function applyConversationQueryNow(query) {
+  cancelPendingConversationSearch()
+  conversationQueryInput.value = query
+  chatStore.setConversationQuery(query)
+}
+
+function handleConversationSearchEnter(event) {
+  if (event?.isComposing || event?.keyCode === 229) return
+  applyConversationQueryNow(conversationQueryInput.value)
+}
+
 onMounted(() => {
   userStore.fetchProfile().catch(() => {})
   chatStore.fetchConversations()
 })
+
+onBeforeUnmount(cancelPendingConversationSearch)
 
 function focusRenameInput() {
   // `ref` 写在 v-for 里时 Vue 会带上 ref_for，落下来的是数组而不是单个实例；
@@ -293,6 +348,9 @@ function handleConversationClick(id) {
   // 不允许「正在编辑的行」被这一下顺手选中/跳转。
   if (editingConversationId.value === id) return
   if (chatStore.historyManageMode) {
+    // 列表正在加载时结果还没落地：此时的选择会指向即将被替换的旧行，
+    // 等响应回来再选，避免「已选」里混进不可见会话（store 落地时还会再对齐一次）。
+    if (chatStore.loading) return
     chatStore.toggleConversationSelection(id)
     return
   }

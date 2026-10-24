@@ -213,7 +213,8 @@ test('管理模式开关与「新建对话」：壳的接线真的改了 store �
 //
 // 选择器约定：不用按钮下标（标题行的管理/新建按钮、以及管理模式里的复选框都会动到
 // `queryAll('button')` 的下标），改用一个稳定的类名 `rename-entry`；
-// 输入框本身在非管理模式下是全壳唯一的一个，直接 `view.query('input')`。
+// 输入框一律限定在 `.conversation-list` 内 —— 侧栏顶部的标题检索框（issue #251）
+// 也是 input，不限定的话 `query('input')` 会先拿到它。
 //
 // 事件一律真派发（`Event('input')` / `KeyboardEvent('keyup')` / `FocusEvent('blur')`），
 // 不直接调组件内部方法——这样 v-model、`.stop`、按键修饰符都是真的在执行。
@@ -232,12 +233,17 @@ function putCalls() {
   return calls.filter((entry) => entry.method === 'put')
 }
 
+// 会话列表请求（挂载时一次，之后检索 / 翻页各算一次）。
+function conversationListCalls() {
+  return calls.filter((entry) => entry.method === 'get' && entry.args[0] === '/chat/conversations')
+}
+
 async function openRename(view, index) {
   const icon = renameIcons(view)[index]
   assert.ok(icon, `第 ${index + 1} 行应当渲染出重命名入口`)
   icon.click()
   await settle(view)
-  const input = view.query('input')
+  const input = view.query('.conversation-list input')
   assert.ok(input, '进入编辑态后应当渲染出输入框')
   return input
 }
@@ -258,7 +264,7 @@ test('重命名 R1：点图标进入编辑态，输入框预填当前标题并�
   try {
     const input = await openRename(view, 0)
 
-    assert.equal(view.queryAll('input').length, 1, '同一时刻只应当有一个输入框')
+    assert.equal(view.queryAll('.conversation-list input').length, 1, '同一时刻只应当有一个输入框')
     assert.equal(input.value, CONV1.title, '输入框应当预填当前标题')
     const focused = await until(view, () => document.activeElement === input)
     assert.ok(focused, '进入编辑态后输入框应当自动获得焦点')
@@ -277,7 +283,7 @@ test('重命名 R2：点另一行的图标只保留一个编辑框，并切到�
     renameIcons(view)[0].click()
     await settle(view)
 
-    const inputs = view.queryAll('input')
+    const inputs = view.queryAll('.conversation-list input')
     assert.equal(inputs.length, 1, '切行之后仍应当只有一个输入框')
     assert.equal(inputs[0].value, CONV1.title, '编辑框应当切到新行并预填它的标题')
   } finally {
@@ -305,7 +311,7 @@ test('重命名 R3：回车提交，发一次 PUT、就地更新标题并提示�
       view.messages.some((entry) => entry.level === 'success' && entry.message === '已重命名'),
       '提交成功应当提示「已重命名」'
     )
-    assert.equal(view.queryAll('input').length, 0, '提交之后应当退出编辑态')
+    assert.equal(view.queryAll('.conversation-list input').length, 0, '提交之后应当退出编辑态')
   } finally {
     await close(view)
   }
@@ -323,7 +329,7 @@ test('重命名 R4：Esc 取消，不提交且保留原标题', async () => {
     assert.equal(putCalls().length, 0, 'Esc 不应当发请求')
     assert.match(view.text(), /第一段对话/, '取消后应当保留原标题')
     assert.doesNotMatch(view.text(), /不该保存的标题/, '草稿不应当出现在列表里')
-    assert.equal(view.queryAll('input').length, 0, '取消之后应当退出编辑态')
+    assert.equal(view.queryAll('.conversation-list input').length, 0, '取消之后应当退出编辑态')
   } finally {
     await close(view)
   }
@@ -340,7 +346,7 @@ test('重命名 R5：失焦取消，不提交且保留原标题', async () => {
 
     assert.equal(putCalls().length, 0, '失焦不应当发请求')
     assert.match(view.text(), /第一段对话/, '失焦取消后应当保留原标题')
-    assert.equal(view.queryAll('input').length, 0, '失焦之后应当退出编辑态')
+    assert.equal(view.queryAll('.conversation-list input').length, 0, '失焦之后应当退出编辑态')
   } finally {
     await close(view)
   }
@@ -369,7 +375,7 @@ test('重命名 R7：纯空白标题被拦截，不发请求', async () => {
 
     assert.equal(putCalls().length, 0, '纯空白不应当发请求')
     assert.match(view.text(), /第一段对话/, '列表里的标题不应当变化')
-    assert.equal(view.queryAll('input').length, 0, '拦截之后仍然退出编辑态')
+    assert.equal(view.queryAll('.conversation-list input').length, 0, '拦截之后仍然退出编辑态')
   } finally {
     await close(view)
   }
@@ -386,7 +392,7 @@ test('重命名 R8：与原标题相同则短路，不发请求', async () => {
 
     assert.equal(putCalls().length, 0, '同名不应当发请求')
     assert.match(view.text(), /第一段对话/, '列表里的标题不应当变化')
-    assert.equal(view.queryAll('input').length, 0, '短路之后仍然退出编辑态')
+    assert.equal(view.queryAll('.conversation-list input').length, 0, '短路之后仍然退出编辑态')
   } finally {
     await close(view)
   }
@@ -412,7 +418,7 @@ test('重命名 R9：请求失败时保留原标题、退出编辑态并提示�
       view.messages.some((entry) => entry.level === 'error' && entry.message === '重命名失败'),
       '提交失败应当提示「重命名失败」'
     )
-    assert.equal(view.queryAll('input').length, 0, '失败之后应当退出编辑态')
+    assert.equal(view.queryAll('.conversation-list input').length, 0, '失败之后应当退出编辑态')
   } finally {
     await close(view)
   }
@@ -435,10 +441,10 @@ test('重命名 R10：管理模式里不出现重命名入口，编辑态随之�
     assert.equal(renameIcons(view).length, 0, '管理模式不应当渲染重命名入口')
     // 增量断言：不写死输入框数量（管理模式本来就有每行一个复选框），
     // 只钉「除复选框之外没有多余的输入框」。
-    const checkboxes = view.queryAll('.el-checkbox')
+    const checkboxes = view.queryAll('.conversation-list .el-checkbox')
     assert.ok(checkboxes.length > 0, '管理模式每行应当有选择框')
     assert.equal(
-      view.queryAll('input').length,
+      view.queryAll('.conversation-list input').length,
       checkboxes.length,
       '编辑框应当收起来，只剩下每行的选择框'
     )
@@ -467,7 +473,7 @@ test('重命名 R11：编辑态内点击不切换会话', async () => {
       '编辑态内点击不应当把路由推到会话详情'
     )
     assert.equal(chatStore.currentId, beforeSelect, '编辑态内点击不应当改写当前会话')
-    assert.ok(view.query('input'), '编辑态内点击不应当把编辑框点没了')
+    assert.ok(view.query('.conversation-list input'), '编辑态内点击不应当把编辑框点没了')
   } finally {
     await close(view)
   }
@@ -535,10 +541,192 @@ test('重命名 R13：IME 组字中的回车不提交', async () => {
 
     assert.equal(putCalls().length, 0, '组字中的回车不应当提交')
     assert.equal(view.messages.length, 0, '组字中的回车不应当弹提示')
-    const stillEditing = view.query('input')
+    const stillEditing = view.query('.conversation-list input')
     assert.ok(stillEditing, '组字中的回车之后应当仍处于编辑态')
     // 编辑态里标题在输入框的 value 上、不在 textContent 里，所以这里钉 value。
     assert.equal(stillEditing.value, '半成品输入', '草稿应当原样留在输入框里')
+  } finally {
+    await close(view)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// e. 标题检索（issue #251）：输入防抖到一次请求，空结果有专门的文案
+// ---------------------------------------------------------------------------
+
+test('标题检索 S1：输入防抖后只发一次带 q 的请求，空结果提示「未找到匹配的对话」', async () => {
+  const { view } = await mountLayout()
+
+  try {
+    const search = view.query('.conversation-search input')
+    assert.ok(search, '「历史对话」下方应当渲染标题检索输入框')
+    assert.equal(search.getAttribute('placeholder'), '搜索对话标题')
+
+    // 带 q 的请求返回空列表；默认列表请求仍返回挂载时的两条。
+    respond('get', (url, config) => {
+      if (url === '/chat/conversations') {
+        return config?.params?.q ? [] : [CONV1, CONV2]
+      }
+      if (url === '/user/profile') return PROFILE
+      return {}
+    })
+
+    const before = conversationListCalls().length
+
+    // 三次输入都落在同一个 300ms 防抖窗口里，最终应当只落成一次请求。
+    typeInto(search, '知')
+    typeInto(search, '知识')
+    typeInto(search, '知识库')
+    assert.equal(conversationListCalls().length, before, '防抖窗口内不应当发请求')
+
+    // 真计时器（不用 fake timers）：等防抖到期，但只等请求本身，不 sleep 固定时长。
+    const sent = await until(view, () => conversationListCalls().length > before, 2000)
+    assert.ok(sent, '停止输入后应当发出检索请求')
+
+    const searched = conversationListCalls().slice(before)
+    assert.equal(searched.length, 1, '连续输入只应当落成一次请求')
+    assert.deepEqual(searched[0].args[1].params, { limit: 51, q: '知识库' })
+
+    const rendered = await until(view, () => view.text().includes('未找到匹配的对话'), 2000)
+    assert.ok(rendered, '检索无结果时应当显示「未找到匹配的对话」')
+    assert.doesNotMatch(view.text(), /第一段对话/, '旧列表应当被检索结果替换')
+    await settle(view)
+    assert.equal(conversationListCalls().length, before + 1, '检索本身不应触发额外请求')
+  } finally {
+    await close(view)
+  }
+})
+
+test('标题检索 S2：检索词变化清空历史管理模式下的选中项，批量删除随之禁用', async () => {
+  const { view } = await mountLayout({ conversations: [CONV1, CONV2] })
+
+  try {
+    const { useChatStore } = await import(
+      new URL('../src/stores/chat.js', import.meta.url).href
+    )
+    const chatStore = useChatStore(view.pinia)
+
+    chatStore.enterHistoryManageMode()
+    chatStore.toggleConversationSelection('c1')
+    chatStore.toggleConversationSelection('c2')
+    await settle(view)
+
+    assert.match(view.text(), /已选 2 \/ 2/, '前置：两条会话应当都已选中')
+    const deleteButton = view
+      .queryAll('button')
+      .find((node) => node.textContent.trim() === '删除选中')
+    assert.ok(deleteButton, '历史管理模式下应当渲染「删除选中」按钮')
+    assert.equal(deleteButton.disabled, false, '选中两条时批量删除应当可用')
+
+    // 只命中第一条：检索后列表被替换，选中集合也必须归零。
+    respond('get', (url, config) => {
+      if (url === '/chat/conversations') {
+        return config?.params?.q ? [CONV1] : [CONV1, CONV2]
+      }
+      if (url === '/user/profile') return PROFILE
+      return {}
+    })
+
+    const before = conversationListCalls().length
+    typeInto(view.query('.conversation-search input'), '第一段')
+
+    const reset = await until(view, () => view.text().includes('已选 0 / 1'), 2000)
+    assert.ok(reset, '检索生效后「已选」应当归零并跟随新列表长度')
+    assert.ok(
+      conversationListCalls().slice(before).every((entry) => entry.args[1].params.q === '第一段'),
+      '检索请求应当带上新的检索词'
+    )
+
+    const disabled = await until(view, () => {
+      const button = view
+        .queryAll('button')
+        .find((node) => node.textContent.trim() === '删除选中')
+      return Boolean(button?.disabled)
+    }, 2000)
+    assert.ok(disabled, '没有选中项时批量删除按钮应当禁用')
+  } finally {
+    await close(view)
+  }
+})
+
+test('标题检索 S3：加载在途时全选与行选择禁用，结果落地后选中与可见列表一致', async () => {
+  const { view } = await mountLayout({ conversations: [CONV1, CONV2] })
+
+  const HIT = {
+    id: 'hit',
+    title: '报表统计',
+    knowledge_base_id: null,
+    updated_at: '2026-09-01T10:00:00',
+  }
+
+  try {
+    const { useChatStore } = await import(
+      new URL('../src/stores/chat.js', import.meta.url).href
+    )
+    const chatStore = useChatStore(view.pinia)
+
+    chatStore.enterHistoryManageMode()
+    await settle(view)
+
+    // 带 q 的请求先挂住：模拟「检索请求在途、旧的 c1 / c2 仍在列表里」的窗口。
+    let resolveSearch
+    respond('get', (url, config) => {
+      if (url === '/chat/conversations') {
+        if (config?.params?.q) {
+          return new Promise((resolve) => {
+            resolveSearch = () => resolve([HIT])
+          })
+        }
+        return [CONV1, CONV2]
+      }
+      if (url === '/user/profile') return PROFILE
+      return {}
+    })
+
+    const before = conversationListCalls().length
+    typeInto(view.query('.conversation-search input'), '报表')
+    const sent = await until(view, () => conversationListCalls().length > before, 2000)
+    assert.ok(sent, '停止输入后应当发出检索请求')
+    assert.equal(chatStore.loading, true, '请求在途时 store 应当处于加载态')
+    assert.match(view.text(), /第一段对话/, '前置：结果落地前列表仍是旧结果')
+
+    const selectAllButton = () =>
+      view.queryAll('button').find((node) => node.textContent.trim() === '全选')
+    assert.equal(selectAllButton().disabled, true, '加载在途时「全选」应当禁用')
+    const rowCheckboxes = view.queryAll('.conversation-list .el-checkbox input')
+    assert.ok(rowCheckboxes.length > 0, '管理模式每行应当渲染选择框')
+    assert.ok(
+      rowCheckboxes.every((input) => input.disabled),
+      '加载在途时每行选择框应当禁用'
+    )
+
+    // 禁用状态下两处点击都不应当产生选中项。
+    selectAllButton().click()
+    conversationRows(view)[0].click()
+    await settle(view)
+    assert.deepEqual(chatStore.selectedConversationIds, [], '结果落地前不应当选中任何会话')
+
+    resolveSearch()
+    const landed = await until(view, () => view.text().includes('报表统计'), 2000)
+    assert.ok(landed, '响应落地后列表应当换成检索结果')
+    await until(view, () => !chatStore.loading, 2000)
+
+    assert.equal(
+      selectAllButton().disabled,
+      false,
+      '响应落地后「全选」应当恢复可用'
+    )
+    selectAllButton().click()
+    await until(view, () => view.text().includes('已选 1 / 1'), 2000)
+
+    // 选中集合、界面计数、可见列表三者一致：批量删除只会碰到可见的 hit。
+    assert.deepEqual(chatStore.selectedConversationIds, ['hit'])
+    assert.deepEqual(chatStore.conversations.map((item) => item.id), ['hit'])
+    assert.doesNotMatch(view.text(), /已选 2 \/ 1/, '计数不应当统计已被替换掉的旧会话')
+    const deleteButton = view
+      .queryAll('button')
+      .find((node) => node.textContent.trim() === '删除选中')
+    assert.equal(deleteButton.disabled, false, '选中可见会话后批量删除应当可用')
   } finally {
     await close(view)
   }

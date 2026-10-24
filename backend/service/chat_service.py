@@ -118,6 +118,7 @@ def list_conversations(
     limit: Annotated[int, Query(ge=1, le=LIST_MAX_LIMIT)] = LIST_DEFAULT_LIMIT,
     before_updated_at: Annotated[datetime | None, Query()] = None,
     before_id: Annotated[str | None, Query()] = None,
+    q: Annotated[str | None, Query(max_length=200)] = None,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -127,13 +128,19 @@ def list_conversations(
     要么都给；只给一个会被 resolve_conversation_cursor 判 422。取值直接回带上一次
     响应里最后一条的 updated_at 与 id，语义与消息接口的 before_id 同族（键集游标，
     不是 offset）。不传时返回最新一页，页大小默认 LIST_DEFAULT_LIMIT。
+
+    `q`（issue #251）是标题子串检索：去首尾空白后为空视同未传，响应结构不变（仍是数组），
+    翻页继续用同一组游标参数并自动带上 `q` 的语义由前端保证。
     """
     cursor = resolve_conversation_cursor(before_updated_at, before_id)
+    # 空白查询等于不搜：否则 `q=" "` 会去匹配标题里的空格，得到与不传参不同的空列表。
+    keyword = (q or "").strip() or None
     rows = crud_chat.list_conversations(
         db,
         user.id,
         limit=resolve_list_limit(limit),
         before=cursor,
+        q=keyword,
     )
     return [_serialize_conversation(c, user.id) for c in rows]
 
