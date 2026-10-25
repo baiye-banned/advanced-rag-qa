@@ -13,6 +13,15 @@ behind pymilvus would otherwise route through HTTP_PROXY/HTTPS_PROXY when the pr
 has one configured; every test removes those variables for its own duration (see
 `isolate_from_environment_proxy`), so the module behaves the same with and without a
 proxy in the environment.
+
+The suite is offline by default. Two opt-in variables point it at a deployed server for
+issue #178 acceptance:
+
+- ``MILVUS_ACCEPTANCE_URI`` (e.g. ``http://127.0.0.1:19530``) uses that server instead of
+  the temporary Lite file. The instance must be a **disposable test instance** -- the
+  tests write and delete rows in it. Never set this for production or shared data.
+- ``MILVUS_ACCEPTANCE_LIVE_EMBEDDING=1`` keeps the project's real embedding provider
+  instead of the deterministic offline bigram embedding.
 """
 
 import hashlib
@@ -35,12 +44,17 @@ NO_PROXY_VARIABLES = ("NO_PROXY", "no_proxy")
 PROXY_ENV_NAMES = {name.lower() for name in PROXY_VARIABLES + NO_PROXY_VARIABLES}
 LOOPBACK_NO_PROXY = "localhost,127.0.0.1,::1"
 DEAD_PROXY = "http://127.0.0.1:9"
+ACCEPTANCE_URI_ENV = "MILVUS_ACCEPTANCE_URI"
+LIVE_EMBEDDING_ENV = "MILVUS_ACCEPTANCE_LIVE_EMBEDDING"
 
 CHUNKS = [
     {"id": "0", "text": "员工迟到一次罚款50元，当月累计三次以上加倍处罚。"},
     {"id": "1", "text": "迟到超过30分钟视为旷工半天。"},
     {"id": "2", "text": "报销流程需要在费用发生后30天内提交。"},
 ]
+# Every file_id this module writes, so a server-backed run can start from the same state
+# as a fresh Lite database without dropping a collection it does not own.
+ACCEPTANCE_FILE_IDS = (1101, 1201, 1301, 1401, 1501, 1502, 1601, 1701)
 
 
 def _bigram_embedding(texts):
@@ -60,6 +74,65 @@ def _bigram_embedding(texts):
         norm = math.sqrt(sum(component * component for component in vector)) or 1.0
         vectors.append([component / norm for component in vector])
     return vectors
+
+
+class _StrongConsistencyClient:
+    """Serve reads with Strong consistency when pointed at a deployed Milvus.
+
+    Milvus Lite answers a read immediately after the write in the same process; a
+    deployed server answers search/query with Bounded consistency by default, so a
+    chunk inserted or deleted a moment earlier can still be missing from the next read.
+    The acceptance flows below assert read-after-write, so only the read methods are
+    overridden to ask for Strong consistency; every other call is forwarded to the real
+    client.
+    """
+
+    def __init__(self, client):
+        self._client = client
+
+    def search(self, *args, **kwargs):
+        kwargs.setdefault("consistency_level", "Strong")
+        return self._client.search(*args, **kwargs)
+
+    def query(self, *args, **kwargs):
+        kwargs.setdefault("consistency_level", "Strong")
+        return self._client.query(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+def _install_server_client_factory(monkeypatch, client_class):
+    """Install a factory that returns the Strong-consistency wrapper.
+
+    ``_index_params()`` reads ``MilvusClient.prepare_index_params`` from the module global,
+    so the replacement has to carry that classmethod as well. A bare ``lambda`` does not,
+    and the first ``add_chunks`` against a server without the collection then fails with
+    ``AttributeError: 'function' object has no attribute 'prepare_index_params'`` before
+    any row is written.
+    """
+
+    def _factory(**kwargs):
+        return _StrongConsistencyClient(client_class(**kwargs))
+
+    _factory.prepare_index_params = client_class.prepare_index_params
+    monkeypatch.setattr(milvus_client, "MilvusClient", _factory)
+    return _factory
+
+
+def _remove_acceptance_rows(client) -> None:
+    """Delete the rows this module owns, leaving every other row in the collection.
+
+    A server keeps its data between runs, so without this the previous run's rows would
+    make the "empty store" and "unfiltered query" assertions fail on a second run. Only
+    the file_ids above are touched: the collection (and anything else in it) stays.
+    """
+    if not client.has_collection(milvus_client.COLLECTION_NAME):
+        return
+    client.delete(
+        collection_name=milvus_client.COLLECTION_NAME,
+        filter=f"file_id in {list(ACCEPTANCE_FILE_IDS)}",
+    )
 
 
 def _release_lite_server(uri: str) -> None:
@@ -98,10 +171,43 @@ def isolate_from_environment_proxy(monkeypatch):
 
 
 @pytest.fixture
-def lite_store(tmp_path):
-    """Point the module at a throwaway Milvus Lite database and clean it up afterwards."""
-    uri = str(tmp_path / "milvus_acceptance.db")
+def acceptance_store(tmp_path, monkeypatch):
+    """Point the module at a disposable Milvus instance and restore it afterwards.
+
+    Without ``MILVUS_ACCEPTANCE_URI`` this is a throwaway Milvus Lite database under
+    ``tmp_path`` (fully offline). With it, the module talks to that server instead and
+    only closes the client on teardown: the instance is assumed to be a one-off test
+    instance, so neither its collection nor its rows are dropped wholesale. Before each
+    test the rows this module wrote to certain file_ids are deleted (see
+    ``_remove_acceptance_rows``), so the suite can be re-run against the same server.
+
+    ``MILVUS_ACCEPTANCE_LIVE_EMBEDDING=1`` leaves the project's real embedding provider
+    in place; otherwise the deterministic offline bigram embedding is installed.
+    """
     saved = (milvus_client.MILVUS_URI, milvus_client._client, milvus_client._embedding_fn)
+    server_uri = os.environ.get(ACCEPTANCE_URI_ENV, "").strip()
+    if server_uri:
+        milvus_client.MILVUS_URI = server_uri
+        milvus_client._client = None
+        # The client is still created lazily by the module's first call, but through a
+        # wrapper that asks for Strong consistency on reads: unlike Lite, a server may
+        # not show a row inserted or deleted a moment ago.
+        _install_server_client_factory(monkeypatch, milvus_client.MilvusClient)
+        # Without the live opt-in, install the deterministic offline embedding; with it,
+        # leave the project's real embedding provider in place.
+        if os.environ.get(LIVE_EMBEDDING_ENV, "").strip() != "1":
+            milvus_client._embedding_fn = _bigram_embedding
+        try:
+            _remove_acceptance_rows(milvus_client._connect_milvus())
+            yield server_uri
+        finally:
+            client, milvus_client._client = milvus_client._client, None
+            milvus_client.MILVUS_URI, _, milvus_client._embedding_fn = saved
+            if client is not None:
+                client.close()
+        return
+
+    uri = str(tmp_path / "milvus_acceptance.db")
     milvus_client.MILVUS_URI = uri
     milvus_client._client = None
     milvus_client._embedding_fn = _bigram_embedding
@@ -114,6 +220,12 @@ def lite_store(tmp_path):
             client.close()
         _release_lite_server(uri)
         shutil.rmtree(str(tmp_path), ignore_errors=True)
+
+
+@pytest.fixture
+def lite_store(acceptance_store):
+    """Backward-compatible alias for :func:`acceptance_store`."""
+    return acceptance_store
 
 
 def _count_rows(filter_expr: str) -> int:
@@ -159,7 +271,7 @@ class _KnowledgeFileRow:
         self.knowledge_base_id = knowledge_base_id
 
 
-def test_acceptance_upload_query_delete_round_trip(lite_store):
+def test_acceptance_upload_query_delete_round_trip(acceptance_store):
     milvus_client.add_chunks(CHUNKS, file_id=1101, file_name="考勤制度.txt", knowledge_base_id=11)
 
     hits = milvus_client.query_vectors("迟到超过30分钟视为旷工半天。", top_k=5, knowledge_base_id=11)
@@ -185,7 +297,7 @@ def test_acceptance_upload_query_delete_round_trip(lite_store):
     assert milvus_client.query_vectors("迟到超过30分钟视为旷工半天。", top_k=5, knowledge_base_id=11) == []
 
 
-def test_acceptance_knowledge_base_isolation(lite_store):
+def test_acceptance_knowledge_base_isolation(acceptance_store):
     milvus_client.add_chunks(
         [{"id": "0", "text": "A库专属条款：迟到一次罚款50元。"}],
         file_id=1201,
@@ -211,7 +323,7 @@ def test_acceptance_knowledge_base_isolation(lite_store):
     assert {hit["file_id"] for hit in unfiltered} == {1201, 1301}
 
 
-def test_acceptance_reupload_replaces_previous_chunks(lite_store):
+def test_acceptance_reupload_replaces_previous_chunks(acceptance_store):
     milvus_client.add_chunks(CHUNKS, file_id=1401, file_name="考勤制度.txt", knowledge_base_id=14)
     assert _count_rows("file_id == 1401") == 3
 
@@ -228,7 +340,7 @@ def test_acceptance_reupload_replaces_previous_chunks(lite_store):
     assert hits[0]["id"] == "1401_0"
 
 
-def test_acceptance_delete_removes_only_target_file(lite_store):
+def test_acceptance_delete_removes_only_target_file(acceptance_store):
     milvus_client.add_chunks(
         [{"id": "0", "text": "文件一：迟到罚款50元。"}], file_id=1501, file_name="一.txt", knowledge_base_id=15
     )
@@ -244,7 +356,7 @@ def test_acceptance_delete_removes_only_target_file(lite_store):
     assert [hit["file_id"] for hit in hits] == [1502]
 
 
-def test_acceptance_index_rebuild_restores_recall_without_duplicates(lite_store, monkeypatch):
+def test_acceptance_index_rebuild_restores_recall_without_duplicates(acceptance_store, monkeypatch):
     # Plain body sentences only: lines like "第1条：..." are parsed as headings and would
     # collapse back into a single chunk instead of producing a multi-chunk document.
     sentence = "员工迟到一次罚款{amount}元，当月累计三次以上加倍处罚，并记入绩效档案。"
@@ -277,7 +389,7 @@ def test_acceptance_index_rebuild_restores_recall_without_duplicates(lite_store,
     assert second_recall == first_recall
 
 
-def test_acceptance_query_window_and_missing_collection(lite_store):
+def test_acceptance_query_window_and_missing_collection(acceptance_store):
     # No collection yet: the query must report an empty result, not bootstrap the store.
     assert milvus_client.query_vectors("迟到", top_k=5, knowledge_base_id=17) == []
 
@@ -288,6 +400,43 @@ def test_acceptance_query_window_and_missing_collection(lite_store):
     assert len(milvus_client.query_vectors("迟到", top_k=99, knowledge_base_id=17)) == 3
     assert milvus_client.query_vectors("   ", top_k=5, knowledge_base_id=17) == []
     assert milvus_client.query_vectors("迟到", top_k=5, knowledge_base_id=99) == []
+
+
+def test_acceptance_server_factory_creates_collection_on_a_fresh_store(tmp_path, monkeypatch):
+    """The server-mode factory must keep `prepare_index_params` for first-time setup.
+
+    The server branch replaces the module's ``MilvusClient`` with a wrapper factory, and
+    collection creation calls ``MilvusClient.prepare_index_params()`` on that module
+    global. A factory missing that classmethod breaks the very first ``add_chunks`` on a
+    server where the collection does not exist yet -- exactly the deployment path #178
+    covers -- while a suite that finds the collection already created never notices.
+
+    This drives the same factory against a throwaway Lite database, so the fresh
+    collection path is covered offline (a server run still keeps this test local).
+    """
+    uri = str(tmp_path / "factory_acceptance.db")
+    monkeypatch.setattr(milvus_client, "MILVUS_URI", uri)
+    monkeypatch.setattr(milvus_client, "_client", None)
+    monkeypatch.setattr(milvus_client, "_embedding_fn", _bigram_embedding)
+    _install_server_client_factory(monkeypatch, milvus_client.MilvusClient)
+
+    try:
+        assert not milvus_client._connect_milvus().has_collection(milvus_client.COLLECTION_NAME)
+        assert milvus_client._index_params() is not None
+
+        # add_chunks -> _ensure_collection -> _index_params on an instance with no
+        # collection: the path the previous suite skipped once the collection existed.
+        milvus_client.add_chunks(CHUNKS, file_id=1801, file_name="考勤制度.txt", knowledge_base_id=18)
+
+        assert _count_rows("file_id == 1801") == 3
+        hits = milvus_client.query_vectors("迟到超过30分钟视为旷工半天。", top_k=5, knowledge_base_id=18)
+        assert [hit["chunk_id"] for hit in hits][0] == "1"
+    finally:
+        client, milvus_client._client = milvus_client._client, None
+        if client is not None:
+            client.close()
+        _release_lite_server(uri)
+        shutil.rmtree(str(tmp_path), ignore_errors=True)
 
 
 def test_acceptance_round_trip_survives_a_dead_proxy_environment():
@@ -303,6 +452,11 @@ def test_acceptance_round_trip_survives_a_dead_proxy_environment():
         if key.lower() not in PROXY_ENV_NAMES and key != "PYTEST_ADDOPTS"
     }
     env.update({name: DEAD_PROXY for name in PROXY_VARIABLES})
+    # Keep the opt-in target in the child too: the re-run must exercise the same store as
+    # the parent (the env copy already carries them, this states the dependency).
+    for name in (ACCEPTANCE_URI_ENV, LIVE_EMBEDDING_ENV):
+        if name in os.environ:
+            env[name] = os.environ[name]
     node = "tests/test_milvus_acceptance.py::test_acceptance_upload_query_delete_round_trip"
 
     result = subprocess.run(
@@ -310,7 +464,11 @@ def test_acceptance_round_trip_survives_a_dead_proxy_environment():
         cwd=str(ROOT),
         env=env,
         capture_output=True,
+        # The child writes UTF-8 (PYTHONIOENCODING), while text=True would decode with the
+        # Windows locale (GBK) and lose the failure output on the first Chinese character.
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=120,
     )
 

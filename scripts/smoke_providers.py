@@ -25,11 +25,19 @@ failure), so read the summary rather than the exit code to see what actually ran
 A check only passes on the provider it names: `rerank` counts as verified only when the
 qwen3-rerank endpoint answered, so a successful LLM fallback is reported as a failure
 instead of hiding an unreachable DashScope endpoint behind a pass.
+
+In `--live` mode every check runs in its own child process (`--check NAME`) so one check
+cannot poison the next: closing the event loop in `rerank` used to leave the shared async
+HTTP client/proxy state closed, which made the following `rerank-fallback` fail with
+`Event loop is closed` even though the provider was reachable. The hidden `--check` flag
+prints a single machine-readable `SMOKE_RESULT` line and is not part of the operator CLI;
+offline mode still runs all checks in-process against the stubs.
 """
 
 import argparse
 import asyncio
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -300,6 +308,95 @@ CHECKS = [
     ("text-fallback", check_text_fallback),
 ]
 
+RESULT_PREFIX = "SMOKE_RESULT\t"
+CHECK_TIMEOUT_SECONDS = 120
+
+
+def _secret_values() -> list[str]:
+    """Configured credential values, so a child's failure text can be redacted."""
+    values = {
+        value
+        for name, value in os.environ.items()
+        if name.endswith("API_KEY") and isinstance(value, str) and value
+    }
+    for name in dir(config):
+        if name.endswith("API_KEY"):
+            value = getattr(config, name, "")
+            if isinstance(value, str) and value:
+                values.add(value)
+    return sorted(values, key=len, reverse=True)
+
+
+def _redact(text: str) -> str:
+    for secret in _secret_values():
+        if len(secret) >= 4:
+            text = text.replace(secret, "***")
+    return text
+
+
+def _one_line(text: str) -> str:
+    """Keep a machine-readable result on exactly one line."""
+    return " ".join(str(text).split())
+
+
+def _run_check(check, live: bool) -> tuple[str, str]:
+    try:
+        return "PASS", check(live)
+    except Skip as exc:
+        return "SKIP", str(exc)
+    except Exception as exc:  # noqa: BLE001 - a smoke check reports any failure
+        return "FAIL", f"{type(exc).__name__}: {exc}"
+
+
+def _run_single_check(name: str, live: bool) -> int:
+    """Run one check and emit a single machine-readable line (child-process mode)."""
+    status, detail = _run_check(dict(CHECKS)[name], live)
+    print(f"{RESULT_PREFIX}{status}\t{name}\t{_one_line(_redact(detail))}")
+    return 1 if status == "FAIL" else 0
+
+
+def _parse_result_line(stdout: str) -> tuple[str, str] | None:
+    lines = [line for line in stdout.splitlines() if line.startswith(RESULT_PREFIX)]
+    if not lines:
+        return None
+    parts = lines[-1][len(RESULT_PREFIX) :].split("\t", 2)
+    if len(parts) < 2 or parts[0] not in ("PASS", "SKIP", "FAIL"):
+        return None
+    return parts[0], parts[2] if len(parts) > 2 else ""
+
+
+def _failure_summary(completed: subprocess.CompletedProcess) -> str:
+    """Redacted one-line digest of a child that produced no SMOKE_RESULT line."""
+    stderr = [line.strip() for line in (completed.stderr or "").splitlines() if line.strip()]
+    stdout = [line.strip() for line in (completed.stdout or "").splitlines() if line.strip()]
+    source = stderr or stdout
+    detail = source[-1] if source else f"no output (exit code {completed.returncode})"
+    return _one_line(_redact(detail))[:300]
+
+
+def _run_check_in_subprocess(name: str) -> tuple[str, str]:
+    """Run one check in a fresh process so it cannot share a closed event loop."""
+    command = [sys.executable, str(Path(__file__).resolve()), "--live", "--check", name]
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            # Decode the same way the child writes (this project sets PYTHONIOENCODING=utf-8);
+            # with the Windows locale codec a Chinese detail would raise UnicodeDecodeError
+            # instead of surfacing as a redacted failure.
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=CHECK_TIMEOUT_SECONDS,
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired:
+        return "FAIL", f"timed out after {CHECK_TIMEOUT_SECONDS}s"
+    parsed = _parse_result_line(completed.stdout or "")
+    if parsed is None:
+        return "FAIL", _failure_summary(completed)
+    return parsed
+
 
 def main() -> int:
     # allow_abbrev=False keeps this parser and the module-level `LIVE` scan above accepting
@@ -311,7 +408,13 @@ def main() -> int:
         allow_abbrev=False,
     )
     parser.add_argument("--live", action="store_true", help="send real requests to the providers")
+    # Internal: the parent process runs each live check through this flag. Kept hidden
+    # because it emits only a SMOKE_RESULT line instead of the operator-facing summary.
+    parser.add_argument("--check", choices=[name for name, _ in CHECKS], help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    if args.check:
+        return _run_single_check(args.check, args.live)
 
     if args.live:
         print("!! LIVE MODE: real provider requests, network access and quota usage !!\n")
@@ -320,14 +423,14 @@ def main() -> int:
 
     results = []
     for name, check in CHECKS:
-        try:
-            detail = check(args.live)
-        except Skip as exc:
-            results.append((name, "SKIP", str(exc)))
-        except Exception as exc:  # noqa: BLE001 - a smoke check reports any failure
-            results.append((name, "FAIL", f"{type(exc).__name__}: {exc}"))
+        if args.live:
+            # A fresh process per check: asyncio.run() closes its loop and the async HTTP
+            # client/proxy state with it, which used to make the next check fail even
+            # though its provider was reachable.
+            status, detail = _run_check_in_subprocess(name)
         else:
-            results.append((name, "PASS", detail))
+            status, detail = _run_check(check, live=False)
+        results.append((name, status, detail))
 
     width = max(len(name) for name, _ in CHECKS)
     for name, status, detail in results:

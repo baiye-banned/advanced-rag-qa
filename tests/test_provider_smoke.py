@@ -580,6 +580,31 @@ def test_smoke_script_runs_offline_and_reports_every_provider():
     assert "5 checks: 5 passed, 0 skipped, 0 failed" in result.stdout
 
 
+def test_smoke_script_single_check_reports_one_result_and_no_summary():
+    # The live parent runs every check through the hidden --check flag in a fresh process.
+    # Offline mode exercises the same output contract against the stubs (no network): one
+    # machine-readable line and no per-run summary, so the parent's parser has one source.
+    env = {key: value for key, value in os.environ.items() if not key.endswith("API_KEY")}
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "smoke_providers.py"), "--check", "rerank"],
+        cwd=str(ROOT),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0].startswith("SMOKE_RESULT\tPASS\trerank\t")
+    assert "checks:" not in result.stdout
+    assert "[PASS]" not in result.stdout
+    assert "[SKIP]" not in result.stdout
+    assert "[FAIL]" not in result.stdout
+
+
 def test_smoke_script_live_without_credentials_reports_skips_not_passes():
     # Empty values, not just removed variables: config.py loads .env/.env.development
     # through dotenv, which does not overwrite variables that are already set, so an
