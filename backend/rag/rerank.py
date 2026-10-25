@@ -171,7 +171,9 @@ async def _rerank_chunks_with_llm(question: str, chunks: list[dict]) -> tuple[li
         ensure_ascii=False,
     )
     try:
-        data = await call_chat_json(system_prompt, user_prompt, max_tokens=1200)
+        data = await call_chat_json(
+            system_prompt, user_prompt, max_tokens=1200, stage="rerank_llm"
+        )
         rows = data.get("results") or []
         by_id = {index: chunk for index, chunk in enumerate(chunks, start=1)}
         reranked = []

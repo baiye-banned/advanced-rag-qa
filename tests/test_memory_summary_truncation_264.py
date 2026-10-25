@@ -50,18 +50,19 @@ def _patch_summarizer(monkeypatch, result, finish_reason):
     """替换非流式调用，记录提示词并返回指定终态。"""
     calls = []
 
-    async def fake_call(system_prompt, user_prompt, *, max_tokens):
+    async def fake_call(system_prompt, user_prompt, *, max_tokens, stage="planner"):
         calls.append(
             {
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
                 "max_tokens": max_tokens,
+                "stage": stage,
             }
         )
         return result, finish_reason
 
     monkeypatch.setattr(memory_service, "call_chat_text_with_metadata", fake_call)
-    monkeypatch.setattr(memory_service, "DEEPSEEK_API_KEY", "offline-test-key")
+    monkeypatch.setattr(memory_service, "MEMORY_API_KEY", "offline-test-key")
     return calls
 
 

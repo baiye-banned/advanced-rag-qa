@@ -159,6 +159,25 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseekv4flash")
 
+# Per-stage overrides for the DeepSeek-backed RAG stages. Empty values inherit the
+# matching DEEPSEEK_* setting, so an existing .env keeps working unchanged; setting
+# only a key still inherits the base URL and model.
+PLANNER_BASE_URL = os.getenv("PLANNER_BASE_URL") or DEEPSEEK_BASE_URL
+PLANNER_API_KEY = os.getenv("PLANNER_API_KEY") or DEEPSEEK_API_KEY
+PLANNER_MODEL = os.getenv("PLANNER_MODEL") or DEEPSEEK_MODEL
+
+ANSWER_BASE_URL = os.getenv("ANSWER_BASE_URL") or DEEPSEEK_BASE_URL
+ANSWER_API_KEY = os.getenv("ANSWER_API_KEY") or DEEPSEEK_API_KEY
+ANSWER_MODEL = os.getenv("ANSWER_MODEL") or DEEPSEEK_MODEL
+
+MEMORY_BASE_URL = os.getenv("MEMORY_BASE_URL") or DEEPSEEK_BASE_URL
+MEMORY_API_KEY = os.getenv("MEMORY_API_KEY") or DEEPSEEK_API_KEY
+MEMORY_MODEL = os.getenv("MEMORY_MODEL") or DEEPSEEK_MODEL
+
+RERANK_LLM_BASE_URL = os.getenv("RERANK_LLM_BASE_URL") or DEEPSEEK_BASE_URL
+RERANK_LLM_API_KEY = os.getenv("RERANK_LLM_API_KEY") or DEEPSEEK_API_KEY
+RERANK_LLM_MODEL = os.getenv("RERANK_LLM_MODEL") or DEEPSEEK_MODEL
+
 # OpenAI-compatible vision chat API for image QA.
 # Defaults target Alibaba Cloud Model Studio and reuse DASHSCOPE_API_KEY.
 VISION_BASE_URL = os.getenv(
@@ -177,6 +196,12 @@ TEXT_FALLBACK_BASE_URL = os.getenv(
 )
 TEXT_FALLBACK_API_KEY = os.getenv("TEXT_FALLBACK_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
 TEXT_FALLBACK_MODEL = os.getenv("TEXT_FALLBACK_MODEL", "qwen3.6-plus")
+
+# Router override. The router is a lightweight intent classifier, so by default it
+# reuses the text fallback provider; empty values inherit TEXT_FALLBACK_*.
+ROUTER_BASE_URL = os.getenv("ROUTER_BASE_URL") or TEXT_FALLBACK_BASE_URL
+ROUTER_API_KEY = os.getenv("ROUTER_API_KEY") or TEXT_FALLBACK_API_KEY
+ROUTER_MODEL = os.getenv("ROUTER_MODEL") or TEXT_FALLBACK_MODEL
 
 DEFAULT_EMBEDDING_TOKEN_SAFETY_RATIO = 0.85  # scan-secrets:allow numeric ratio, not a credential
 
@@ -389,6 +414,9 @@ RERANK_LLM_FALLBACK_ENABLED = _env_bool("RERANK_LLM_FALLBACK_ENABLED", True)
 
 # Online RAGAS evaluation.
 RAGAS_ENABLED = _env_bool("RAGAS_ENABLED", False)
+# Empty values inherit DEEPSEEK_*; the model keeps its dedicated RAGAS_LLM_MODEL.
+RAGAS_BASE_URL = os.getenv("RAGAS_BASE_URL") or DEEPSEEK_BASE_URL
+RAGAS_API_KEY = os.getenv("RAGAS_API_KEY") or DEEPSEEK_API_KEY
 RAGAS_LLM_MODEL = os.getenv("RAGAS_LLM_MODEL", DEEPSEEK_MODEL)
 RAGAS_TIMEOUT_SECONDS = _env_int("RAGAS_TIMEOUT_SECONDS", 180)
 RAGAS_METRIC_TIMEOUT_SECONDS = _env_int("RAGAS_METRIC_TIMEOUT_SECONDS", 60)

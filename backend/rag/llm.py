@@ -15,9 +15,27 @@ from openai import (
 )
 
 from config import (
+    ANSWER_API_KEY,
+    ANSWER_BASE_URL,
+    ANSWER_MODEL,
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
+    MEMORY_API_KEY,
+    MEMORY_BASE_URL,
+    MEMORY_MODEL,
+    PLANNER_API_KEY,
+    PLANNER_BASE_URL,
+    PLANNER_MODEL,
+    RAGAS_API_KEY,
+    RAGAS_BASE_URL,
+    RAGAS_LLM_MODEL,
+    RERANK_LLM_API_KEY,
+    RERANK_LLM_BASE_URL,
+    RERANK_LLM_MODEL,
+    ROUTER_API_KEY,
+    ROUTER_BASE_URL,
+    ROUTER_MODEL,
     TEXT_FALLBACK_API_KEY,
     TEXT_FALLBACK_BASE_URL,
     TEXT_FALLBACK_ENABLED,
@@ -191,11 +209,154 @@ def get_text_fallback_model(*, streaming: bool = False, temperature: float = 0.1
     return ChatOpenAI(**kwargs)
 
 
+# 每个 RAG 阶段对应的配置常量与默认继承来源。常量名在调用时经 globals() 读取，
+# 这样测试和运维代码对模块常量的替换都能立即生效。
+_STAGE_CONSTANTS = {
+    "router": ("ROUTER_API_KEY", "ROUTER_BASE_URL", "ROUTER_MODEL"),
+    "planner": ("PLANNER_API_KEY", "PLANNER_BASE_URL", "PLANNER_MODEL"),
+    "answer": ("ANSWER_API_KEY", "ANSWER_BASE_URL", "ANSWER_MODEL"),
+    "memory": ("MEMORY_API_KEY", "MEMORY_BASE_URL", "MEMORY_MODEL"),
+    "rerank_llm": ("RERANK_LLM_API_KEY", "RERANK_LLM_BASE_URL", "RERANK_LLM_MODEL"),
+    # RAGAS 的模型沿用既有 RAGAS_LLM_MODEL，只新增 base URL / API Key 覆盖。
+    "ragas": ("RAGAS_API_KEY", "RAGAS_BASE_URL", "RAGAS_LLM_MODEL"),
+    "text_fallback": ("TEXT_FALLBACK_API_KEY", "TEXT_FALLBACK_BASE_URL", "TEXT_FALLBACK_MODEL"),
+}
+
+# 阶段来源：router 继承文本后备模型，其余阶段继承 DeepSeek。
+_STAGE_SOURCE = {
+    "router": "text_fallback",
+    "planner": "deepseek",
+    "answer": "deepseek",
+    "memory": "deepseek",
+    "rerank_llm": "deepseek",
+    "ragas": "deepseek",
+}
+
+# DeepSeek 别名（deepseekv4flash 等）只在 DeepSeek 家族的阶段里归一化；路由和文本
+# 后备是 DashScope 模型，保持配置原文。
+_DEEPSEEK_FAMILY_STAGES = {"planner", "answer", "memory", "rerank_llm", "ragas"}
+
+_DEEPSEEK_IMPORT_VALUES = (DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL, DEEPSEEK_MODEL)
+_TEXT_FALLBACK_IMPORT_VALUES = (
+    TEXT_FALLBACK_API_KEY,
+    TEXT_FALLBACK_BASE_URL,
+    TEXT_FALLBACK_MODEL,
+)
+# 导入时的取值快照。继承判定不能只比较调用时的模块常量：现有测试会替换
+# TEXT_FALLBACK_API_KEY / get_text_fallback_model 而不动 ROUTER_*，只做实时比较
+# 会把 router 误判成独立覆盖并绕过替身。快照 + 实时比较同时满足两种场景：
+# 配置在进程内被改写时走覆盖分支，完全未改写时沿用原 getter。
+_STAGE_IMPORT_VALUES = {
+    stage: tuple(globals()[name] for name in names)
+    for stage, names in _STAGE_CONSTANTS.items()
+}
+_STAGE_INHERITS_AT_IMPORT = {
+    stage: _STAGE_IMPORT_VALUES[stage]
+    == (
+        _TEXT_FALLBACK_IMPORT_VALUES
+        if source == "text_fallback"
+        else _DEEPSEEK_IMPORT_VALUES
+    )
+    for stage, source in _STAGE_SOURCE.items()
+}
+
+
+def _stage_values(stage: str) -> tuple[str, str, str]:
+    api_key_name, base_url_name, model_name = _STAGE_CONSTANTS[stage]
+    return (
+        globals()[api_key_name],
+        globals()[base_url_name],
+        globals()[model_name],
+    )
+
+
+def _source_values(source: str) -> tuple[str, str, str]:
+    if source == "text_fallback":
+        return (
+            globals()["TEXT_FALLBACK_API_KEY"],
+            globals()["TEXT_FALLBACK_BASE_URL"],
+            globals()["TEXT_FALLBACK_MODEL"],
+        )
+    return (
+        globals()["DEEPSEEK_API_KEY"],
+        globals()["DEEPSEEK_BASE_URL"],
+        globals()["DEEPSEEK_MODEL"],
+    )
+
+
+def _stage_inherits(stage: str) -> bool:
+    values = _stage_values(stage)
+    if values == _source_values(_STAGE_SOURCE[stage]):
+        return True
+    return _STAGE_INHERITS_AT_IMPORT[stage] and values == _STAGE_IMPORT_VALUES[stage]
+
+
+def get_stage_model(
+    stage: str,
+    *,
+    streaming: bool = False,
+    temperature: float = 0.1,
+    max_tokens: int | None = None,
+):
+    """按 RAG 阶段取模型，未配置的字段继承该阶段的默认来源。
+
+    阶段与来源：router -> TEXT_FALLBACK_*，planner/answer/memory/rerank_llm/ragas
+    -> DEEPSEEK_*（RAGAS 的模型名仍取 RAGAS_LLM_MODEL）。阶段配置与来源完全一致时
+    复用原 getter，保持既有监控和测试替身的行为；只有显式覆盖时才独立构造客户端。
+    """
+    if stage not in _STAGE_CONSTANTS:
+        raise ValueError(f"未知的 RAG 阶段：{stage}")
+
+    # 未显式给预算时不要向下传 max_tokens=None：原 getter 的默认值就是 None，
+    # 省略才能让调用方（及其测试替身）看到与改动前完全一致的参数。
+    getter_kwargs = {"streaming": streaming, "temperature": temperature}
+    if max_tokens is not None:
+        getter_kwargs["max_tokens"] = max_tokens
+
+    if stage == "text_fallback":
+        return get_text_fallback_model(**getter_kwargs)
+
+    if _stage_inherits(stage):
+        source = _STAGE_SOURCE[stage]
+        try:
+            if source == "text_fallback":
+                return get_text_fallback_model(**getter_kwargs)
+            return get_deepseek_model(**getter_kwargs)
+        except LLMCredentialError:
+            # 继承来的 Key 为空时，报阶段名比报来源模型名更容易定位到该改哪个变量；
+            # 这里只重写异常文案，不携带任何 Key 值。
+            raise LLMCredentialError(f"{stage} API Key 未配置") from None
+
+    api_key, base_url, model = _stage_values(stage)
+    if not api_key:
+        raise LLMCredentialError(f"{stage} API Key 未配置")
+    if stage in _DEEPSEEK_FAMILY_STAGES:
+        model = normalize_deepseek_model(model)
+    kwargs = {
+        "api_key": api_key,
+        "base_url": openai_base_url(base_url),
+        "model": model,
+        "temperature": temperature,
+        "streaming": streaming,
+        "timeout": 60,
+        "max_retries": 0,
+    }
+    if max_tokens is not None:
+        kwargs["max_completion_tokens"] = max_tokens
+    return ChatOpenAI(**kwargs)
+
+
 async def call_chat_text_with_metadata(
-    system_prompt: str, user_prompt: str, *, max_tokens: int = 900
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    max_tokens: int = 900,
+    stage: str = "planner",
 ) -> tuple[str, str | None]:
     """返回文本与 finish_reason，供调用方识别被 token 上限截断的输出。"""
-    model = get_deepseek_model(streaming=False, temperature=0.1, max_tokens=max_tokens)
+    model = get_stage_model(
+        stage, streaming=False, temperature=0.1, max_tokens=max_tokens
+    )
     message = await model.ainvoke([
         ("system", system_prompt),
         ("user", user_prompt),
@@ -203,15 +364,29 @@ async def call_chat_text_with_metadata(
     return _message_text(message.content), _message_finish_reason(message)
 
 
-async def call_chat_text(system_prompt: str, user_prompt: str, *, max_tokens: int = 900) -> str:
+async def call_chat_text(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    max_tokens: int = 900,
+    stage: str = "planner",
+) -> str:
     content, _ = await call_chat_text_with_metadata(
-        system_prompt, user_prompt, max_tokens=max_tokens
+        system_prompt, user_prompt, max_tokens=max_tokens, stage=stage
     )
     return content
 
 
-async def call_chat_json(system_prompt: str, user_prompt: str, *, max_tokens: int = 800) -> dict:
-    content = await call_chat_text(system_prompt, user_prompt, max_tokens=max_tokens)
+async def call_chat_json(
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    max_tokens: int = 800,
+    stage: str = "planner",
+) -> dict:
+    content = await call_chat_text(
+        system_prompt, user_prompt, max_tokens=max_tokens, stage=stage
+    )
     parsed = parse_json_object(content)
     if isinstance(parsed, dict) and parsed.get("error") and "content" in parsed:
         raise ValueError("chat model returned invalid JSON")
@@ -221,9 +396,7 @@ async def call_chat_json(system_prompt: str, user_prompt: str, *, max_tokens: in
 
 
 async def call_router_json(payload: dict) -> dict:
-    if not TEXT_FALLBACK_API_KEY:
-        raise RuntimeError("路由模型 API Key 未配置")
-    model = get_text_fallback_model(streaming=False, temperature=0, max_tokens=300)
+    model = get_stage_model("router", streaming=False, temperature=0, max_tokens=300)
     system_prompt = (
         "你是企业知识库 RAG 路由器，只判断当前问题是否需要检索企业知识库。"
         "只输出 JSON，不要输出 Markdown。字段必须是："
@@ -267,7 +440,7 @@ async def stream_answer_events(
     )
 
     try:
-        async for chunk in _stream_model_chunks(get_deepseek_model(streaming=True, temperature=0.1), messages):
+        async for chunk in _stream_model_chunks(get_stage_model("answer", streaming=True, temperature=0.1), messages):
             # 内容过滤可能只体现在最后一个 chunk 的 finish_reason 上（普通 astream 不会抛
             # ContentFilterFinishReasonError），必须在这里显式转为 error，否则空流会被当成
             # 正常结束。过滤不是传输故障，不切换后备模型——换个模型继续生成会绕过内容策略。
@@ -351,7 +524,7 @@ async def stream_answer_events(
             params={"model": TEXT_FALLBACK_MODEL},
             note="LangChain 切换到 OpenAI 兼容文本后备模型继续本轮回答。",
         )
-        async for chunk in _stream_model_chunks(get_text_fallback_model(streaming=True, temperature=0.1), messages):
+        async for chunk in _stream_model_chunks(get_stage_model("text_fallback", streaming=True, temperature=0.1), messages):
             if _is_content_filter_chunk(chunk):
                 logger.warning("text fallback stream generation stopped by content filter")
                 await _trace_add(
