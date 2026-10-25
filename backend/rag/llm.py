@@ -247,8 +247,13 @@ _TEXT_FALLBACK_IMPORT_VALUES = (
 # 会把 router 误判成独立覆盖并绕过替身。快照 + 实时比较同时满足两种场景：
 # 配置在进程内被改写时走覆盖分支，完全未改写时沿用原 getter。
 _STAGE_IMPORT_VALUES = {
-    stage: tuple(globals()[name] for name in names)
-    for stage, names in _STAGE_CONSTANTS.items()
+    "router": (ROUTER_API_KEY, ROUTER_BASE_URL, ROUTER_MODEL),
+    "planner": (PLANNER_API_KEY, PLANNER_BASE_URL, PLANNER_MODEL),
+    "answer": (ANSWER_API_KEY, ANSWER_BASE_URL, ANSWER_MODEL),
+    "memory": (MEMORY_API_KEY, MEMORY_BASE_URL, MEMORY_MODEL),
+    "rerank_llm": (RERANK_LLM_API_KEY, RERANK_LLM_BASE_URL, RERANK_LLM_MODEL),
+    "ragas": (RAGAS_API_KEY, RAGAS_BASE_URL, RAGAS_LLM_MODEL),
+    "text_fallback": (TEXT_FALLBACK_API_KEY, TEXT_FALLBACK_BASE_URL, TEXT_FALLBACK_MODEL),
 }
 _STAGE_INHERITS_AT_IMPORT = {
     stage: _STAGE_IMPORT_VALUES[stage]
