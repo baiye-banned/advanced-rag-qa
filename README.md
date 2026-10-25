@@ -2,11 +2,11 @@
 
 面向企业内部资料，基于 Vue 3 + FastAPI 的检索增强问答平台：登录后按知识库隔离检索，以 SSE 流式输出带来源的答案，检索、融合、重排、保存、评估由确定性代码编排，LLM 只负责理解与生成。
 
-[![pytest](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/python-tests.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/python-tests.yml)
-[![node --test](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/frontend-tests.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/frontend-tests.yml)
-[![vite build](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/build.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/build.yml)
-[![static checks](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/static-checks.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/static-checks.yml)
-[![e2e](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/e2e.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/Agent_about_answer/actions/workflows/e2e.yml)
+[![pytest](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/python-tests.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/python-tests.yml)
+[![node --test](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/frontend-tests.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/frontend-tests.yml)
+[![vite build](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/build.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/build.yml)
+[![static checks](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/static-checks.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/static-checks.yml)
+[![e2e](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/e2e.yml/badge.svg?branch=develop)](https://github.com/baiye-banned/advanced-rag-qa/actions/workflows/e2e.yml)
 
 ## 目录
 
