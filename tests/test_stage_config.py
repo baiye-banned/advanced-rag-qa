@@ -145,6 +145,10 @@ def test_missing_stage_key_raises_stage_specific_error_without_leaking(monkeypat
     monkeypatch.setattr(llm, "ChatOpenAI", fail_chat_openai)
     monkeypatch.setattr(llm, "DEEPSEEK_API_KEY", source_key)
     monkeypatch.setattr(llm, "PLANNER_API_KEY", "")
+    if source_key:
+        # 源 key 非空时，空的阶段 key 会按「空值继承」沿用源 key；显式覆盖
+        # BASE_URL 才让 planner 不再完整继承来源，从而真正走到阶段缺 Key 的报错路径。
+        monkeypatch.setattr(llm, "PLANNER_BASE_URL", "https://planner.example.com")
 
     with pytest.raises(RuntimeError) as excinfo:
         llm.get_stage_model("planner")
@@ -152,6 +156,19 @@ def test_missing_stage_key_raises_stage_specific_error_without_leaking(monkeypat
     assert isinstance(excinfo.value, llm.LLMCredentialError)
     assert str(excinfo.value) == "planner API Key 未配置"
     assert "deepseek-source-secret" not in str(excinfo.value)
+
+
+def test_planner_without_overrides_inherits_source_key(monkeypatch):
+    """源 key 非空且 planner 未覆盖时，空的阶段配置继续沿用来源客户端。"""
+    captured = _capture_chat_openai(monkeypatch)
+    monkeypatch.setattr(llm, "DEEPSEEK_API_KEY", "deepseek-source-secret")
+
+    llm.get_stage_model("planner")
+
+    assert len(captured) == 1
+    assert captured[0]["api_key"] == "deepseek-source-secret"
+    assert captured[0]["base_url"] == llm.openai_base_url(llm.DEEPSEEK_BASE_URL)
+    assert captured[0]["model"] == llm.normalize_deepseek_model(llm.DEEPSEEK_MODEL)
 
 
 def test_call_helpers_forward_stage_to_model_selector(monkeypatch):
