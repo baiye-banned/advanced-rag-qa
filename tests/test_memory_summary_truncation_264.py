@@ -122,6 +122,8 @@ def test_conversation_summary_rejects_length_truncation(monkeypatch, caplog):
     )
 
     assert result == "", "截断的半句摘要不能作为长期记忆返回"
+    # 记忆压缩必须走 memory 阶段，才能应用 MEMORY_* 独立配置。
+    assert calls[0]["stage"] == "memory"
     assert calls[0]["max_tokens"] == config.MEMORY_SUMMARY_MAX_TOKENS
     assert f"{config.MEMORY_SUMMARY_MAX_TOKENS} token" in calls[0]["user_prompt"]
     assert f"{config.MEMORY_SUMMARY_MAX_CHARS} 字" not in calls[0]["user_prompt"]
@@ -149,6 +151,7 @@ def test_recent_memory_summary_rejects_length_truncation(monkeypatch):
     )
 
     assert result == ""
+    assert calls[0]["stage"] == "memory"
     assert calls[0]["max_tokens"] == config.MEMORY_RECENT_MAX_TOKENS
     assert f"{config.MEMORY_RECENT_MAX_TOKENS} token" in calls[0]["user_prompt"]
     assert f"{config.MEMORY_RECENT_MAX_CHARS} 字" not in calls[0]["user_prompt"]

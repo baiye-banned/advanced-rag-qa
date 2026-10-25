@@ -165,6 +165,14 @@ def schedule_ragas_evaluation(
         )
 
 
+def _ragas_llm_client_config() -> dict:
+    """RAGAS evaluator 使用的 OpenAI 客户端参数（不构造客户端，便于离线断言）。"""
+    return {
+        "api_key": RAGAS_API_KEY,
+        "base_url": openai_base_url(RAGAS_BASE_URL),
+    }
+
+
 def _evaluate_message_sync(question: str, answer: str, contexts: list[str], trace_id: str | None = None) -> dict:
     if not RAGAS_API_KEY:
         raise RuntimeError("RAGAS API Key 未配置")
@@ -185,10 +193,7 @@ def _evaluate_message_sync(question: str, answer: str, contexts: list[str], trac
         OpenAIEmbeddings(client=embedding_client, model=EMBEDDING_MODEL)
     )
 
-    llm_client = OpenAI(
-        api_key=RAGAS_API_KEY,
-        base_url=openai_base_url(RAGAS_BASE_URL),
-    )
+    llm_client = OpenAI(**_ragas_llm_client_config())
     llm = _make_ragas_llm(llm_factory, llm_client)
     sample = SingleTurnSample(
         user_input=question,

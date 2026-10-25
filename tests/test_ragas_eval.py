@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -69,3 +70,110 @@ def test_disabled_path_does_not_import_ragas(monkeypatch):
     _, args, kwargs = trace_calls[0]
     assert args == ("trace-ragas-off", "ragas_disabled", "evaluate_message_async")
     assert kwargs["result"] == {"message_id": 7}
+
+
+def _install_fake_ragas_stack(monkeypatch):
+    """离线替身：拦截 openai/ragas 导入，记录客户端参数与指标调用。"""
+    openai_calls = []
+    metric_calls = []
+    trace_events = []
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            openai_calls.append(kwargs)
+
+    class FakeSingleTurnSample:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeOpenAIEmbeddings:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class FakeMetric:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def single_turn_score(self, sample):
+            metric_calls.append(sample)
+            return 0.5
+
+    def fake_llm_factory(**kwargs):
+        return SimpleNamespace(**kwargs)
+
+    fake_openai = ModuleType("openai")
+    fake_openai.OpenAI = FakeOpenAI
+    ragas_package = ModuleType("ragas")
+    dataset_schema = ModuleType("ragas.dataset_schema")
+    dataset_schema.SingleTurnSample = FakeSingleTurnSample
+    embeddings = ModuleType("ragas.embeddings")
+    embeddings.OpenAIEmbeddings = FakeOpenAIEmbeddings
+    llms = ModuleType("ragas.llms")
+    llms.llm_factory = fake_llm_factory
+    metrics = ModuleType("ragas.metrics")
+    metrics.Faithfulness = FakeMetric
+    metrics.LLMContextPrecisionWithoutReference = FakeMetric
+    metrics.ResponseRelevancy = FakeMetric
+
+    for name, module in {
+        "openai": fake_openai,
+        "ragas": ragas_package,
+        "ragas.dataset_schema": dataset_schema,
+        "ragas.embeddings": embeddings,
+        "ragas.llms": llms,
+        "ragas.metrics": metrics,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(
+        ragas_eval,
+        "append_trace_event",
+        lambda *args, **kwargs: trace_events.append((args, kwargs)),
+    )
+    return openai_calls, metric_calls, trace_events
+
+
+def test_ragas_llm_client_config_uses_ragas_key_and_url(monkeypatch):
+    monkeypatch.setattr(ragas_eval, "RAGAS_API_KEY", "ragas-only-key")
+    monkeypatch.setattr(ragas_eval, "RAGAS_BASE_URL", "https://ragas.example.com/")
+
+    assert ragas_eval._ragas_llm_client_config() == {
+        "api_key": "ragas-only-key",
+        "base_url": "https://ragas.example.com/v1",
+    }
+
+
+def test_evaluate_message_sync_constructs_llm_client_from_ragas_config(monkeypatch):
+    """真实 `_evaluate_message_sync` 路径必须用 RAGAS_API_KEY/RAGAS_BASE_URL。"""
+    openai_calls, metric_calls, trace_events = _install_fake_ragas_stack(monkeypatch)
+    monkeypatch.setattr(ragas_eval, "RAGAS_API_KEY", "ragas-stage-key")
+    monkeypatch.setattr(ragas_eval, "RAGAS_BASE_URL", "https://ragas.example.com")
+    monkeypatch.setattr(ragas_eval, "RAGAS_LLM_MODEL", "deepseekv4flash")
+    monkeypatch.setattr(ragas_eval, "EMBEDDING_BASE_URL", "https://embedding.example.com")
+    monkeypatch.setattr(ragas_eval, "EMBEDDING_API_KEY", "embedding-key")
+
+    scores = ragas_eval._evaluate_message_sync("问题", "回答", ["上下文"], "trace-ragas-path")
+
+    assert openai_calls[1] == {
+        "api_key": "ragas-stage-key",
+        "base_url": "https://ragas.example.com/v1",
+    }
+    assert openai_calls[0]["api_key"] == "embedding-key"
+    assert openai_calls[0]["base_url"] == "https://embedding.example.com/v1"
+    assert len(metric_calls) == 3
+    assert scores == {
+        "faithfulness": 0.5,
+        "context_precision_without_reference": 0.5,
+        "response_relevancy": 0.5,
+    }
+    assert [entry[0][1] for entry in trace_events] == ["ragas_metric_done"] * 3
+
+
+def test_evaluate_message_sync_rejects_missing_ragas_key(monkeypatch):
+    monkeypatch.setattr(ragas_eval, "RAGAS_API_KEY", "")
+    monkeypatch.setattr(ragas_eval, "EMBEDDING_BASE_URL", "https://embedding.example.com")
+    monkeypatch.setattr(ragas_eval, "EMBEDDING_API_KEY", "embedding-key")
+    # 守卫必须在导入 ragas/openai 之前触发，避免未配置时仍加载可选依赖。
+    monkeypatch.setitem(sys.modules, "openai", None)
+
+    with pytest.raises(RuntimeError, match="RAGAS API Key 未配置"):
+        ragas_eval._evaluate_message_sync("问题", "回答", ["上下文"])
