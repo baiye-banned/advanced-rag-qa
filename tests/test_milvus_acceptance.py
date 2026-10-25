@@ -102,6 +102,24 @@ class _StrongConsistencyClient:
         return getattr(self._client, name)
 
 
+def _install_server_client_factory(monkeypatch, client_class):
+    """Install a factory that returns the Strong-consistency wrapper.
+
+    ``_index_params()`` reads ``MilvusClient.prepare_index_params`` from the module global,
+    so the replacement has to carry that classmethod as well. A bare ``lambda`` does not,
+    and the first ``add_chunks`` against a server without the collection then fails with
+    ``AttributeError: 'function' object has no attribute 'prepare_index_params'`` before
+    any row is written.
+    """
+
+    def _factory(**kwargs):
+        return _StrongConsistencyClient(client_class(**kwargs))
+
+    _factory.prepare_index_params = client_class.prepare_index_params
+    monkeypatch.setattr(milvus_client, "MilvusClient", _factory)
+    return _factory
+
+
 def _remove_acceptance_rows(client) -> None:
     """Delete the rows this module owns, leaving every other row in the collection.
 
@@ -174,12 +192,7 @@ def acceptance_store(tmp_path, monkeypatch):
         # The client is still created lazily by the module's first call, but through a
         # wrapper that asks for Strong consistency on reads: unlike Lite, a server may
         # not show a row inserted or deleted a moment ago.
-        client_class = milvus_client.MilvusClient
-        monkeypatch.setattr(
-            milvus_client,
-            "MilvusClient",
-            lambda **kwargs: _StrongConsistencyClient(client_class(**kwargs)),
-        )
+        _install_server_client_factory(monkeypatch, milvus_client.MilvusClient)
         # Without the live opt-in, install the deterministic offline embedding; with it,
         # leave the project's real embedding provider in place.
         if os.environ.get(LIVE_EMBEDDING_ENV, "").strip() != "1":
@@ -387,6 +400,43 @@ def test_acceptance_query_window_and_missing_collection(acceptance_store):
     assert len(milvus_client.query_vectors("迟到", top_k=99, knowledge_base_id=17)) == 3
     assert milvus_client.query_vectors("   ", top_k=5, knowledge_base_id=17) == []
     assert milvus_client.query_vectors("迟到", top_k=5, knowledge_base_id=99) == []
+
+
+def test_acceptance_server_factory_creates_collection_on_a_fresh_store(tmp_path, monkeypatch):
+    """The server-mode factory must keep `prepare_index_params` for first-time setup.
+
+    The server branch replaces the module's ``MilvusClient`` with a wrapper factory, and
+    collection creation calls ``MilvusClient.prepare_index_params()`` on that module
+    global. A factory missing that classmethod breaks the very first ``add_chunks`` on a
+    server where the collection does not exist yet -- exactly the deployment path #178
+    covers -- while a suite that finds the collection already created never notices.
+
+    This drives the same factory against a throwaway Lite database, so the fresh
+    collection path is covered offline (a server run still keeps this test local).
+    """
+    uri = str(tmp_path / "factory_acceptance.db")
+    monkeypatch.setattr(milvus_client, "MILVUS_URI", uri)
+    monkeypatch.setattr(milvus_client, "_client", None)
+    monkeypatch.setattr(milvus_client, "_embedding_fn", _bigram_embedding)
+    _install_server_client_factory(monkeypatch, milvus_client.MilvusClient)
+
+    try:
+        assert not milvus_client._connect_milvus().has_collection(milvus_client.COLLECTION_NAME)
+        assert milvus_client._index_params() is not None
+
+        # add_chunks -> _ensure_collection -> _index_params on an instance with no
+        # collection: the path the previous suite skipped once the collection existed.
+        milvus_client.add_chunks(CHUNKS, file_id=1801, file_name="考勤制度.txt", knowledge_base_id=18)
+
+        assert _count_rows("file_id == 1801") == 3
+        hits = milvus_client.query_vectors("迟到超过30分钟视为旷工半天。", top_k=5, knowledge_base_id=18)
+        assert [hit["chunk_id"] for hit in hits][0] == "1"
+    finally:
+        client, milvus_client._client = milvus_client._client, None
+        if client is not None:
+            client.close()
+        _release_lite_server(uri)
+        shutil.rmtree(str(tmp_path), ignore_errors=True)
 
 
 def test_acceptance_round_trip_survives_a_dead_proxy_environment():
