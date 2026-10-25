@@ -5,12 +5,12 @@ import logging
 import time
 
 from config import (
-    DEEPSEEK_API_KEY,
-    DEEPSEEK_BASE_URL,
     EMBEDDING_API_KEY,
     EMBEDDING_BASE_URL,
     EMBEDDING_DIM,
     EMBEDDING_MODEL,
+    RAGAS_API_KEY,
+    RAGAS_BASE_URL,
     RAGAS_ENABLED,
     RAGAS_LLM_MODEL,
     RAGAS_MAX_ANSWER_CHARS,
@@ -165,9 +165,17 @@ def schedule_ragas_evaluation(
         )
 
 
+def _ragas_llm_client_config() -> dict:
+    """RAGAS evaluator 使用的 OpenAI 客户端参数（不构造客户端，便于离线断言）。"""
+    return {
+        "api_key": RAGAS_API_KEY,
+        "base_url": openai_base_url(RAGAS_BASE_URL),
+    }
+
+
 def _evaluate_message_sync(question: str, answer: str, contexts: list[str], trace_id: str | None = None) -> dict:
-    if not DEEPSEEK_API_KEY:
-        raise RuntimeError("DeepSeek API Key 未配置")
+    if not RAGAS_API_KEY:
+        raise RuntimeError("RAGAS API Key 未配置")
     if not EMBEDDING_BASE_URL or not EMBEDDING_API_KEY:
         raise RuntimeError("Embedding API 未配置")
 
@@ -185,10 +193,7 @@ def _evaluate_message_sync(question: str, answer: str, contexts: list[str], trac
         OpenAIEmbeddings(client=embedding_client, model=EMBEDDING_MODEL)
     )
 
-    llm_client = OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url=openai_base_url(DEEPSEEK_BASE_URL),
-    )
+    llm_client = OpenAI(**_ragas_llm_client_config())
     llm = _make_ragas_llm(llm_factory, llm_client)
     sample = SingleTurnSample(
         user_input=question,

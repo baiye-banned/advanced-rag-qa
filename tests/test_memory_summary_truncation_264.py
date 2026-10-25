@@ -50,18 +50,19 @@ def _patch_summarizer(monkeypatch, result, finish_reason):
     """替换非流式调用，记录提示词并返回指定终态。"""
     calls = []
 
-    async def fake_call(system_prompt, user_prompt, *, max_tokens):
+    async def fake_call(system_prompt, user_prompt, *, max_tokens, stage="planner"):
         calls.append(
             {
                 "system_prompt": system_prompt,
                 "user_prompt": user_prompt,
                 "max_tokens": max_tokens,
+                "stage": stage,
             }
         )
         return result, finish_reason
 
     monkeypatch.setattr(memory_service, "call_chat_text_with_metadata", fake_call)
-    monkeypatch.setattr(memory_service, "DEEPSEEK_API_KEY", "offline-test-key")
+    monkeypatch.setattr(memory_service, "MEMORY_API_KEY", "offline-test-key")
     return calls
 
 
@@ -121,6 +122,8 @@ def test_conversation_summary_rejects_length_truncation(monkeypatch, caplog):
     )
 
     assert result == "", "截断的半句摘要不能作为长期记忆返回"
+    # 记忆压缩必须走 memory 阶段，才能应用 MEMORY_* 独立配置。
+    assert calls[0]["stage"] == "memory"
     assert calls[0]["max_tokens"] == config.MEMORY_SUMMARY_MAX_TOKENS
     assert f"{config.MEMORY_SUMMARY_MAX_TOKENS} token" in calls[0]["user_prompt"]
     assert f"{config.MEMORY_SUMMARY_MAX_CHARS} 字" not in calls[0]["user_prompt"]
@@ -148,6 +151,7 @@ def test_recent_memory_summary_rejects_length_truncation(monkeypatch):
     )
 
     assert result == ""
+    assert calls[0]["stage"] == "memory"
     assert calls[0]["max_tokens"] == config.MEMORY_RECENT_MAX_TOKENS
     assert f"{config.MEMORY_RECENT_MAX_TOKENS} token" in calls[0]["user_prompt"]
     assert f"{config.MEMORY_RECENT_MAX_CHARS} 字" not in calls[0]["user_prompt"]

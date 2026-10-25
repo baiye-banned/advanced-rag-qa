@@ -89,7 +89,10 @@ def test_rerank_returns_empty_when_qwen3_and_llm_fail(monkeypatch):
 
 
 def test_llm_rerank_ignores_invalid_scores(monkeypatch):
+    captured = {}
+
     async def fake_call_chat_json(*args, **kwargs):
+        captured.update(kwargs)
         return {"results": [{"id": 1, "score": "bad-score", "reason": "invalid score"}]}
 
     monkeypatch.setattr(rerank, "call_chat_json", fake_call_chat_json)
@@ -97,6 +100,7 @@ def test_llm_rerank_ignores_invalid_scores(monkeypatch):
     reranked, trace = asyncio.run(rerank._rerank_chunks_with_llm("question", _chunks()))
 
     assert trace["status"] == "done"
+    assert captured["stage"] == "rerank_llm"
     assert reranked[0]["rerank_score"] == 0.0
 
 

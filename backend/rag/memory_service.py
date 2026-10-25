@@ -4,8 +4,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from config import (
-    DEEPSEEK_API_KEY,
-    DEEPSEEK_MODEL,
+    MEMORY_API_KEY,
+    MEMORY_MODEL,
     MEMORY_RECENT_MAX_CHARS,
     MEMORY_RECENT_MAX_TOKENS,
     MEMORY_SUMMARY_MAX_CHARS,
@@ -473,8 +473,8 @@ def _fallback_compact_recent_memory(rendered_turns: list[str]) -> str:
 
 
 async def _summarize_recent_memory(transcript: str, trace_id: str | None = None) -> str:
-    if not DEEPSEEK_API_KEY:
-        logger.warning("Skip recent memory compaction because DeepSeek API Key is not configured")
+    if not MEMORY_API_KEY:
+        logger.warning("Skip recent memory compaction because memory API Key is not configured")
         return ""
 
     system_prompt = (
@@ -489,12 +489,12 @@ async def _summarize_recent_memory(transcript: str, trace_id: str | None = None)
     )
     try:
         content, finish_reason = await call_chat_text_with_metadata(
-            system_prompt, user_prompt, max_tokens=MEMORY_RECENT_MAX_TOKENS
+            system_prompt, user_prompt, max_tokens=MEMORY_RECENT_MAX_TOKENS, stage="memory"
         )
         if finish_reason == "length":
             logger.warning(
                 "Recent memory compaction truncated: model=%s max_tokens=%s",
-                DEEPSEEK_MODEL,
+                MEMORY_MODEL,
                 MEMORY_RECENT_MAX_TOKENS,
             )
             await asyncio.to_thread(
@@ -519,8 +519,8 @@ async def _summarize_recent_memory(transcript: str, trace_id: str | None = None)
 async def _summarize_conversation_memory(
     previous_summary: str, transcript: str, trace_id: str | None = None
 ) -> str:
-    if not DEEPSEEK_API_KEY:
-        logger.warning("Skip memory summary update because DeepSeek API Key is not configured")
+    if not MEMORY_API_KEY:
+        logger.warning("Skip memory summary update because memory API Key is not configured")
         return ""
 
     system_prompt = (
@@ -537,12 +537,12 @@ async def _summarize_conversation_memory(
     )
     try:
         content, finish_reason = await call_chat_text_with_metadata(
-            system_prompt, user_prompt, max_tokens=MEMORY_SUMMARY_MAX_TOKENS
+            system_prompt, user_prompt, max_tokens=MEMORY_SUMMARY_MAX_TOKENS, stage="memory"
         )
         if finish_reason == "length":
             logger.warning(
                 "Memory summary truncated: model=%s max_tokens=%s",
-                DEEPSEEK_MODEL,
+                MEMORY_MODEL,
                 MEMORY_SUMMARY_MAX_TOKENS,
             )
             await asyncio.to_thread(

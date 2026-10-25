@@ -194,7 +194,7 @@ async def build_query_plan(question: str) -> dict:
         f"\n\n用户问题：{question}"
     )
     try:
-        data = await call_chat_json(system_prompt, user_prompt)
+        data = await call_chat_json(system_prompt, user_prompt, stage="planner")
     except Exception as exc:
         # query_plan 会进 SSE 轨迹帧与 retrieval_trace；error 只作失败标记，不携带异常原文。
         logger.warning("Query plan build failed: %s", exc, exc_info=True)

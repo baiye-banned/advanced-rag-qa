@@ -18,6 +18,27 @@ if str(BACKEND) not in sys.path:
     sys.path.insert(0, str(BACKEND))
 
 
+# 阶段覆盖变量（issue #317）。采用者会在 .env / 宿主环境里配置它们，而 conftest 的路由、
+# 记忆、重排等用例都假设没有阶段覆盖：一旦宿主机带值，`llm.get_stage_model` 会绕过被替换
+# 的原 getter 并可能真实外呼。用法例级隔离保证测试结果不取决于运行机器的环境。
+# `RAGAS_LLM_MODEL` 是既有变量，不属于阶段覆盖路径，保持原样。
+STAGE_ENV_NAMES = (
+    "ROUTER_API_KEY", "ROUTER_BASE_URL", "ROUTER_MODEL",
+    "PLANNER_API_KEY", "PLANNER_BASE_URL", "PLANNER_MODEL",
+    "ANSWER_API_KEY", "ANSWER_BASE_URL", "ANSWER_MODEL",
+    "MEMORY_API_KEY", "MEMORY_BASE_URL", "MEMORY_MODEL",
+    "RERANK_LLM_API_KEY", "RERANK_LLM_BASE_URL", "RERANK_LLM_MODEL",
+    "RAGAS_API_KEY", "RAGAS_BASE_URL",
+)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_stage_env(monkeypatch):
+    """每条用例从「无阶段覆盖」开始；用例内的 monkeypatch.setenv 仍可覆盖。"""
+    for name in STAGE_ENV_NAMES:
+        monkeypatch.delenv(name, raising=False)
+
+
 class FakeQuery:
     """SQLAlchemy Query 的最小替身：只实现被测代码真正用到的 filter_by/first 组合。"""
 
