@@ -23,4 +23,4 @@ ragas==0.4.3
 #   上游 ragas 不再导入 ChatVertexAI 后删除此 pin。
 #   已知限制：ragas 间接依赖的 instructor 与主应用 requirements.txt 的
 #   openai>=3.23.0 在全新解析时会冲突，需单独跟进；本 pin 只解决 LangChain 侧导入兼容。
-langchain-community==0.3.30
+langchain-community==0.4.2
