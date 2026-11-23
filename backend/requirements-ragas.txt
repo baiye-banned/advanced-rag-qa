@@ -13,7 +13,7 @@
 #   2. ragas 在 ragas_eval.py 里是函数内延迟导入，且 RAGAS_ENABLED 默认为 False，
 #      未显式开启时评测链路根本不会加载该库。
 # 后续：上游发布包含修复的版本后，把这一行改为该版本下限，并同步更新本说明。
-ragas==0.4.3
+ragas==0.4.4
 #
 # 关于 issue #291（导入失败）：
 #   ragas 0.4.x 在 import 阶段从 langchain_community.chat_models.vertexai 导入
@@ -23,4 +23,4 @@ ragas==0.4.3
 #   上游 ragas 不再导入 ChatVertexAI 后删除此 pin。
 #   已知限制：ragas 间接依赖的 instructor 与主应用 requirements.txt 的
 #   openai>=3.23.0 在全新解析时会冲突，需单独跟进；本 pin 只解决 LangChain 侧导入兼容。
-langchain-community==0.3.30
+langchain-community==0.4.2
